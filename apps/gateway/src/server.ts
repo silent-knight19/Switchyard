@@ -16,8 +16,14 @@ export interface GatewayServerContext {
   stop(): Promise<void>;
 }
 
+export interface ServerDependencies {
+  postgres?: PostgresClient;
+  redis?: RedisClient;
+}
+
 export async function createServer(
   envOverride?: Record<string, string | undefined>,
+  dependencies?: ServerDependencies,
 ): Promise<GatewayServerContext> {
   // Step 1: Validate configuration
   const config = loadConfig(envOverride);
@@ -34,7 +40,7 @@ export async function createServer(
 
   // Step 3: Initialize database connectivity
   logger.info('Connecting to PostgreSQL');
-  const postgres = createPostgresClient(config);
+  const postgres = dependencies?.postgres ?? createPostgresClient(config);
   const pgReady = await postgres.checkReadiness();
   if (!pgReady.ok) {
     const errorMsg = `PostgreSQL readiness check failed during startup: ${pgReady.error}`;
@@ -45,7 +51,7 @@ export async function createServer(
 
   // Step 4: Initialize Redis connectivity
   logger.info('Connecting to Redis');
-  const redis = createRedisClient(config);
+  const redis = dependencies?.redis ?? createRedisClient(config);
   const redisReady = await redis.checkReadiness();
   if (!redisReady.ok) {
     const errorMsg = `Redis readiness check failed during startup: ${redisReady.error}`;

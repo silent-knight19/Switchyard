@@ -28,11 +28,40 @@ const VALID_DEV_ENV: Record<string, string> = {
   DEMO_SEEDING_ENABLED: 'false',
 };
 
+function createMockPostgres(overrides?: Partial<PostgresClient>): PostgresClient {
+  return {
+    pool: {
+      totalCount: 1,
+      idleCount: 1,
+      waitingCount: 0,
+    } as unknown as PostgresClient['pool'],
+    checkReadiness: async () => ({ ok: true }),
+    close: async () => {},
+    ...overrides,
+  };
+}
+
+function createMockRedis(overrides?: Partial<RedisClient>): RedisClient {
+  return {
+    redis: {
+      status: 'ready',
+    } as unknown as RedisClient['redis'],
+    checkReadiness: async () => ({ ok: true, policy: 'noeviction' }),
+    close: async () => {},
+    ...overrides,
+  };
+}
+
 describe('SW-1.2.4 Gateway Boot, Health, and Shutdown Lifecycle', () => {
   let serverContext: GatewayServerContext;
 
   beforeAll(async () => {
-    serverContext = await createServer(VALID_DEV_ENV);
+    const mockPg = createMockPostgres();
+    const mockRedis = createMockRedis();
+    serverContext = await createServer(VALID_DEV_ENV, {
+      postgres: mockPg,
+      redis: mockRedis,
+    });
     serverContext.lifecycle.setReady();
   });
 
@@ -55,49 +84,60 @@ describe('SW-1.2.4 Gateway Boot, Health, and Shutdown Lifecycle', () => {
   });
 
   it('3. unavailable PostgreSQL prevents successful startup / readiness', async () => {
-    const unreachablePgEnv = { ...VALID_DEV_ENV, POSTGRES_PORT: '5499' };
-    await expect(createServer(unreachablePgEnv)).rejects.toThrow(
-      /PostgreSQL readiness check failed/,
+    let closedPg = false;
+    const failingPg = createMockPostgres({
+      checkReadiness: async () => ({
+        ok: false,
+        error: 'connect ECONNREFUSED 127.0.0.1:5499',
+      }),
+      close: async () => {
+        closedPg = true;
+      },
+    });
+
+    await expect(createServer(VALID_DEV_ENV, { postgres: failingPg })).rejects.toThrow(
+      /PostgreSQL readiness check failed during startup/,
     );
+    expect(closedPg).toBe(true); // Verifies resources are safely closed on startup abort
   });
 
   it('4. unavailable Redis prevents successful startup / readiness', async () => {
-    const unreachableRedisEnv = { ...VALID_DEV_ENV, REDIS_PORT: '6399' };
-    await expect(createServer(unreachableRedisEnv)).rejects.toThrow(/Redis readiness check failed/);
+    let closedPg = false;
+    let closedRedis = false;
+    const mockPg = createMockPostgres({
+      close: async () => {
+        closedPg = true;
+      },
+    });
+    const failingRedis = createMockRedis({
+      checkReadiness: async () => ({
+        ok: false,
+        error: 'connect ECONNREFUSED 127.0.0.1:6399',
+      }),
+      close: async () => {
+        closedRedis = true;
+      },
+    });
+
+    await expect(
+      createServer(VALID_DEV_ENV, { postgres: mockPg, redis: failingRedis }),
+    ).rejects.toThrow(/Redis readiness check failed during startup/);
+    expect(closedPg).toBe(true);
+    expect(closedRedis).toBe(true);
   });
 
   it('5. unsafe Redis runtime policy prevents readiness', async () => {
-    const mockPg: PostgresClient = {
-      pool: {} as unknown as PostgresClient['pool'],
-      checkReadiness: async () => ({ ok: true }),
-      close: async () => {},
-    };
-    const mockRedisUnsafe: RedisClient = {
-      redis: {} as unknown as RedisClient['redis'],
-      checkReadiness: async () => ({ ok: false, policy: 'allkeys-lru', error: 'Unsafe policy' }),
-      close: async () => {},
-    };
-    const lifecycle = new LifecycleCoordinator();
-    lifecycle.setReady();
-    const logger = createLogger({ level: 'silent' });
-
-    const app = await buildApp({
-      postgres: mockPg,
-      redis: mockRedisUnsafe,
-      lifecycle,
-      logger,
+    const mockPg = createMockPostgres();
+    const mockRedisUnsafe = createMockRedis({
+      checkReadiness: async () => ({
+        ok: true,
+        policy: 'allkeys-lru',
+      }),
     });
 
-    const res = await app.inject({
-      method: 'GET',
-      url: '/health/ready',
-    });
-
-    expect(res.statusCode).toBe(503);
-    const body = res.json();
-    expect(body.status).toBe('unavailable');
-    expect(body.dependencies.redis).toBe('unhealthy');
-    await app.close();
+    await expect(
+      createServer(VALID_DEV_ENV, { postgres: mockPg, redis: mockRedisUnsafe }),
+    ).rejects.toThrow(/Unsafe Redis policy "allkeys-lru": expected "noeviction"/);
   });
 
   it('6. liveness endpoint reports ok (200) without leaking internal details', async () => {
@@ -125,17 +165,11 @@ describe('SW-1.2.4 Gateway Boot, Health, and Shutdown Lifecycle', () => {
 
   it('8. dependency failure changes readiness to unavailable (503)', async () => {
     let pgOk = false;
-    const mockPg: PostgresClient = {
-      pool: {} as unknown as PostgresClient['pool'],
+    const mockPg = createMockPostgres({
       checkReadiness: async () =>
         pgOk ? { ok: true } : { ok: false, error: 'Connection refused' },
-      close: async () => {},
-    };
-    const mockRedis: RedisClient = {
-      redis: {} as unknown as RedisClient['redis'],
-      checkReadiness: async () => ({ ok: true, policy: 'noeviction' }),
-      close: async () => {},
-    };
+    });
+    const mockRedis = createMockRedis();
     const lifecycle = new LifecycleCoordinator();
     lifecycle.setReady();
     const logger = createLogger({ level: 'silent' });
@@ -277,16 +311,8 @@ describe('SW-1.2.4 Gateway Boot, Health, and Shutdown Lifecycle', () => {
   });
 
   it('14. readiness returns 503 draining when shutdown is in progress', async () => {
-    const mockPg: PostgresClient = {
-      pool: {} as unknown as PostgresClient['pool'],
-      checkReadiness: async () => ({ ok: true }),
-      close: async () => {},
-    };
-    const mockRedis: RedisClient = {
-      redis: {} as unknown as RedisClient['redis'],
-      checkReadiness: async () => ({ ok: true }),
-      close: async () => {},
-    };
+    const mockPg = createMockPostgres();
+    const mockRedis = createMockRedis();
     const lifecycle = new LifecycleCoordinator();
     lifecycle.setDraining();
     const logger = createLogger({ level: 'silent' });
