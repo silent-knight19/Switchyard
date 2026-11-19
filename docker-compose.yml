@@ -1,0 +1,59 @@
+services:
+  postgres:
+    image: postgres:16.8-alpine
+    container_name: switchyard-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-switchyard}
+      POSTGRES_USER: ${POSTGRES_USER:-switchyard}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-switchyard_dev_password}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - switchyard-network
+    healthcheck:
+      test:
+        ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-switchyard} -d ${POSTGRES_DB:-switchyard}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  redis:
+    image: redis:7.4.2-alpine
+    container_name: switchyard-redis
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-switchyard_dev_password}
+      REDISCLI_AUTH: ${REDIS_PASSWORD:-switchyard_dev_password}
+      REDIS_MAXMEMORY: ${REDIS_MAXMEMORY:-64mb}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        printf "appendonly yes\nappendfsync everysec\nmaxmemory %s\nmaxmemory-policy noeviction\nrequirepass %s\n" "$$REDIS_MAXMEMORY" "$$REDIS_PASSWORD" | exec redis-server -
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - switchyard-network
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+networks:
+  switchyard-network:
+    name: switchyard-network
+    driver: bridge
+
+volumes:
+  postgres_data:
+    name: switchyard_postgres_data
+  redis_data:
+    name: switchyard_redis_data

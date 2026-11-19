@@ -82,3 +82,93 @@ Every task must transition through five distinct states:
 - Architecture v1.2 and accepted ADRs are normative.
 - Existing code or tests describe implementation state but do not override architectural invariants.
 - If an architectural conflict arises, work must stop, the conflict must be reported, and the Project Owner must approve any deviation before implementation.
+
+## 7. Local Infrastructure (PostgreSQL, Redis, Docker Compose)
+
+As established in SW-1.2.1, Switchyard uses Docker Compose to orchestrate local development and test instances of PostgreSQL and Redis with private network isolation and persistent named volumes.
+
+### 7.1 Prerequisites & Pinned Image Versions
+
+- **Docker:** Engine v24.0+ / Docker Desktop (Compose v2.20+)
+- **PostgreSQL:** `postgres:16.8-alpine` (PostgreSQL 16+)
+- **Redis:** `redis:7.4.2-alpine` (Redis 7+)
+
+### 7.2 Configuration & Environment Variables
+
+Copy the provided development defaults template:
+
+```bash
+cp .env.example .env
+```
+
+| Variable | Default Value | Purpose | Notes |
+| :--- | :--- | :--- | :--- |
+| `POSTGRES_USER` | `switchyard` | PostgreSQL development superuser | Local development only |
+| `POSTGRES_PASSWORD` | `switchyard_dev_password` | PostgreSQL development password | Local development only |
+| `POSTGRES_DB` | `switchyard` | PostgreSQL development database | Local development only |
+| `POSTGRES_PORT` | `5432` | Host loopback port for PostgreSQL | Bound to `127.0.0.1` |
+| `REDIS_PASSWORD` | `switchyard_dev_password` | Redis authentication password | Injected via stdin/environment |
+| `REDIS_PORT` | `6379` | Host loopback port for Redis | Bound to `127.0.0.1` |
+| `REDIS_MAXMEMORY` | `64mb` | Redis memory allocation bound | Provisional development baseline; not benchmark-validated (production sizing requires Phase 2 load testing under `bench/`) |
+
+### 7.3 Service Management Commands
+
+#### Safe Startup
+```bash
+docker compose up -d
+```
+Starts PostgreSQL and Redis in detached mode on the private `switchyard-network`.
+
+#### Status & Health Inspection
+```bash
+docker compose ps
+```
+Displays container state, port bindings, and healthcheck status (`healthy` / `starting` / `unhealthy`).
+
+#### Service Logs
+```bash
+docker compose logs -f [postgres|redis]
+```
+
+#### Safe Normal Shutdown (Preserves Volumes)
+```bash
+docker compose down
+```
+> [!TIP]
+> Always use `docker compose down` for normal development shutdown. This stops and removes container instances while preserving the named data volumes (`switchyard_postgres_data` and `switchyard_redis_data`).
+
+Alternatively, to pause services without removing containers:
+```bash
+docker compose stop
+```
+
+#### Prohibited Destructive Reset (`docker compose down -v`)
+> [!CAUTION]
+> **PROHIBITED DURING NORMAL DEVELOPMENT SHUTDOWN.**
+> Executing `docker compose down -v` permanently destroys all persistent volumes, irrecoverably wiping all PostgreSQL database tables, migrations, user records, and Redis AOF persistence logs. Never execute `docker compose down -v` unless an explicit, clean-slate teardown is deliberately intended.
+
+### 7.4 Health & Connectivity Verification
+
+- **PostgreSQL Readiness:**
+  Healthcheck executes `pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}` every 5s.
+  To verify manually from host:
+  ```bash
+  docker compose exec postgres pg_isready -U switchyard -d switchyard
+  ```
+- **Redis Readiness:**
+  Healthcheck executes `redis-cli ping` every 5s using the container's `REDISCLI_AUTH` environment variable (preventing command-line credential exposure).
+  To verify manually from host:
+  ```bash
+  docker compose exec redis redis-cli ping
+  ```
+
+### 7.5 Persistence Verification
+
+- **PostgreSQL Volume (`switchyard_postgres_data`):** Mounted to `/var/lib/postgresql/data`. Schema and data persist across container restarts and normal recreations (`docker compose down && docker compose up -d`).
+- **Redis Volume (`switchyard_redis_data`):** Mounted to `/data` with AOF persistence enabled (`appendonly yes`, `appendfsync everysec`, `maxmemory-policy noeviction`).
+
+### 7.6 Local Security Limitations
+
+- **Loopback-Only Binding:** Both PostgreSQL and Redis are bound exclusively to host loopback (`127.0.0.1:5432` and `127.0.0.1:6379`) to prevent external network exposure.
+- **Process Credential Masking & Docker Inspection Boundary:** Redis credentials are provided to `redis-server` via standard input stream and to `redis-cli` via `REDISCLI_AUTH`, avoiding password visibility in process table listings (`ps aux`) and suppressing CLI warning banners. However, environment variables remain visible via `docker inspect <container>`; therefore, this mechanism is strictly intended for local development. Production deployments must not rely on environment variables for sensitive secrets and must utilize external secret management with separate least-privilege database roles as defined in Architecture v1.2 §19.
+- **Development Credentials:** The default credentials (`switchyard_dev_password`) are strictly intended for local development.
