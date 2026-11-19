@@ -6,5 +6,21 @@
   "engines": {
     "node": "26.13.1",
     "pnpm": "12.21.0"
+  },
+  "scripts": {
+    "build": "pnpm -r --filter=!switchyard build",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "pnpm -r --filter=!switchyard lint",
+    "test": "pnpm -r --filter=!switchyard test",
+    "typecheck": "pnpm -r --filter=!switchyard typecheck"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.6",
+    "eslint": "10.15.0",
+    "prettier": "3.10.1",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.73.0",
+    "vitest": "5.1.1"
   }
 }
