@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build artifacts and caches
+dist/
+build/
+.turbo/
+.next/
+coverage/
+.cache/
+tmp/
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment and secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Operating System files
+.DS_Store
+Thumbs.db
+
+# IDE and editor files
+.idea/
+*.swp
+*.swo
+
+# Lockfile must never be ignored
+!pnpm-lock.yaml
