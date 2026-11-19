@@ -9,5 +9,8 @@
     "lint": "eslint . --no-error-on-unmatched-pattern",
     "test": "vitest run --passWithNoTests",
     "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "zod": "^4.6.7"
   }
 }
