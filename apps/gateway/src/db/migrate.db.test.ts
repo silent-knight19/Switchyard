@@ -33,6 +33,7 @@ const MIGRATION_FILES = [
   '0005-virtual-key-integrity.sql',
   '0006-schema-privilege-hardening.sql',
   '0007-financial-observability-tables.sql',
+  '0008-financial-integrity.sql',
 ];
 const ALL_VERSIONS = MIGRATION_FILES.map((fileName) => fileName.slice(0, 4));
 
@@ -238,10 +239,10 @@ describe('SW-1.3.1 migration runner: locking, integrity, bootstrap (real Postgre
     const database = await createDatabase('missing-file');
     await migrate(database);
 
-    const dir = copyMigrationsToTempDir(MIGRATION_FILES.filter((name) => !name.startsWith('0007')));
+    const dir = copyMigrationsToTempDir(MIGRATION_FILES.filter((name) => !name.startsWith('0008')));
     try {
       const error = await expectMigrationError(migrate(database, dir), 'MIGRATION_FILE_MISSING');
-      expect(error.message).toMatch(/0007/);
+      expect(error.message).toMatch(/0008/);
     } finally {
       removeTempDir(dir);
     }
@@ -490,7 +491,7 @@ describe('SW-1.3.1 migration runner: locking, integrity, bootstrap (real Postgre
     } finally {
       await pool.end();
     }
-    expect(applied).toEqual(['0003', '0004', '0005', '0006', '0007']);
+    expect(applied).toEqual(['0003', '0004', '0005', '0006', '0007', '0008']);
     expect(events).toContain('adopted:0001');
     expect(events).toContain('adopted:0002');
 

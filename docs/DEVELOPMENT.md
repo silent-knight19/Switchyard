@@ -218,7 +218,8 @@ apply tenant-table DDL.
 Migration set: `0001-roles` (idempotent no-op when bootstrap ran first), `0002-org-tables`
 (six core tables), `0003-rls-default-deny`, `0004-gateway-control-privileges`,
 `0005-virtual-key-integrity`, `0006-schema-privilege-hardening`,
-`0007-financial-observability-tables` (gateway_requests, provider_attempts, adjustments, trace_payloads). `0001`/`0002` are historical
+`0007-financial-observability-tables` (gateway_requests, provider_attempts, adjustments, trace_payloads),
+`0008-financial-integrity` (financial immutability, append-only adjustments, monetary bounds). `0001`/`0002` are historical
 and byte-frozen; corrections are forward-only migrations.
 
 #### 7.7.3 Integrity: checksums and fail-closed history
@@ -286,7 +287,38 @@ validated guarantee. `0003-rls-default-deny.sql` drops them. Comprehensive tenan
 tenant-context helper, and per-role table grants are **Subphase 1.4** (SW-1.4.1/SW-1.4.2) work.
 `gateway_control` is the only global table and intentionally has no RLS.
 
-#### 7.7.7 Known limitations (Phase 2)
+#### 7.7.7 Financial Immutability and Integrity (SW-1.3.4)
+
+Established on top of accepted prerequisite SW-1.3.3 (`a193e12f0e270720fb37e1ec10c1a94dcaadadb6`),
+migration `0008-financial-integrity.sql` hardens the financial ledger:
+
+- **Immutable Billing Period & Admission Consistency:** `gateway_requests` enforces
+  `CHECK (billing_period = to_char(admitted_at AT TIME ZONE 'UTC', 'YYYY-MM'))` and a `BEFORE UPDATE`
+  trigger preventing modification to `billing_period`, `request_id`, `org_id`, `virtual_key_id`,
+  `admitted_at`, and gateway epoch/instance metadata. Terminal status cannot be regressed.
+- **Immutable Terminal Attempt Base Costs:** `provider_attempts` protects terminal rows
+  (`status IN ('settled', 'interrupted')`) against mutations to `estimated_cost_microdollars`,
+  `actual_cost_microdollars`, `cost_status`, `billing_period`, and identity fields. Status regressions
+  back to `reserved` and terminal status flips are rejected.
+- **Append-Only Cost Adjustments:** `provider_cost_adjustments` rejects all `UPDATE`, `DELETE`, and
+  `TRUNCATE` operations via database triggers. Inserting an adjustment targeting an active `reserved`
+  attempt is rejected (`23514`); adjustments require a terminal attempt.
+- **Monetary Integrity & Authoritative Accounting (DB-22):** Architecture v1.2 §5.2 #3 applies
+  the \$1 billion (`1,000,000,000,000,000` microdollars) bound to organization monthly budgets and Redis
+  intermediate counters. In PostgreSQL, individual attempts and adjustments are not subject to an artificial
+  \$1B cap; PostgreSQL is the canonical financial ledger (§5.2 #6) and must faithfully record actual costs
+  and overspend (§5.2 #9) representable in BIGINT (`0 <= cost <= 9,223,372,036,854,775,807`) while strictly
+  enforcing nonnegative bounds and integer-only arithmetic. Redis rejects or closes admission when
+  intermediate balances exceed safe bounds; PostgreSQL never discards legitimate authoritative billing evidence.
+- **Database vs Service Concurrency Boundaries (DB-24):** Database tests attest to PostgreSQL-level
+  row immutability, check constraints, append-only triggers, and migration advisory lock serialization.
+  Complete cross-store financial adjustment transaction serialization (locking organization/period scope,
+  verifying prior canonical cost across stores, and applying Redis Lua deltas) is deferred to the
+  financial service layer in Phase 2+.
+- **RLS Default-Deny Posture:** RLS remains enabled and forced with zero permissive policies; runtime
+  roles hold zero table privileges until Subphase 1.4.
+
+#### 7.7.8 Known limitations (Phase 2)
 
 - `gateway_startup` may update `gateway_epoch` but not `updated_at`; the §12.1 column grant is
   literal, so epoch bumps leave `updated_at` stale. A trigger or a widened grant is a Phase 2
@@ -295,7 +327,7 @@ tenant-context helper, and per-role table grants are **Subphase 1.4** (SW-1.4.1/
   exclusive transaction advisory lock. Column grants cannot enforce lock ordering; that
   admission-protocol invariant is a Phase 2 implementation concern.
 
-#### 7.7.8 Database integration tests
+#### 7.7.9 Database integration tests
 
 ```bash
 pnpm --filter @switchyard/gateway test:db   # or: pnpm test:db from the repo root
