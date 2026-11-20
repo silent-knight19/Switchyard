@@ -318,7 +318,65 @@ migration `0008-financial-integrity.sql` hardens the financial ledger:
 - **RLS Default-Deny Posture:** RLS remains enabled and forced with zero permissive policies; runtime
   roles hold zero table privileges until Subphase 1.4.
 
-#### 7.7.8 Known limitations (Phase 2)
+#### 7.7.8 Transaction-Scoped Tenant Context & RLS Policies (SW-1.4.1 & SW-1.4.2)
+
+Established on top of accepted prerequisite Subphase 1.3 (`1b13bbe464fbfa2ec9bd3b361ab36ecfae12096a`),
+Subphase 1.4 Batch A delivers transaction-scoped tenant isolation and least-privilege PostgreSQL role grants.
+
+##### 1. `withTenant(pool, orgId, callback)` Contract
+
+Defined in `apps/gateway/src/db/tenant.ts`, `withTenant` executes tenant-scoped operations within a dedicated database transaction:
+
+```typescript
+export interface TenantClient {
+  query<R extends pg.QueryResultRow = any, I extends any[] = any[]>(
+    queryTextOrConfig: string | pg.QueryConfig<I>,
+    values?: I,
+  ): Promise<pg.QueryResult<R>>;
+  escapeIdentifier(str: string): string;
+  escapeLiteral(str: string): string;
+}
+
+export async function withTenant<T>(
+  pool: Pool,
+  orgId: string,
+  callback: (client: TenantClient) => Promise<T>
+): Promise<T>;
+```
+
+- **UUID Validation:** `orgId` is validated fail-closed upfront (`/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i`). Invalid tenant IDs throw `InvalidTenantIdError` without acquiring a pool client.
+- **Protocol-Enforced Single-Statement Execution & Lexical Guard (DB-27, DB-30):**
+  - In `tenantClient.query()`, `withTenant` unconditionally enforces PostgreSQL's extended query protocol (`queryMode: 'extended'`). Under extended query protocol, PostgreSQL natively rejects any multi-statement command string with SQLSTATE `42601` (`cannot insert multiple commands into a prepared statement`). Caller-supplied `queryMode` in `QueryConfig` cannot override this.
+  - In addition, leading comment/whitespace stripping (`stripLeadingCommentsAndWhitespace`, supporting nested block comments per PostgreSQL 16) and `standard_conforming_strings`-aware lexical inspection reject standalone and embedded transaction control commands (`BEGIN`, `COMMIT`, `ROLLBACK`, `START TRANSACTION`, `END`, `ABORT`, `SAVEPOINT`, `RELEASE`, `PREPARE TRANSACTION`) before dispatch.
+- **Confirmed COMMIT Verification (DB-26):** `withTenant` inspects PostgreSQL's command completion tag upon `COMMIT`. If PostgreSQL returns `ROLLBACK` (which occurs when `COMMIT` is executed on an aborted transaction block whose error was swallowed inside the callback), `withTenant` immediately throws `TenantTransactionError` and marks the transaction failed, guaranteeing that aborted transactions never silently report success.
+- **AsyncLocalStorage Isolation & Lifetime (DB-29):** Active tenant context is tracked in `AsyncLocalStorage`. Inactive context state prevents detached asynchronous continuations from executing queries through stale `TenantClient` references or mistaking finished transactions for active ones. `getActiveTenantContext()` exposes only `{ orgId }` (never the raw client). Nested active `withTenant` calls are rejected.
+- **Transaction-Local GUC:** Sets PostgreSQL application context `app.current_org_id` transaction-locally (`is_local = true`):
+  ```sql
+  SELECT pg_catalog.set_config('app.current_org_id', $1, true);
+  ```
+  Because `is_local = true`, the parameter automatically reverts when the transaction ends (commit or rollback).
+- **Connection Hygiene, Pool Invalidation & Session Cleanup (DB-31, DB-33, DB-34):**
+  - Client release is intercepted during the callback to prevent premature release.
+  - **Connection Release Invariant (DB-31, DB-34):** No reusable pooled connection may retain tenant identity from a completed transaction. Outside an active transaction upon completion, `withTenant` issues `RESET ALL` and `DISCARD TEMP` to purge session-level GUC overrides (such as `SET app.current_org_id = ...` or `set_config('app.current_org_id', ..., false)`) and session temporary tables without destroying server-side prepared statements cached on client connections by `node-postgres` (DB-34 SQLSTATE `26000` prevention).
+  - It then explicitly verifies `SELECT pg_catalog.current_setting('app.current_org_id', true) AS cur_org`. If residual context is detected or cleanup throws, the connection is marked uncertain and destroyed via `client.release(true)`.
+  - **Confirmed COMMIT Durability & Diagnostic Reporting (DB-33):** Once PostgreSQL confirms `COMMIT`, the transaction has durably succeeded. If post-commit connection cleanup fails thereafter, the contaminated connection is invalidated via `client.release(true)`, and the cleanup incident is reported via diagnostics (`WithTenantOptions.onCleanupError` or `process.emitWarning`) without throwing a false transaction error that would cause callers to retry already committed operations.
+  - On confirmed rollback, the clean idle connection is returned to the pool after session cleanup.
+  - On uncertain connection state (unhandled commit failure, failed rollback, or unconfirmed outcome), the connection is destroyed via `client.release(true)`.
+  - **Residual Limitations:** Custom GUCs provide application context, not cryptographic tokens (§12.6). A process compromised by arbitrary code execution could manipulate memory or execute queries directly; defense-in-depth requires strict input parameterization and application sandbox isolation.
+
+##### 2. Migration `0009-tenant-rls-policies.sql` & Unified Policy Architecture
+
+Migration `0009-tenant-rls-policies.sql` establishes:
+
+- **Row-Level Security Posture:** Asserts `ENABLE ROW LEVEL SECURITY` and `FORCE ROW LEVEL SECURITY` across all 9 tenant-owned tables (`organizations`, `users`, `web_sessions`, `provider_keys`, `virtual_keys`, `gateway_requests`, `provider_attempts`, `provider_cost_adjustments`, `trace_payloads`). `FORCE RLS` ensures policies apply even to table owner `gateway_owner`.
+- **Unified Permissive Policies (DB-04 Guard):** Exactly one permissive policy per table (`FOR ALL TO PUBLIC USING (...) WITH CHECK (...)`). This permanently avoids the PostgreSQL vulnerability where multiple permissive policies are evaluated with logical `OR`. If `app.current_org_id` is unset or empty, the predicate evaluates to `NULL` (falsy), denying all access by default.
+- **Least-Privilege Role Grants:**
+  - `gateway_app`: Tenant-scoped CRUD on data/control plane tables; denied `DELETE` on financial ledger tables; denied `UPDATE`/`DELETE` on append-only adjustments.
+  - `gateway_worker`: Non-secret metadata on organizations/provider keys; insert/update on attempts, adjustments, traces; secret columns (`wrapped_dek`, `ciphertext`, IVs, auth tags) and user/session tables strictly revoked/denied.
+  - `gateway_startup` & `PUBLIC`: Zero table grants on all tenant tables.
+  - Runtime roles possess no `BYPASSRLS` attribute and cannot alter RLS policies.
+
+#### 7.7.9 Known limitations (Phase 2)
 
 - `gateway_startup` may update `gateway_epoch` but not `updated_at`; the §12.1 column grant is
   literal, so epoch bumps leave `updated_at` stale. A trigger or a widened grant is a Phase 2
@@ -327,7 +385,7 @@ migration `0008-financial-integrity.sql` hardens the financial ledger:
   exclusive transaction advisory lock. Column grants cannot enforce lock ordering; that
   admission-protocol invariant is a Phase 2 implementation concern.
 
-#### 7.7.9 Database integration tests
+#### 7.7.10 Database integration tests
 
 ```bash
 pnpm --filter @switchyard/gateway test:db   # or: pnpm test:db from the repo root

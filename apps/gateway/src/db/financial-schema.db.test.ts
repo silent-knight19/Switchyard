@@ -506,10 +506,19 @@ describe('SW-1.3.3 financial and observability schema: constraints, FKs, generat
       const { rows: policies } = await pool.query<{ tablename: string; policyname: string }>(
         `SELECT tablename, policyname
          FROM pg_policies
-         WHERE schemaname = 'public' AND tablename = ANY($1::text[])`,
+         WHERE schemaname = 'public' AND tablename = ANY($1::text[])
+         ORDER BY tablename`,
         [FINANCIAL_TABLES],
       );
-      expect(policies).toEqual([]);
+      expect(policies).toEqual([
+        { tablename: 'gateway_requests', policyname: 'gateway_requests_tenant_isolation' },
+        { tablename: 'provider_attempts', policyname: 'provider_attempts_tenant_isolation' },
+        {
+          tablename: 'provider_cost_adjustments',
+          policyname: 'provider_cost_adjustments_tenant_isolation',
+        },
+        { tablename: 'trace_payloads', policyname: 'trace_payloads_tenant_isolation' },
+      ]);
     });
 
     it('revokes all permissions on the four tables from PUBLIC', async () => {
@@ -1325,22 +1334,43 @@ describe('SW-1.3.3 financial and observability schema: constraints, FKs, generat
   });
 
   describe('PostgreSQL role least privilege under real authenticated sessions', () => {
-    it('denies gateway_app, gateway_worker, and gateway_startup on all four financial tables (42501)', async () => {
+    it('enforces least-privilege grants and RLS on financial tables across runtime roles (42501)', async () => {
       const app = await connectAs(fresh, 'gateway_app');
       const worker = await connectAs(fresh, 'gateway_worker');
       const startup = await connectAs(fresh, 'gateway_startup');
 
       const clients = [app, worker, startup];
       try {
-        for (const client of clients) {
+        // 1. gateway_startup is denied all operations on all financial tables
+        for (const table of FINANCIAL_TABLES) {
+          await expectSqlState(startup.query(`SELECT * FROM ${table}`), '42501');
+          await expectSqlState(startup.query(`INSERT INTO ${table} DEFAULT VALUES`), '42501');
+          await expectSqlState(startup.query(`UPDATE ${table} SET org_id = org_id`), '42501');
+          await expectSqlState(startup.query(`DELETE FROM ${table}`), '42501');
+          await expectSqlState(startup.query(`TRUNCATE TABLE ${table}`), '42501');
+        }
+
+        // 2. Financial deletion and TRUNCATE are denied to runtime roles
+        for (const client of [app, worker]) {
+          await expectSqlState(client.query('DELETE FROM gateway_requests'), '42501');
+          await expectSqlState(client.query('DELETE FROM provider_attempts'), '42501');
+          await expectSqlState(client.query('DELETE FROM provider_cost_adjustments'), '42501');
+          await expectSqlState(
+            client.query('UPDATE provider_cost_adjustments SET delta_microdollars = 0'),
+            '42501',
+          );
           for (const table of FINANCIAL_TABLES) {
-            await expectSqlState(client.query(`SELECT * FROM ${table}`), '42501');
-            await expectSqlState(client.query(`INSERT INTO ${table} DEFAULT VALUES`), '42501');
-            await expectSqlState(client.query(`UPDATE ${table} SET org_id = org_id`), '42501');
-            await expectSqlState(client.query(`DELETE FROM ${table}`), '42501');
             await expectSqlState(client.query(`TRUNCATE TABLE ${table}`), '42501');
           }
           await expectSqlState(client.query('SET ROLE gateway_owner'), '42501');
+        }
+
+        // 3. Without tenant context, SELECT returns 0 rows via RLS
+        for (const table of FINANCIAL_TABLES) {
+          const { rows: appRows } = await app.query(`SELECT * FROM ${table}`);
+          expect(appRows).toHaveLength(0);
+          const { rows: workerRows } = await worker.query(`SELECT * FROM ${table}`);
+          expect(workerRows).toHaveLength(0);
         }
       } finally {
         for (const client of clients) {
@@ -1411,9 +1441,9 @@ describe('SW-1.3.3 financial and observability schema: constraints, FKs, generat
           await seeder.end();
         }
 
-        // Apply remaining migrations using authoritative directory (applies 0007 and 0008)
+        // Apply remaining migrations using authoritative directory (applies 0007, 0008, 0009)
         const secondRun = await migrate(upgradedDb);
-        expect(secondRun).toEqual(['0007', '0008']);
+        expect(secondRun).toEqual(['0007', '0008', '0009']);
 
         // Verify seeded data intact
         const verifier = new pg.Client({ connectionString: upgradedDb.url });

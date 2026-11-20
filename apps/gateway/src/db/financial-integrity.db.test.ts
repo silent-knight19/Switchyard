@@ -274,7 +274,8 @@ describe('SW-1.3.4 Financial Immutability, Append-Only Adjustments, and Monetary
          WHERE n.nspname = 'public' AND c.relname = ANY($1)`,
         [tables],
       );
-      expect(policyRows[0]?.count).toBe(0);
+      // Subphase 1.4 (SW-1.4.2) defines exactly one unified isolation policy per tenant table
+      expect(policyRows[0]?.count).toBe(tables.length);
     });
   });
 
@@ -1554,9 +1555,9 @@ describe('SW-1.3.4 Financial Immutability, Append-Only Adjustments, and Monetary
           fs.writeFileSync(path.join(tempDir, `${file.name}.sql`), file.sql, 'utf8');
         }
 
-        // Add failing migration 0009
+        // Add failing migration 0010 (subsequent to all 0001..0009 authoritative migrations)
         fs.writeFileSync(
-          path.join(tempDir, '0009-failing-migration.sql'),
+          path.join(tempDir, '0010-failing-migration.sql'),
           'SET ROLE gateway_owner; CREATE TABLE broken_table (id int); SYNTAX_ERROR_CRASH;',
           'utf8',
         );
@@ -1584,7 +1585,7 @@ describe('SW-1.3.4 Financial Immutability, Append-Only Adjustments, and Monetary
           expect(rows[0]?.exists).toBe(false);
 
           const { rows: ledger } = await verifier.query<{ version: string }>(
-            `SELECT version FROM ${MIGRATION_LEDGER_TABLE} WHERE version = '0009'`,
+            `SELECT version FROM ${MIGRATION_LEDGER_TABLE} WHERE version = '0010'`,
           );
           expect(ledger).toHaveLength(0);
         } finally {
@@ -1713,7 +1714,7 @@ describe('SW-1.3.4 Financial Immutability, Append-Only Adjustments, and Monetary
           await seeder.end();
         }
 
-        // Apply remaining migrations using authoritative migration directory (applies 0008)
+        // Apply remaining migrations using authoritative migration directory (applies 0008, 0009)
         const migrator2 = new pg.Pool({
           connectionString: roleConnectionString(
             upgradeDb.url,
@@ -1723,7 +1724,7 @@ describe('SW-1.3.4 Financial Immutability, Append-Only Adjustments, and Monetary
         });
         try {
           const secondRun = await runMigrations(migrator2);
-          expect(secondRun).toEqual(['0008']);
+          expect(secondRun).toEqual(['0008', '0009']);
         } finally {
           await migrator2.end();
         }
@@ -1788,19 +1789,22 @@ describe('SW-1.3.4 Financial Immutability, Append-Only Adjustments, and Monetary
   // Section G: PostgreSQL Role Least Privilege under Authenticated Sessions
   // =========================================================================
   describe('G. Role Least Privilege under Authenticated Sessions', () => {
-    it('verifies gateway_app cannot execute DML on financial tables (42501)', async () => {
+    it('verifies gateway_app cannot execute unauthorized DML on financial tables (42501)', async () => {
       const appClient = await connectAs(fresh, 'gateway_app');
       try {
-        await expectSqlState(appClient.query('SELECT * FROM gateway_requests LIMIT 1'), '42501');
-        await expectSqlState(appClient.query('SELECT * FROM provider_attempts LIMIT 1'), '42501');
-        await expectSqlState(
-          appClient.query('SELECT * FROM provider_cost_adjustments LIMIT 1'),
-          '42501',
-        );
-        await expectSqlState(appClient.query('SELECT * FROM trace_payloads LIMIT 1'), '42501');
+        // Without tenant context, SELECT returns 0 rows via RLS
+        const { rows: reqRows } = await appClient.query('SELECT * FROM gateway_requests LIMIT 1');
+        expect(reqRows).toHaveLength(0);
 
+        // Financial DELETE is strictly prohibited
         await expectSqlState(
           appClient.query("DELETE FROM provider_attempts WHERE status = 'settled'"),
+          '42501',
+        );
+        await expectSqlState(appClient.query('DELETE FROM gateway_requests'), '42501');
+        await expectSqlState(appClient.query('DELETE FROM provider_cost_adjustments'), '42501');
+        await expectSqlState(
+          appClient.query('UPDATE provider_cost_adjustments SET delta_microdollars = 0'),
           '42501',
         );
       } finally {
@@ -1808,19 +1812,26 @@ describe('SW-1.3.4 Financial Immutability, Append-Only Adjustments, and Monetary
       }
     });
 
-    it('verifies gateway_worker cannot execute DML on financial tables (42501)', async () => {
+    it('verifies gateway_worker cannot execute unauthorized DML on financial tables (42501)', async () => {
       const workerClient = await connectAs(fresh, 'gateway_worker');
       try {
-        await expectSqlState(workerClient.query('SELECT * FROM gateway_requests LIMIT 1'), '42501');
+        // Without tenant context, SELECT returns 0 rows via RLS
+        const { rows: reqRows } = await workerClient.query(
+          'SELECT * FROM gateway_requests LIMIT 1',
+        );
+        expect(reqRows).toHaveLength(0);
+
+        // Financial DELETE is strictly prohibited
         await expectSqlState(
-          workerClient.query('SELECT * FROM provider_attempts LIMIT 1'),
+          workerClient.query("DELETE FROM provider_attempts WHERE status = 'settled'"),
           '42501',
         );
+        await expectSqlState(workerClient.query('DELETE FROM gateway_requests'), '42501');
+        await expectSqlState(workerClient.query('DELETE FROM provider_cost_adjustments'), '42501');
         await expectSqlState(
-          workerClient.query('SELECT * FROM provider_cost_adjustments LIMIT 1'),
+          workerClient.query('UPDATE provider_cost_adjustments SET delta_microdollars = 0'),
           '42501',
         );
-        await expectSqlState(workerClient.query('SELECT * FROM trace_payloads LIMIT 1'), '42501');
       } finally {
         await workerClient.end();
       }

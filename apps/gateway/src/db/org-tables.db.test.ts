@@ -129,7 +129,15 @@ describe('SW-1.3.2 tenant core tables: constraints, RLS posture, upgrade safety'
     } finally {
       await legacyClient.end();
     }
-    expect(await migrate(upgraded)).toEqual(['0003', '0004', '0005', '0006', '0007', '0008']);
+    expect(await migrate(upgraded)).toEqual([
+      '0003',
+      '0004',
+      '0005',
+      '0006',
+      '0007',
+      '0008',
+      '0009',
+    ]);
   });
 
   afterAll(async () => {
@@ -173,13 +181,26 @@ describe('SW-1.3.2 tenant core tables: constraints, RLS posture, upgrade safety'
     expect(byName.get('gateway_control')?.forced).toBe(false);
 
     const { rows: policies } = await pool.query<{ tablename: string; policyname: string }>(
-      `SELECT tablename, policyname FROM pg_policies WHERE schemaname = 'public'`,
+      `SELECT tablename, policyname FROM pg_policies WHERE schemaname = 'public' ORDER BY tablename`,
     );
-    // Batch A deliberately leaves the tenant tables policy-free (default deny) until SW-1.4.
-    expect(policies).toEqual([]);
+    // Subphase 1.4 (SW-1.4.2) defines exactly one unified tenant isolation policy per tenant table.
+    expect(policies).toEqual([
+      { tablename: 'gateway_requests', policyname: 'gateway_requests_tenant_isolation' },
+      { tablename: 'organizations', policyname: 'organizations_tenant_isolation' },
+      { tablename: 'provider_attempts', policyname: 'provider_attempts_tenant_isolation' },
+      {
+        tablename: 'provider_cost_adjustments',
+        policyname: 'provider_cost_adjustments_tenant_isolation',
+      },
+      { tablename: 'provider_keys', policyname: 'provider_keys_tenant_isolation' },
+      { tablename: 'trace_payloads', policyname: 'trace_payloads_tenant_isolation' },
+      { tablename: 'users', policyname: 'users_tenant_isolation' },
+      { tablename: 'virtual_keys', policyname: 'virtual_keys_tenant_isolation' },
+      { tablename: 'web_sessions', policyname: 'web_sessions_tenant_isolation' },
+    ]);
   });
 
-  it('default-deny is effective for a non-superuser table owner with and without tenant context', async () => {
+  it('default-deny is effective for a non-superuser table owner without tenant context and on mismatched org', async () => {
     const client = await pool.connect();
     try {
       await client.query('SET ROLE gateway_owner');
@@ -188,12 +209,18 @@ describe('SW-1.3.2 tenant core tables: constraints, RLS posture, upgrade safety'
       );
       expect(withoutContext[0]?.count).toBe(0);
 
-      await client.query(`SELECT set_config('app.current_org_id', $1, false)`, [ORG_A]);
-      const { rows: withContext } = await client.query<{ count: number }>(
-        'SELECT count(*)::int AS count FROM users',
+      // Attempting to insert without tenant context is rejected by RLS (42501)
+      await expectSqlState(
+        client.query(
+          `INSERT INTO users (id, org_id, email_normalized, password_hash, role)
+           VALUES ($1, $2, 'rls-probe@example.com', 'hash', 'member')`,
+          [USER_B, ORG_A],
+        ),
+        '42501',
       );
-      expect(withContext[0]?.count).toBe(0);
 
+      // Attempting to insert with mismatched tenant context (Org B context inserting Org A row) is rejected by RLS (42501)
+      await client.query(`SELECT set_config('app.current_org_id', $1, false)`, [ORG_B]);
       await expectSqlState(
         client.query(
           `INSERT INTO users (id, org_id, email_normalized, password_hash, role)
