@@ -130,8 +130,14 @@ SECURITY DEFINER
 SET search_path = pg_catalog, app_private, pg_temp
 AS $$
 BEGIN
-  -- Fail closed: reject NULL, empty, or oversized input (> 255 chars). Invalid/unknown returns no rows.
-  IF p_email_normalized IS NULL OR p_email_normalized = '' OR pg_catalog.length(p_email_normalized) > 255 THEN
+  -- Fail closed: reject NULL, empty, oversized (> 255 chars), or noncanonical email.
+  -- Canonical normalized email must be trimmed, lowercase, contain exactly one '@', and contain no whitespace.
+  IF p_email_normalized IS NULL
+     OR p_email_normalized = ''
+     OR pg_catalog.length(p_email_normalized) > 255
+     OR p_email_normalized != pg_catalog.btrim(p_email_normalized)
+     OR p_email_normalized != pg_catalog.lower(p_email_normalized)
+     OR p_email_normalized !~ '^[^@\s]+@[^@\s]+$' THEN
     RETURN;
   END IF;
 
@@ -200,13 +206,23 @@ BEGIN
       USING ERRCODE = '22023';
   END IF;
 
-  IF p_admin_email_normalized IS NULL OR p_admin_email_normalized = '' OR pg_catalog.length(p_admin_email_normalized) > 255 THEN
-    RAISE EXCEPTION 'Invalid admin email'
+  -- DB-36: Enforce strict canonical normalized email (lowercase, trimmed, valid structure, <= 255 chars).
+  IF p_admin_email_normalized IS NULL
+     OR p_admin_email_normalized = ''
+     OR pg_catalog.length(p_admin_email_normalized) > 255
+     OR p_admin_email_normalized != pg_catalog.btrim(p_admin_email_normalized)
+     OR p_admin_email_normalized != pg_catalog.lower(p_admin_email_normalized)
+     OR p_admin_email_normalized !~ '^[^@\s]+@[^@\s]+$' THEN
+    RAISE EXCEPTION 'Invalid admin email: must be canonical normalized (lowercase, trimmed, valid format, <= 255 characters)'
       USING ERRCODE = '22023';
   END IF;
 
-  IF p_admin_password_hash IS NULL OR p_admin_password_hash = '' OR pg_catalog.length(p_admin_password_hash) > 255 THEN
-    RAISE EXCEPTION 'Invalid admin password hash'
+  -- DB-37: Validate Argon2id PHC verifier representation. Reject plaintext, non-Argon2 algorithms, and malformed structures.
+  IF p_admin_password_hash IS NULL
+     OR p_admin_password_hash = ''
+     OR pg_catalog.length(p_admin_password_hash) > 255
+     OR p_admin_password_hash !~ '^\$argon2id\$v=\d+\$[a-z0-9,=]+\$[A-Za-z0-9+/=_-]+(\$[A-Za-z0-9+/=_-]+)*$' THEN
+    RAISE EXCEPTION 'Invalid admin password hash: must be a valid Argon2id verifier representation'
       USING ERRCODE = '22023';
   END IF;
 

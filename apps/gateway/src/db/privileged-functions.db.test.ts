@@ -441,6 +441,25 @@ describe('SW-1.4.3 & SW-1.4.4 Privileged Functions Integration Suite (real Postg
       expect(rows).toHaveLength(0);
     });
 
+    it('fails closed and returns 0 rows on leading/trailing whitespace or malformed email (DB-36)', async () => {
+      const resLeading = await appClient.query(
+        'SELECT * FROM app_private.lookup_user_for_login($1)',
+        [' admin@alpha.com'],
+      );
+      expect(resLeading.rows).toHaveLength(0);
+
+      const resTrailing = await appClient.query(
+        'SELECT * FROM app_private.lookup_user_for_login($1)',
+        ['admin@alpha.com '],
+      );
+      expect(resTrailing.rows).toHaveLength(0);
+
+      const resNoAt = await appClient.query('SELECT * FROM app_private.lookup_user_for_login($1)', [
+        'adminalpha.com',
+      ]);
+      expect(resNoAt.rows).toHaveLength(0);
+    });
+
     it('fails closed and returns 0 rows on NULL, empty, or oversized input', async () => {
       // NULL
       const resNull = await appClient.query('SELECT * FROM app_private.lookup_user_for_login($1)', [
@@ -547,7 +566,7 @@ describe('SW-1.4.3 & SW-1.4.4 Privileged Functions Integration Suite (real Postg
             Buffer.from('tag'),
             freshAdminId,
             'unique.email@test.com',
-            'hash',
+            '$argon2id$v=19$m=65536,t=3,p=4$someHash',
           ],
         ),
         '23505',
@@ -581,7 +600,7 @@ describe('SW-1.4.3 & SW-1.4.4 Privileged Functions Integration Suite (real Postg
             Buffer.from('tag'),
             freshAdminId,
             'founder@bootstrap.com', // duplicate email!
-            'hash',
+            '$argon2id$v=19$m=65536,t=3,p=4$someHash',
           ],
         ),
         '23505',
@@ -599,7 +618,7 @@ describe('SW-1.4.3 & SW-1.4.4 Privileged Functions Integration Suite (real Postg
         appClient.query(`
           SELECT * FROM app_private.create_organization_with_admin(
             NULL, 'Org', 1000, 1, '\\x01'::bytea, '\\x02'::bytea, '\\x03'::bytea,
-            '99999999-9999-9999-9999-999999999999', 'a@b.com', 'h'
+            '99999999-9999-9999-9999-999999999999', 'a@b.com', '$argon2id$v=19$m=65536,t=3,p=4$someHash'
           )
         `),
         '22004',
@@ -609,7 +628,7 @@ describe('SW-1.4.3 & SW-1.4.4 Privileged Functions Integration Suite (real Postg
         appClient.query(`
           SELECT * FROM app_private.create_organization_with_admin(
             '99999999-9999-9999-9999-999999999999', 'Org', 1000, 1, '\\x01'::bytea, '\\x02'::bytea, '\\x03'::bytea,
-            NULL, 'a@b.com', 'h'
+            NULL, 'a@b.com', '$argon2id$v=19$m=65536,t=3,p=4$someHash'
           )
         `),
         '22004',
@@ -619,6 +638,7 @@ describe('SW-1.4.3 & SW-1.4.4 Privileged Functions Integration Suite (real Postg
     it('rejects invalid parameters with SQLSTATE 22023', async () => {
       const validOrg = '99999999-9999-9999-9999-999999999991';
       const validAdmin = '99999999-9999-9999-9999-999999999992';
+      const validHash = '$argon2id$v=19$m=65536,t=3,p=4$testHash';
 
       // Empty name
       await expectSqlState(
@@ -626,10 +646,10 @@ describe('SW-1.4.3 & SW-1.4.4 Privileged Functions Integration Suite (real Postg
           `
           SELECT * FROM app_private.create_organization_with_admin(
             $1, '   ', 1000, 1, '\\x01'::bytea, '\\x02'::bytea, '\\x03'::bytea,
-            $2, 'test@test.com', 'pass'
+            $2, 'test@test.com', $3
           )
         `,
-          [validOrg, validAdmin],
+          [validOrg, validAdmin, validHash],
         ),
         '22023',
       );
@@ -640,10 +660,10 @@ describe('SW-1.4.3 & SW-1.4.4 Privileged Functions Integration Suite (real Postg
           `
           SELECT * FROM app_private.create_organization_with_admin(
             $1, 'Org', -1, 1, '\\x01'::bytea, '\\x02'::bytea, '\\x03'::bytea,
-            $2, 'test@test.com', 'pass'
+            $2, 'test@test.com', $3
           )
         `,
-          [validOrg, validAdmin],
+          [validOrg, validAdmin, validHash],
         ),
         '22023',
       );
@@ -654,10 +674,10 @@ describe('SW-1.4.3 & SW-1.4.4 Privileged Functions Integration Suite (real Postg
           `
           SELECT * FROM app_private.create_organization_with_admin(
             $1, 'Org', 1000000000000001, 1, '\\x01'::bytea, '\\x02'::bytea, '\\x03'::bytea,
-            $2, 'test@test.com', 'pass'
+            $2, 'test@test.com', $3
           )
         `,
-          [validOrg, validAdmin],
+          [validOrg, validAdmin, validHash],
         ),
         '22023',
       );
@@ -668,10 +688,10 @@ describe('SW-1.4.3 & SW-1.4.4 Privileged Functions Integration Suite (real Postg
           `
           SELECT * FROM app_private.create_organization_with_admin(
             $1, 'Org', 1000, 0, '\\x01'::bytea, '\\x02'::bytea, '\\x03'::bytea,
-            $2, 'test@test.com', 'pass'
+            $2, 'test@test.com', $3
           )
         `,
-          [validOrg, validAdmin],
+          [validOrg, validAdmin, validHash],
         ),
         '22023',
       );
@@ -682,10 +702,10 @@ describe('SW-1.4.3 & SW-1.4.4 Privileged Functions Integration Suite (real Postg
           `
           SELECT * FROM app_private.create_organization_with_admin(
             $1, 'Org', 1000, 1, '\\x'::bytea, '\\x02'::bytea, '\\x03'::bytea,
-            $2, 'test@test.com', 'pass'
+            $2, 'test@test.com', $3
           )
         `,
-          [validOrg, validAdmin],
+          [validOrg, validAdmin, validHash],
         ),
         '22023',
       );
@@ -696,10 +716,10 @@ describe('SW-1.4.3 & SW-1.4.4 Privileged Functions Integration Suite (real Postg
           `
           SELECT * FROM app_private.create_organization_with_admin(
             $1, 'Org', 1000, 1, '\\x01'::bytea, '\\x02'::bytea, '\\x03'::bytea,
-            $2, '', 'pass'
+            $2, '', $3
           )
         `,
-          [validOrg, validAdmin],
+          [validOrg, validAdmin, validHash],
         ),
         '22023',
       );
@@ -717,6 +737,215 @@ describe('SW-1.4.3 & SW-1.4.4 Privileged Functions Integration Suite (real Postg
         ),
         '22023',
       );
+    });
+
+    it('enforces canonical normalized email contract on bootstrap (DB-36)', async () => {
+      const baseOrg = '99999999-9999-9999-9999-9999999999a0';
+      const baseAdmin = '99999999-9999-9999-9999-9999999999a1';
+      const validHash = '$argon2id$v=19$m=65536,t=3,p=4$someHash';
+
+      // 1. Mixed-case admin email rejected with 22023
+      await expectSqlState(
+        appClient.query(
+          `
+          SELECT * FROM app_private.create_organization_with_admin(
+            $1, 'Org Mixed', 1000, 1, '\\x01'::bytea, '\\x02'::bytea, '\\x03'::bytea,
+            $2, 'Admin@Bootstrap.com', $3
+          )
+        `,
+          [baseOrg, baseAdmin, validHash],
+        ),
+        '22023',
+      );
+
+      // Verify no orphan organization persisted after mixed-case rejection
+      const orphan1 = await adminClient.query('SELECT id FROM organizations WHERE id = $1', [
+        baseOrg,
+      ]);
+      expect(orphan1.rows).toHaveLength(0);
+
+      // 2. Leading whitespace rejected with 22023
+      await expectSqlState(
+        appClient.query(
+          `
+          SELECT * FROM app_private.create_organization_with_admin(
+            $1, 'Org Lead Space', 1000, 1, '\\x01'::bytea, '\\x02'::bytea, '\\x03'::bytea,
+            $2, ' admin@bootstrap.com', $3
+          )
+        `,
+          [baseOrg, baseAdmin, validHash],
+        ),
+        '22023',
+      );
+
+      // 3. Trailing whitespace rejected with 22023
+      await expectSqlState(
+        appClient.query(
+          `
+          SELECT * FROM app_private.create_organization_with_admin(
+            $1, 'Org Trail Space', 1000, 1, '\\x01'::bytea, '\\x02'::bytea, '\\x03'::bytea,
+            $2, 'admin@bootstrap.com ', $3
+          )
+        `,
+          [baseOrg, baseAdmin, validHash],
+        ),
+        '22023',
+      );
+
+      // 4. Oversized email (> 255 chars) rejected with 22023
+      const oversizedEmail = 'a'.repeat(250) + '@bootstrap.com';
+      await expectSqlState(
+        appClient.query(
+          `
+          SELECT * FROM app_private.create_organization_with_admin(
+            $1, 'Org Oversized', 1000, 1, '\\x01'::bytea, '\\x02'::bytea, '\\x03'::bytea,
+            $2, $3, $4
+          )
+        `,
+          [baseOrg, baseAdmin, oversizedEmail, validHash],
+        ),
+        '22023',
+      );
+
+      // 5. Canonical lowercase email accepted and immediately resolvable by lookup_user_for_login
+      const canonicalOrgId = '99999999-9999-9999-9999-9999999999a2';
+      const canonicalAdminId = '99999999-9999-9999-9999-9999999999a3';
+      const canonicalEmail = 'canonical.admin@bootstrap.com';
+
+      const createRes = await appClient.query<{ org_id: string; admin_user_id: string }>(
+        `
+        SELECT * FROM app_private.create_organization_with_admin(
+          $1, 'Canonical Org', 1000, 1, '\\x01'::bytea, '\\x02'::bytea, '\\x03'::bytea,
+          $2, $3, $4
+        )
+      `,
+        [canonicalOrgId, canonicalAdminId, canonicalEmail, validHash],
+      );
+      expect(createRes.rows).toHaveLength(1);
+      expect(createRes.rows[0]?.org_id).toBe(canonicalOrgId);
+      expect(createRes.rows[0]?.admin_user_id).toBe(canonicalAdminId);
+
+      // Verify immediate resolution via lookup_user_for_login
+      const lookupRes = await appClient.query<{
+        id: string;
+        org_id: string;
+        role: string;
+        password_hash: string;
+      }>('SELECT * FROM app_private.lookup_user_for_login($1)', [canonicalEmail]);
+      expect(lookupRes.rows).toHaveLength(1);
+      expect(lookupRes.rows[0]?.id).toBe(canonicalAdminId);
+      expect(lookupRes.rows[0]?.org_id).toBe(canonicalOrgId);
+      expect(lookupRes.rows[0]?.role).toBe('admin');
+      expect(lookupRes.rows[0]?.password_hash).toBe(validHash);
+
+      // 6. Rejected input cannot create a second identity differing only in email capitalization
+      const competingOrgId = '99999999-9999-9999-9999-9999999999a4';
+      const competingAdminId = '99999999-9999-9999-9999-9999999999a5';
+      await expectSqlState(
+        appClient.query(
+          `
+          SELECT * FROM app_private.create_organization_with_admin(
+            $1, 'Competing Org', 1000, 1, '\\x01'::bytea, '\\x02'::bytea, '\\x03'::bytea,
+            $2, 'Canonical.Admin@Bootstrap.com', $3
+          )
+        `,
+          [competingOrgId, competingAdminId, validHash],
+        ),
+        '22023',
+      );
+
+      // Verify persistent state: only exactly 1 user exists with that email stem
+      const countRes = await adminClient.query(
+        'SELECT count(*)::int as count FROM users WHERE lower(email_normalized) = $1',
+        [canonicalEmail],
+      );
+      expect(countRes.rows[0]?.count).toBe(1);
+    });
+
+    it('enforces Argon2id verifier representation contract on bootstrap (DB-37)', async () => {
+      const baseOrg = '99999999-9999-9999-9999-9999999999b0';
+      const baseAdmin = '99999999-9999-9999-9999-9999999999b1';
+
+      // 1. Plaintext passwords rejected with 22023
+      for (const plaintext of ['hunter2', 'Password123!', 'plaintext', 'pass']) {
+        await expectSqlState(
+          appClient.query(
+            `
+            SELECT * FROM app_private.create_organization_with_admin(
+              $1, 'Org Plaintext', 1000, 1, '\\x01'::bytea, '\\x02'::bytea, '\\x03'::bytea,
+              $2, 'admin.plaintext@test.com', $3
+            )
+          `,
+            [baseOrg, baseAdmin, plaintext],
+          ),
+          '22023',
+        );
+      }
+
+      // 2. Non-Argon2 algorithms rejected with 22023
+      const bcryptHash = '$2a$12$R9h/cIPz0gi.URNNXRkh2OPST9/PgBkqquzi.Ss7KIUgO2t0jWMUW';
+      await expectSqlState(
+        appClient.query(
+          `
+          SELECT * FROM app_private.create_organization_with_admin(
+            $1, 'Org Bcrypt', 1000, 1, '\\x01'::bytea, '\\x02'::bytea, '\\x03'::bytea,
+            $2, 'admin.bcrypt@test.com', $3
+          )
+        `,
+          [baseOrg, baseAdmin, bcryptHash],
+        ),
+        '22023',
+      );
+
+      // 3. Malformed Argon2 strings rejected with 22023
+      for (const malformed of [
+        '$argon2id$',
+        '$argon2id$v=19$',
+        '$argon2id$v=19$m=65536',
+        '$argon2id$v=19$m=65536,t=3,p=4',
+      ]) {
+        await expectSqlState(
+          appClient.query(
+            `
+            SELECT * FROM app_private.create_organization_with_admin(
+              $1, 'Org Malformed', 1000, 1, '\\x01'::bytea, '\\x02'::bytea, '\\x03'::bytea,
+              $2, 'admin.malformed@test.com', $3
+            )
+          `,
+            [baseOrg, baseAdmin, malformed],
+          ),
+          '22023',
+        );
+      }
+
+      // 4. Legitimate OWASP-baseline Argon2id verifier accepted
+      const owaspOrgId = '99999999-9999-9999-9999-9999999999b2';
+      const owaspAdminId = '99999999-9999-9999-9999-9999999999b3';
+      const owaspHash = '$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$somehash123';
+      const owaspEmail = 'owasp.admin@bootstrap.com';
+
+      const res = await appClient.query<{ org_id: string; admin_user_id: string }>(
+        `
+        SELECT * FROM app_private.create_organization_with_admin(
+          $1, 'OWASP Org', 1000, 1, '\\x01'::bytea, '\\x02'::bytea, '\\x03'::bytea,
+          $2, $3, $4
+        )
+      `,
+        [owaspOrgId, owaspAdminId, owaspEmail, owaspHash],
+      );
+      expect(res.rows).toHaveLength(1);
+      expect(res.rows[0]?.org_id).toBe(owaspOrgId);
+      expect(res.rows[0]?.admin_user_id).toBe(owaspAdminId);
+
+      // Verify that create_organization_with_admin returns ONLY org_id and admin_user_id (no hash leaked)
+      const fieldNames = res.fields.map((f) => f.name);
+      expect(fieldNames).toEqual(['org_id', 'admin_user_id']);
+
+      // Verify persistent state: password_hash stored accurately without alteration
+      const checkHash = await adminClient.query('SELECT password_hash FROM users WHERE id = $1', [
+        owaspAdminId,
+      ]);
+      expect(checkHash.rows[0]?.password_hash).toBe(owaspHash);
     });
   });
 

@@ -388,14 +388,14 @@ Migration `0010-privileged-bootstrap-functions.sql` establishes secure, narrowly
      - **EXECUTE:** Granted strictly to `gateway_app`. Denied to `gateway_worker`, `gateway_startup`, and `PUBLIC`.
   2. `app_private.lookup_user_for_login(p_email_normalized TEXT)`:
      - **Owner:** `gateway_auth_executor` (`NOLOGIN BYPASSRLS`).
-     - **Purpose:** Resolves user identity for authentication by globally unique normalized email before tenant context exists.
-     - **Return contract:** Minimal login columns only (`id`, `org_id`, `role`, `password_hash`). Returns zero rows for NULL, empty, oversized (> 255 chars), or non-matching emails. Never exposes session tokens, CSRF secrets, or DEKs.
+     - **Purpose:** Resolves user identity for authentication by globally unique canonical normalized email before tenant context exists.
+     - **Return contract:** Minimal login columns only (`id`, `org_id`, `role`, `password_hash`). Returns zero rows for NULL, empty, oversized (> 255 chars), noncanonical (mixed-case, leading/trailing whitespace, missing `@`), or non-matching emails. Never exposes session tokens, CSRF secrets, or DEKs. Note that `password_hash` is intentionally returned because the trusted authentication handler in SW-1.5.1 requires the stored Argon2id verifier string to authenticate credentials.
      - **EXECUTE:** Granted strictly to `gateway_app`. Denied to `gateway_worker`, `gateway_startup`, and `PUBLIC`.
-  3. `app_private.create_organization_with_admin(...)`:
+  3. `app_private.create_organization_with_admin(p_org_id UUID, p_org_name TEXT, p_monthly_budget_microdollars BIGINT, p_kek_version INT, p_wrapped_dek BYTEA, p_dek_iv BYTEA, p_dek_auth_tag BYTEA, p_admin_user_id UUID, p_admin_email_normalized TEXT, p_admin_password_hash TEXT)`:
      - **Owner:** `gateway_auth_executor` (`NOLOGIN BYPASSRLS`).
      - **Purpose:** Atomically provisions a new organization and its initial administrator (`role = 'admin'`) before a tenant-scoped session exists.
-     - **Return contract:** Confirmation record (`org_id UUID`, `admin_user_id UUID`).
-     - **Atomicity & Validation:** Strict validation fails closed with SQLSTATE `22004` (nulls) and `22023` (invalid parameters, bounded budget up to $10^{15}$ microdollars, non-empty DEKs). Any uniqueness or persistence failure rolls back both inserts atomically, guaranteeing no orphan organizations or orphaned admin users.
+     - **Return contract:** Confirmation record of two UUIDs (`org_id UUID`, `admin_user_id UUID`).
+     - **Atomicity & Validation:** Strict validation fails closed with SQLSTATE `22004` (null IDs) and `22023` (invalid parameters, bounded budget up to $10^{15}$ microdollars, non-empty DEKs). Enforces canonical email normalization (lowercase, trimmed, valid email format, $\le 255$ chars; DB-36) and valid Argon2id verifier representation (rejects plaintext, non-Argon2 algorithms, and malformed structures; DB-37). Any uniqueness or persistence failure rolls back both inserts atomically, guaranteeing no orphan organizations or orphaned admin users.
      - **EXECUTE:** Granted strictly to `gateway_app`. Denied to `gateway_worker`, `gateway_startup`, and `PUBLIC`.
   4. `app_private.list_active_org_ids(p_after_id UUID DEFAULT NULL, p_limit INT DEFAULT 100)`:
      - **Owner:** `gateway_ops_executor` (`NOLOGIN BYPASSRLS`).

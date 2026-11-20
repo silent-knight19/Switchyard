@@ -157,8 +157,8 @@ To allow deployment role `gateway_migrator` to install executor-owned functions 
    - `gateway_startup` and `PUBLIC` have zero execution privileges.
 3. **Fail-Closed Input Contracts:**
    - `lookup_virtual_key_by_hash`: Fails closed and returns 0 rows on NULL, empty, or wrong-length hash (!= 32 bytes).
-   - `lookup_user_for_login`: Fails closed and returns 0 rows on NULL, empty, or oversized email (> 255 chars). Exact matching on `email_normalized` avoids inconsistent casing behavior.
-   - `create_organization_with_admin`: Bounded parameters (budget $\le 10^{15}$, non-empty DEKs) with controlled SQLSTATE exceptions (`22004`, `22023`). Atomic rollback on any constraint violation (`23505`) prevents orphan organizations or orphaned admin users.
+   - `lookup_user_for_login`: Fails closed and returns 0 rows on NULL, empty, oversized email (> 255 chars), or noncanonical email (mixed-case, leading/trailing whitespace, missing '@'; DB-36). Exact matching on canonical `email_normalized` avoids identity ambiguity. Returns `password_hash` strictly for verification by the trusted authentication handler in SW-1.5.1.
+   - `create_organization_with_admin`: Strict validation fails closed with SQLSTATE `22004` (nulls) and `22023` (invalid parameters, bounded budget $\le 10^{15}$, non-empty DEKs). Enforces strict canonical email normalization (DB-36) and Argon2id PHC verifier representation structure (DB-37), rejecting plaintext passwords, non-Argon2 algorithms, and malformed structures. Atomic rollback on any constraint violation (`23505`) prevents orphan organizations or orphaned admin users.
    - `list_active_org_ids`: Bounded limits (1..100). Invalid limits fail closed with SQLSTATE `22023`. Keyset pagination ensures deterministic, duplicate-free enumeration.
 4. **Maintenance Enumeration Privacy Boundary:**
    - `list_active_org_ids` returns only `org_id UUID`. It never returns organization names, budgets, wrapped DEKs, or created timestamps.
