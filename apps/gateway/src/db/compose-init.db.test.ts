@@ -6,19 +6,23 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { loadMigrationFiles } from './migrate.js';
 
 /**
- * Regression test for the fresh-Compose initialization path (review finding DB-15).
+ * Regression test for Docker Compose fresh initialization & password safety (DB-15, DB-16).
  * Demonstrates:
  * 1. A genuinely fresh database initializes successfully via Docker Compose.
- * 2. Role provisioning and local credential provisioning run first via 01-provision-roles.sql
- *    and 02-init-development.sh without executing migrations.
- * 3. All six migrations apply through the authoritative runner (apps/gateway/src/db/migrate.ts)
+ * 2. Role provisioning and local credential provisioning run via 01-provision-roles.sql
+ *    and 02-init-development.sh without executing migrations or printing passwords.
+ * 3. 02-init-development.sh safely sets passwords containing single quotes, spaces, double quotes,
+ *    and SQL-injection syntax (:'var') without statement breakage or SQL execution (DB-16).
+ * 4. All six migrations apply through the authoritative runner (apps/gateway/src/db/migrate.ts)
  *    under gateway_migrator before Gateway admission.
- * 4. All six ledger records have correct SHA-256 checksums matching authoritative files.
- * 5. The Gateway runtime container connects as gateway_app with least privilege.
- * 6. No administrator or migrator credentials are leaked into the Gateway container environment.
- * 7. Redis ACL attestation and Gateway healthcheck (/health/ready) pass.
- * 8. Restarting the stack is idempotent: migrate runs, finds no pending migrations, exits 0,
- *    and data is preserved across restart.
+ * 5. All six ledger records have correct SHA-256 checksums matching authoritative files.
+ * 6. The Gateway runtime container connects as gateway_app with least privilege.
+ * 7. All four expected roles (migrator, app, startup, worker) authenticate successfully with
+ *    their complex passwords and retain their required privileges.
+ * 8. No administrator or migrator credentials are leaked into the Gateway container environment.
+ * 9. Redis ACL attestation and Gateway healthcheck (/health/ready) pass.
+ * 10. Restarting the stack is idempotent: migrate runs, finds no pending migrations, exits 0,
+ *     and data is preserved across restart.
  *
  * Uses an isolated Compose project name, independently named disposable volumes, and ephemeral
  * ports so the persistent development database and Redis instances are never touched.
@@ -47,7 +51,7 @@ function run(cmd: string, args: string[], env: Record<string, string>): string {
   });
 }
 
-describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15 regression gate)', () => {
+describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15, DB-16 regression gate)', () => {
   const runId = crypto.randomBytes(4).toString('hex');
   const projectName = `switchyard-test-cmp-${runId}`;
   const pgContainer = `switchyard-test-pg-${runId}`;
@@ -57,6 +61,12 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15 regress
   const pgVolume = `switchyard_test_pg_vol_${runId}`;
   const redisVolume = `switchyard_test_redis_vol_${runId}`;
   const networkName = `switchyard-test-net-${runId}`;
+
+  // Passwords containing single quotes, spaces, and SQL injection syntax (DB-16) // gitleaks:allow
+  const migratorPass = "migrator'pass; DROP TABLE IF EXISTS injection_target; --"; // gitleaks:allow
+  const appPass = 'app \'pass with spaces\' and "quotes"'; // gitleaks:allow
+  const startupPass = "startup'quote; SELECT '1';"; // gitleaks:allow
+  const workerPass = "worker 'pass' with spaces & symbols"; // gitleaks:allow
 
   let pgPort: number;
   let redisPort: number;
@@ -79,6 +89,12 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15 regress
       POSTGRES_VOLUME_NAME: pgVolume,
       REDIS_VOLUME_NAME: redisVolume,
       NETWORK_NAME: networkName,
+      GATEWAY_MIGRATOR_PASSWORD: migratorPass,
+      MIGRATE_POSTGRES_PASSWORD: migratorPass,
+      GATEWAY_APP_PASSWORD: appPass,
+      GATEWAY_POSTGRES_PASSWORD: appPass,
+      GATEWAY_STARTUP_PASSWORD: startupPass,
+      GATEWAY_WORKER_PASSWORD: workerPass,
     };
 
     // Build image and start all services using isolated project
@@ -122,6 +138,14 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15 regress
     expect(pgLogs).not.toContain('ON CONFLICT (version) DO UPDATE SET checksum');
   });
 
+  it('does not leak plaintext passwords into container logs', () => {
+    const pgLogs = run('docker', ['logs', pgContainer], composeEnv);
+    expect(pgLogs).not.toContain(migratorPass);
+    expect(pgLogs).not.toContain(appPass);
+    expect(pgLogs).not.toContain(startupPass);
+    expect(pgLogs).not.toContain(workerPass);
+  });
+
   it('executes authoritative migration runner via migrate service and applies all six migrations', () => {
     // migrate container exited with code 0
     const exitCode = run(
@@ -150,7 +174,7 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15 regress
       port: pgPort,
       database: 'switchyard',
       user: 'gateway_migrator',
-      password: 'switchyard_migrator_password',
+      password: migratorPass,
     });
     await client.connect();
     try {
@@ -170,6 +194,92 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15 regress
       }
     } finally {
       await client.end();
+    }
+  });
+
+  it('authenticates all four roles with quote/space/injection passwords and preserves privileges', async () => {
+    // 1. gateway_migrator authenticates with SQL-injection shaped password
+    const migratorClient = new pg.Client({
+      host: '127.0.0.1',
+      port: pgPort,
+      database: 'switchyard',
+      user: 'gateway_migrator',
+      password: migratorPass,
+    });
+    await migratorClient.connect();
+    try {
+      const { rows } = await migratorClient.query<{ usename: string }>(
+        'SELECT current_user AS usename',
+      );
+      expect(rows[0]?.usename).toBe('gateway_migrator');
+    } finally {
+      await migratorClient.end();
+    }
+
+    // 2. gateway_app authenticates with password containing spaces and quotes
+    const appClient = new pg.Client({
+      host: '127.0.0.1',
+      port: pgPort,
+      database: 'switchyard',
+      user: 'gateway_app',
+      password: appPass,
+    });
+    await appClient.connect();
+    try {
+      const { rows: userRows } = await appClient.query<{ usename: string }>(
+        'SELECT current_user AS usename',
+      );
+      expect(userRows[0]?.usename).toBe('gateway_app');
+
+      const { rows: superRows } = await appClient.query<{
+        rolsuper: boolean;
+        rolbypassrls: boolean;
+      }>("SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = 'gateway_app'");
+      expect(superRows[0]?.rolsuper).toBe(false);
+      expect(superRows[0]?.rolbypassrls).toBe(false);
+
+      // gateway_app cannot CREATE TABLE
+      await expect(appClient.query('CREATE TABLE app_unauthorized (id int)')).rejects.toMatchObject(
+        { code: '42501' },
+      );
+    } finally {
+      await appClient.end();
+    }
+
+    // 3. gateway_startup authenticates with quote-containing password
+    const startupClient = new pg.Client({
+      host: '127.0.0.1',
+      port: pgPort,
+      database: 'switchyard',
+      user: 'gateway_startup',
+      password: startupPass,
+    });
+    await startupClient.connect();
+    try {
+      const { rows } = await startupClient.query<{ usename: string }>(
+        'SELECT current_user AS usename',
+      );
+      expect(rows[0]?.usename).toBe('gateway_startup');
+    } finally {
+      await startupClient.end();
+    }
+
+    // 4. gateway_worker authenticates with space/symbol password
+    const workerClient = new pg.Client({
+      host: '127.0.0.1',
+      port: pgPort,
+      database: 'switchyard',
+      user: 'gateway_worker',
+      password: workerPass,
+    });
+    await workerClient.connect();
+    try {
+      const { rows } = await workerClient.query<{ usename: string }>(
+        'SELECT current_user AS usename',
+      );
+      expect(rows[0]?.usename).toBe('gateway_worker');
+    } finally {
+      await workerClient.end();
     }
   });
 
@@ -198,13 +308,13 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15 regress
     const envLines = envOutput.split('\n');
 
     expect(envLines).toContain('POSTGRES_USER=gateway_app');
-    expect(envLines).toContain('POSTGRES_PASSWORD=switchyard_app_password');
+    expect(envLines).toContain(`POSTGRES_PASSWORD=${appPass}`);
 
     // Confirms migrator, bootstrap, and superuser secrets are absent
     expect(envLines.some((line) => line.startsWith('MIGRATE_'))).toBe(false);
     expect(envLines.some((line) => line.startsWith('BOOTSTRAP_'))).toBe(false);
     expect(envLines.some((line) => line.includes('switchyard_dev_password'))).toBe(false);
-    expect(envLines.some((line) => line.includes('switchyard_migrator_password'))).toBe(false);
+    expect(envLines.some((line) => line.includes(migratorPass))).toBe(false);
   });
 
   it('demonstrates Redis ACL attestation and Gateway readiness pass', async () => {
@@ -254,7 +364,7 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15 regress
       port: pgPort,
       database: 'switchyard',
       user: 'gateway_migrator',
-      password: 'switchyard_migrator_password',
+      password: migratorPass,
     });
     await client.connect();
     try {
