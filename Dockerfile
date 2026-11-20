@@ -32,6 +32,8 @@ COPY packages/shared/package.json ./packages/shared/
 RUN pnpm install --frozen-lockfile --prod
 
 COPY --from=builder /app/apps/gateway/dist ./apps/gateway/dist
+COPY apps/gateway/src/db/migrations ./apps/gateway/dist/db/migrations
+COPY apps/gateway/src/db/bootstrap/provision-roles.sql ./apps/gateway/dist/db/bootstrap/provision-roles.sql
 
 USER node
 

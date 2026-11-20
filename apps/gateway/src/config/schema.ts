@@ -54,12 +54,12 @@ export const rawEnvSchema = z
     PORT: portNumber.default(3000),
     HOST: z.string().min(1).default('127.0.0.1'),
 
-    // PostgreSQL
+    // PostgreSQL (runtime connects as restricted gateway_app role; review finding DB-12)
     POSTGRES_HOST: z.string().min(1).default('127.0.0.1'),
     POSTGRES_PORT: portNumber.default(5432),
     POSTGRES_DB: z.string().min(1).default('switchyard'),
-    POSTGRES_USER: z.string().min(1).default('switchyard'),
-    POSTGRES_PASSWORD: z.string().min(1).default('switchyard_dev_password'),
+    POSTGRES_USER: z.string().min(1).default('gateway_app'),
+    POSTGRES_PASSWORD: z.string().min(1).default('switchyard_app_password'),
 
     // Redis
     REDIS_HOST: z.string().min(1).default('127.0.0.1'),

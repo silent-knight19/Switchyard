@@ -8,8 +8,8 @@ const VALID_DEV_ENV: Record<string, string> = {
   POSTGRES_HOST: '127.0.0.1',
   POSTGRES_PORT: '5432',
   POSTGRES_DB: 'switchyard',
-  POSTGRES_USER: 'switchyard',
-  POSTGRES_PASSWORD: 'switchyard_dev_password',
+  POSTGRES_USER: 'gateway_app',
+  POSTGRES_PASSWORD: 'switchyard_app_password',
   REDIS_HOST: '127.0.0.1',
   REDIS_PORT: '6379',
   REDIS_USER: 'switchyard_app',
@@ -49,7 +49,15 @@ describe('SW-1.2.2 Central Zod Configuration', () => {
     expect(config.NODE_ENV).toBe('development');
     expect(config.PORT).toBe(3000);
     expect(config.POSTGRES_PORT).toBe(5432);
+    expect(config.POSTGRES_USER).toBe('gateway_app');
     expect(config.REDIS_MAXMEMORY_POLICY).toBe('noeviction');
+  });
+
+  it('1b. defaults PostgreSQL connection credentials to gateway_app (DB-12 least privilege)', () => {
+    const minimalDevEnv: Record<string, string> = { NODE_ENV: 'development' };
+    const config = loadConfig(minimalDevEnv);
+    expect(config.POSTGRES_USER).toBe('gateway_app');
+    expect(config.POSTGRES_PASSWORD).toBe('switchyard_app_password');
   });
 
   it('2. accepts valid test configuration', () => {
