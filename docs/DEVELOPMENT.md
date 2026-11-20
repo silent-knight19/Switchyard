@@ -121,17 +121,17 @@ cp .env.example .env
 ```bash
 docker compose up -d
 ```
-Starts PostgreSQL and Redis in detached mode on the private `switchyard-network`.
+Starts PostgreSQL, Redis, applies database migrations under advisory lock via the one-shot `migrate` service (`gateway_migrator`), and admits the Gateway (`gateway_app`) once migrations complete successfully.
 
 #### Status & Health Inspection
 ```bash
 docker compose ps
 ```
-Displays container state, port bindings, and healthcheck status (`healthy` / `starting` / `unhealthy`).
+Displays container state, port bindings, and healthcheck status (`healthy` / `starting` / `unhealthy` / `exited` for completed one-shot migration).
 
 #### Service Logs
 ```bash
-docker compose logs -f [postgres|redis]
+docker compose logs -f [postgres|redis|migrate|gateway]
 ```
 
 #### Safe Normal Shutdown (Preserves Volumes)

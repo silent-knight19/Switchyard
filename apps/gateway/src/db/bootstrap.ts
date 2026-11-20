@@ -14,10 +14,14 @@ export function bootstrapSqlPath(): string {
   const candidates = [
     path.join(process.cwd(), 'src', 'db', 'bootstrap', BOOTSTRAP_SQL_FILE),
     path.join(process.cwd(), 'dist', 'db', 'bootstrap', BOOTSTRAP_SQL_FILE),
+    path.join(process.cwd(), 'apps', 'gateway', 'src', 'db', 'bootstrap', BOOTSTRAP_SQL_FILE),
+    path.join(process.cwd(), 'apps', 'gateway', 'dist', 'db', 'bootstrap', BOOTSTRAP_SQL_FILE),
   ];
   const found = candidates.find((candidate) => fs.existsSync(candidate));
   if (!found) {
-    throw new Error('Role bootstrap SQL not found; run from the gateway package root');
+    throw new Error(
+      'Role bootstrap SQL not found; run from the gateway package root or repository root',
+    );
   }
   return found;
 }

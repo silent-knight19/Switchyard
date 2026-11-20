@@ -115,12 +115,14 @@ function migrationFilesDir(): string {
   const candidates = [
     path.join(process.cwd(), 'src', 'db', 'migrations'),
     path.join(process.cwd(), 'dist', 'db', 'migrations'),
+    path.join(process.cwd(), 'apps', 'gateway', 'src', 'db', 'migrations'),
+    path.join(process.cwd(), 'apps', 'gateway', 'dist', 'db', 'migrations'),
   ];
   const dir = candidates.find((candidate) => fs.existsSync(candidate));
   if (!dir) {
     throw new MigrationError(
       'MIGRATION_DIRECTORY_MISSING',
-      'Migration directory not found; run from the gateway package root',
+      'Migration directory not found; run from the gateway package root or repository root',
     );
   }
   return dir;
