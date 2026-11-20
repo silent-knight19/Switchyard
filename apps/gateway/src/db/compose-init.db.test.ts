@@ -15,7 +15,7 @@ import { loadMigrationFiles } from './migrate.js';
  *    and SQL-injection syntax (:'var') without statement breakage or SQL execution (DB-16).
  * 4. All six migrations apply through the authoritative runner (apps/gateway/src/db/migrate.ts)
  *    under gateway_migrator before Gateway admission.
- * 5. All six ledger records have correct SHA-256 checksums matching authoritative files.
+ * 5. All seven ledger records have correct SHA-256 checksums matching authoritative files.
  * 6. The Gateway runtime container connects as gateway_app with least privilege.
  * 7. All four expected roles (migrator, app, startup, worker) authenticate successfully with
  *    their complex passwords and retain their required privileges.
@@ -163,11 +163,12 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15, DB-16 
     expect(migrateLogs).toContain('applied 0004');
     expect(migrateLogs).toContain('applied 0005');
     expect(migrateLogs).toContain('applied 0006');
+    expect(migrateLogs).toContain('applied 0007');
   });
 
-  it('records correct SHA-256 checksums in gateway_migrations for all six migrations', async () => {
+  it('records correct SHA-256 checksums in gateway_migrations for all seven migrations', async () => {
     const expectedFiles = loadMigrationFiles();
-    expect(expectedFiles).toHaveLength(6);
+    expect(expectedFiles).toHaveLength(7);
 
     const client = new pg.Client({
       host: '127.0.0.1',
@@ -184,7 +185,7 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15, DB-16 
         checksum: string;
       }>('SELECT version, name, checksum FROM gateway_migrations ORDER BY version');
 
-      expect(rows).toHaveLength(6);
+      expect(rows).toHaveLength(7);
       for (let i = 0; i < expectedFiles.length; i += 1) {
         const expected = expectedFiles[i]!;
         const row = rows[i]!;
@@ -371,7 +372,7 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15, DB-16 
       const { rows } = await client.query<{ count: string }>(
         'SELECT count(*)::text as count FROM gateway_migrations',
       );
-      expect(rows[0]?.count).toBe('6');
+      expect(rows[0]?.count).toBe('7');
     } finally {
       await client.end();
     }

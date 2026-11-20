@@ -163,6 +163,10 @@ describe('SW-1.3.1 role privileges under real authenticated sessions', () => {
       await expectSqlState(client.query('SELECT * FROM provider_keys'), '42501');
       await expectSqlState(client.query('SELECT * FROM virtual_keys'), '42501');
       await expectSqlState(client.query('SELECT * FROM web_sessions'), '42501');
+      await expectSqlState(client.query('SELECT * FROM gateway_requests'), '42501');
+      await expectSqlState(client.query('SELECT * FROM provider_attempts'), '42501');
+      await expectSqlState(client.query('SELECT * FROM provider_cost_adjustments'), '42501');
+      await expectSqlState(client.query('SELECT * FROM trace_payloads'), '42501');
     }
   });
 
@@ -344,7 +348,7 @@ describe('SW-1.3.1 role privileges under real authenticated sessions', () => {
     });
     try {
       const applied = await runMigrations(migrator);
-      expect(applied).toHaveLength(6);
+      expect(applied).toHaveLength(7);
     } finally {
       await migrator.end();
     }
