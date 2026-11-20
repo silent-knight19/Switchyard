@@ -26,6 +26,22 @@ export class TenantTransactionError extends Error {
   }
 }
 
+/**
+ * Options for withTenant lifecycle observation and diagnostics.
+ */
+export interface WithTenantOptions {
+  onCleanupError?: (error: unknown) => void;
+}
+
+function reportCleanupWarning(error: unknown): void {
+  const err =
+    error instanceof Error ? error : new Error(typeof error === 'string' ? error : String(error));
+  process.emitWarning(err.message, {
+    type: 'TenantCleanupWarning',
+    detail: err.stack,
+  });
+}
+
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
@@ -313,6 +329,7 @@ export async function withTenant<T>(
   pool: pg.Pool,
   orgId: string,
   callback: (client: TenantClient) => Promise<T>,
+  options?: WithTenantOptions,
 ): Promise<T> {
   // 1. Fail-closed input validation
   const validatedOrgId = validateTenantId(orgId);
@@ -336,7 +353,9 @@ export async function withTenant<T>(
   }
 
   let insideTransaction = false;
+  let commitConfirmed = false;
   let connectionUncertain = false;
+  let hasThrownError = false;
   const contextStore: TenantContextStore = { orgId: validatedOrgId, isActive: false };
 
   // Intercept client.release during callback execution to prevent premature pool return
@@ -407,8 +426,6 @@ export async function withTenant<T>(
     throw new TenantTransactionError('Callback must not invoke release() on withTenant client');
   };
 
-  let hasThrownError = false;
-
   try {
     // 4. Begin explicit PostgreSQL transaction
     await client.query('BEGIN');
@@ -449,6 +466,7 @@ export async function withTenant<T>(
       );
     }
 
+    commitConfirmed = true;
     return result;
   } catch (error: unknown) {
     hasThrownError = true;
@@ -473,12 +491,15 @@ export async function withTenant<T>(
     // Restore original release method
     client.release = originalRelease;
 
-    // Connection release cleanup & verification (DB-31 invariant: no reusable pooled connection may retain tenant identity)
+    // Connection release cleanup & verification (DB-31, DB-33, DB-34)
+    // Invariant: no reusable pooled connection may retain tenant identity from a completed transaction.
+    // Use RESET ALL and DISCARD TEMP rather than DISCARD ALL to avoid destroying server-side prepared statements
+    // cached on the client connection by node-postgres (DB-34 SQLSTATE 26000 avoidance).
     let cleanupError: unknown;
     if (!insideTransaction && !connectionUncertain) {
       try {
-        // Discard session-level settings, temporary tables, prepared statements, etc.
-        await client.query('DISCARD ALL');
+        await client.query('RESET ALL');
+        await client.query('DISCARD TEMP');
 
         // Explicitly verify that app.current_org_id is empty/null
         const checkResult = await client.query<{ cur_org: string | null }>(
@@ -500,11 +521,37 @@ export async function withTenant<T>(
     if (connectionUncertain || insideTransaction) {
       // Invalidate connection to prevent uncertain or contaminated state from being reused in the pool
       originalRelease(true);
-      if (cleanupError && !hasThrownError) {
-        throw new TenantTransactionError(
-          'Failed to sanitize or verify pooled connection state after transaction',
-          { cause: cleanupError },
-        );
+      if (cleanupError) {
+        if (commitConfirmed) {
+          // DB-33: Transaction committed durably on PostgreSQL.
+          // Never report a confirmed durable COMMIT as an uncommitted or rolled-back transaction.
+          // Destroy the contaminated connection and make the cleanup incident observable via diagnostics.
+          if (options?.onCleanupError) {
+            try {
+              options.onCleanupError(cleanupError);
+            } catch {
+              // Ignore diagnostic hook errors to avoid masking committed result
+            }
+          } else {
+            reportCleanupWarning(cleanupError);
+          }
+        } else if (!hasThrownError) {
+          throw new TenantTransactionError(
+            'Failed to sanitize or verify pooled connection state after transaction',
+            { cause: cleanupError },
+          );
+        } else {
+          // Preserve original callback error while observing cleanup failure
+          if (options?.onCleanupError) {
+            try {
+              options.onCleanupError(cleanupError);
+            } catch {
+              // Ignore diagnostic hook errors
+            }
+          } else {
+            reportCleanupWarning(cleanupError);
+          }
+        }
       }
     } else {
       originalRelease();

@@ -281,28 +281,60 @@ describe('SW-1.4.1 Transaction-Scoped Tenant Context & SW-1.4.2 PostgreSQL RLS P
       });
     });
 
-    it('DB-31: guarantees connection hygiene and prevents session-level tenant GUC leakage on pool reuse (max: 1)', async () => {
+    it('DB-34: prepared-statement cache invalidation prevention and session parameter cleanup under pooled reuse (max: 1)', async () => {
       const singleConnPool = new pg.Pool({
         connectionString: roleConnectionString(database.url, 'gateway_app', passwords.gateway_app),
         max: 1,
       });
 
       try {
-        // 1. Normal Org A transaction completes
-        await withTenant(singleConnPool, ORG_A, async (client) => {
-          const { rows } = await client.query<{ id: string }>('SELECT id FROM users');
-          expect(rows).toHaveLength(1);
-          expect(rows[0]?.id).toBe(USER_A);
+        // 1. Repeated named QueryConfig query using the same pooled connection (DB-34 reproduction & verification)
+        const namedQueryA = {
+          name: 'get_user_by_email_normalized',
+          text: 'SELECT id, email_normalized FROM users WHERE email_normalized = $1',
+          values: ['alice@acme.example'],
+        };
+        const r1 = await withTenant(singleConnPool, ORG_A, async (client) => {
+          return client.query<{ id: string; email_normalized: string }>(namedQueryA);
         });
+        expect(r1.rows).toHaveLength(1);
+        expect(r1.rows[0]?.id).toBe(USER_A);
 
-        // 2. Same connection subsequently serves Org B
-        await withTenant(singleConnPool, ORG_B, async (client) => {
-          const { rows } = await client.query<{ id: string }>('SELECT id FROM users');
-          expect(rows).toHaveLength(1);
-          expect(rows[0]?.id).toBe(USER_B);
+        // Same connection reused by Org B with identical statement name must NOT fail with SQLSTATE 26000
+        const namedQueryB = {
+          name: 'get_user_by_email_normalized',
+          text: 'SELECT id, email_normalized FROM users WHERE email_normalized = $1',
+          values: ['bob@beta.example'],
+        };
+        const r2 = await withTenant(singleConnPool, ORG_B, async (client) => {
+          return client.query<{ id: string; email_normalized: string }>(namedQueryB);
         });
+        expect(r2.rows).toHaveLength(1);
+        expect(r2.rows[0]?.id).toBe(USER_B);
 
-        // 3. No-context reads on the same connection return zero tenant rows
+        // 2. Repeated unnamed parameterized query
+        const u1 = await withTenant(singleConnPool, ORG_A, async (client) => {
+          return client.query<{ val: string }>('SELECT $1::text AS val', ['alpha']);
+        });
+        expect(u1.rows[0]?.val).toBe('alpha');
+
+        const u2 = await withTenant(singleConnPool, ORG_B, async (client) => {
+          return client.query<{ val: string }>('SELECT $1::text AS val', ['beta']);
+        });
+        expect(u2.rows[0]?.val).toBe('beta');
+
+        // 3. Caller QueryConfig attempting to override extended mode is rejected by single-statement enforcement
+        await expectSqlState(
+          withTenant(singleConnPool, ORG_A, async (client) => {
+            await client.query({
+              text: 'SELECT 1; SELECT 2;',
+              queryMode: 'simple',
+            } as pg.QueryConfig);
+          }),
+          '42601',
+        );
+
+        // 4. Org A -> Org B -> no-context pool reuse
         let noCtx = await singleConnPool.connect();
         try {
           const guc = await noCtx.query<{ org: string | null }>(
@@ -315,12 +347,11 @@ describe('SW-1.4.1 Transaction-Scoped Tenant Context & SW-1.4.2 PostgreSQL RLS P
           noCtx.release();
         }
 
-        // 4. Callback deliberately sets session-level tenant context via SET app.current_org_id
+        // 5. Session-level SET app.current_org_id contamination cleaned up by RESET ALL
         await withTenant(singleConnPool, ORG_A, async (client) => {
           await client.query(`SET app.current_org_id = '${ORG_A}'`);
         });
 
-        // After completion, the pooled connection must NOT expose tenant rows under a no-context query
         noCtx = await singleConnPool.connect();
         try {
           const guc = await noCtx.query<{ org: string | null }>(
@@ -333,27 +364,7 @@ describe('SW-1.4.1 Transaction-Scoped Tenant Context & SW-1.4.2 PostgreSQL RLS P
           noCtx.release();
         }
 
-        // 5. Repeat after callback failure and rollback
-        await expect(
-          withTenant(singleConnPool, ORG_A, async (client) => {
-            await client.query(`SET app.current_org_id = '${ORG_A}'`);
-            throw new Error('deliberate-error-with-session-guc');
-          }),
-        ).rejects.toThrow('deliberate-error-with-session-guc');
-
-        noCtx = await singleConnPool.connect();
-        try {
-          const guc = await noCtx.query<{ org: string | null }>(
-            "SELECT current_setting('app.current_org_id', true) AS org",
-          );
-          expect(guc.rows[0]?.org === '' || guc.rows[0]?.org === null).toBe(true);
-          const users = await noCtx.query('SELECT * FROM users');
-          expect(users.rows).toHaveLength(0);
-        } finally {
-          noCtx.release();
-        }
-
-        // 6. Repeat for set_config(..., false)
+        // 6. Session-level set_config(..., false) contamination cleaned up by RESET ALL
         await withTenant(singleConnPool, ORG_A, async (client) => {
           await client.query(`SELECT set_config('app.current_org_id', '${ORG_A}', false)`);
         });
@@ -370,13 +381,13 @@ describe('SW-1.4.1 Transaction-Scoped Tenant Context & SW-1.4.2 PostgreSQL RLS P
           noCtx.release();
         }
 
-        // Repeat for set_config(..., false) with callback failure and rollback
+        // 7. Callback rollback after a session-setting change
         await expect(
           withTenant(singleConnPool, ORG_A, async (client) => {
             await client.query(`SELECT set_config('app.current_org_id', '${ORG_A}', false)`);
-            throw new Error('set_config failure probe');
+            throw new Error('deliberate-error-with-session-guc');
           }),
-        ).rejects.toThrow('set_config failure probe');
+        ).rejects.toThrow('deliberate-error-with-session-guc');
 
         noCtx = await singleConnPool.connect();
         try {
@@ -390,18 +401,206 @@ describe('SW-1.4.1 Transaction-Scoped Tenant Context & SW-1.4.2 PostgreSQL RLS P
           noCtx.release();
         }
 
-        // 7. Verify safe connection disposal when cleanup fails or client destroyed
+        // 8. Connection sanitation failure and destruction
         const deadClient = await singleConnPool.connect();
         deadClient.release(true); // destroy connection
         expect(singleConnPool.waitingCount).toBe(0);
 
-        // Verify no connection remains checked out after failure; pool continues to serve
+        // 9. No stale tenant identity on a reused connection
         const freshClient = await singleConnPool.connect();
-        expect(freshClient).toBeDefined();
-        freshClient.release();
+        try {
+          const guc = await freshClient.query<{ org: string | null }>(
+            "SELECT current_setting('app.current_org_id', true) AS org",
+          );
+          expect(guc.rows[0]?.org === '' || guc.rows[0]?.org === null).toBe(true);
+        } finally {
+          freshClient.release();
+        }
       } finally {
         await singleConnPool.end();
       }
+    });
+
+    it('DB-33: false failure after confirmed COMMIT prevention, durable write preservation, and distinct outcome reporting', async () => {
+      // 1. Execute actual INSERT through withTenant() with deterministic failure in post-COMMIT sanitation
+      const committedUserId = 'a1000009-0000-4000-8000-000000000066';
+      let postCommitCleanupError: unknown;
+
+      const postCommitFailPool = {
+        connect: async () => {
+          const client = await poolApp.connect();
+          const originalQuery = client.query.bind(client);
+          client.query = (async (...args: unknown[]) => {
+            const first = args[0];
+            const sql =
+              typeof first === 'string' ? first : (first as { text?: string } | undefined)?.text;
+            if (sql === 'RESET ALL') {
+              throw new Error('Injected post-commit sanitation failure');
+            }
+            return (originalQuery as (...a: unknown[]) => Promise<unknown>)(...args);
+          }) as unknown as typeof client.query;
+          return client;
+        },
+      } as unknown as pg.Pool;
+
+      // 2. Allow PostgreSQL to confirm COMMIT; post-COMMIT sanitation step fails
+      const result = await withTenant(
+        postCommitFailPool,
+        ORG_A,
+        async (txClient) => {
+          await txClient.query(
+            `INSERT INTO users (id, org_id, email_normalized, password_hash, role)
+             VALUES ($1, $2, 'durable-commit@example.com', 'h', 'member')`,
+            [committedUserId, ORG_A],
+          );
+          return 'committed-durable-result';
+        },
+        {
+          onCleanupError: (err) => {
+            postCommitCleanupError = err;
+          },
+        },
+      );
+
+      // 3. Verify helper preserves confirmed result and does not represent transaction as rolled back or failed
+      expect(result).toBe('committed-durable-result');
+      expect(postCommitCleanupError).toBeDefined();
+      expect((postCommitCleanupError as Error).message).toBe(
+        'Injected post-commit sanitation failure',
+      );
+
+      // 4. Verify row is durably present in the database
+      await withTenant(poolApp, ORG_A, async (client) => {
+        const { rows } = await client.query<{ id: string }>('SELECT id FROM users WHERE id = $1', [
+          committedUserId,
+        ]);
+        expect(rows).toHaveLength(1);
+        expect(rows[0]?.id).toBe(committedUserId);
+      });
+
+      // Clean up durable test row so subsequent fixture-dependent assertions are unaffected
+      await withTenant(poolApp, ORG_A, async (client) => {
+        await client.query('DELETE FROM users WHERE id = $1', [committedUserId]);
+      });
+
+      // 5. Verify subsequent checkout from pool succeeds safely
+      const subsequentClient = await poolApp.connect();
+      try {
+        const { rows } = await subsequentClient.query<{ n: number }>('SELECT 1 AS n');
+        expect(rows[0]?.n).toBe(1);
+      } finally {
+        subsequentClient.release();
+      }
+
+      // 6. Separately test: COMMIT returning ROLLBACK (aborted transaction with swallowed error)
+      const probeRollbackId = 'a1000009-0000-4000-8000-000000000067';
+      await expect(
+        withTenant(poolApp, ORG_A, async (client) => {
+          await client.query(
+            `INSERT INTO users (id, org_id, email_normalized, password_hash, role)
+             VALUES ($1, $2, 'rollback-swallowed@example.com', 'h', 'member')`,
+            [probeRollbackId, ORG_A],
+          );
+          try {
+            await client.query('SYNTAX ERROR TRIGGERING 42601 TO ABORT TRANSACTION');
+          } catch {
+            // Swallowing statement error inside callback
+          }
+          return 'should-not-reach-here';
+        }),
+      ).rejects.toThrow(/PostgreSQL rolled back the aborted transaction/i);
+
+      // Confirm row was NOT committed
+      await withTenant(poolApp, ORG_A, async (client) => {
+        const { rows } = await client.query('SELECT id FROM users WHERE id = $1', [
+          probeRollbackId,
+        ]);
+        expect(rows).toHaveLength(0);
+      });
+
+      // 7. Separately test: actual COMMIT execution failure
+      const commitFailPool = {
+        connect: async () => {
+          const client = await poolApp.connect();
+          const originalQuery = client.query.bind(client);
+          client.query = (async (...args: unknown[]) => {
+            const first = args[0];
+            const sql =
+              typeof first === 'string' ? first : (first as { text?: string } | undefined)?.text;
+            if (sql === 'COMMIT') {
+              throw new Error('Injected network disruption on COMMIT');
+            }
+            return (originalQuery as (...a: unknown[]) => Promise<unknown>)(...args);
+          }) as unknown as typeof client.query;
+          return client;
+        },
+      } as unknown as pg.Pool;
+
+      await expect(
+        withTenant(commitFailPool, ORG_A, async (client) => {
+          await client.query('SELECT 1');
+          return 'ok';
+        }),
+      ).rejects.toThrow('Failed to execute COMMIT statement');
+
+      // 8. Separately test: callback failure
+      const cbFailId = 'a1000009-0000-4000-8000-000000000068';
+      const customAppError = new Error('Custom application business logic error');
+      await expect(
+        withTenant(poolApp, ORG_A, async (client) => {
+          await client.query(
+            `INSERT INTO users (id, org_id, email_normalized, password_hash, role)
+             VALUES ($1, $2, 'cb-fail@example.com', 'h', 'member')`,
+            [cbFailId, ORG_A],
+          );
+          throw customAppError;
+        }),
+      ).rejects.toThrow(customAppError);
+
+      await withTenant(poolApp, ORG_A, async (client) => {
+        const { rows } = await client.query('SELECT id FROM users WHERE id = $1', [cbFailId]);
+        expect(rows).toHaveLength(0);
+      });
+
+      // 9. Separately test: rollback cleanup failure preserves original callback error
+      let rollbackCleanupWarning: unknown;
+      const rollbackCleanupFailPool = {
+        connect: async () => {
+          const client = await poolApp.connect();
+          const originalQuery = client.query.bind(client);
+          client.query = (async (...args: unknown[]) => {
+            const first = args[0];
+            const sql =
+              typeof first === 'string' ? first : (first as { text?: string } | undefined)?.text;
+            if (sql === 'RESET ALL') {
+              throw new Error('Injected post-rollback cleanup failure');
+            }
+            return (originalQuery as (...a: unknown[]) => Promise<unknown>)(...args);
+          }) as unknown as typeof client.query;
+          return client;
+        },
+      } as unknown as pg.Pool;
+
+      const originalAppError = new Error('Original application error before rollback');
+      await expect(
+        withTenant(
+          rollbackCleanupFailPool,
+          ORG_A,
+          async () => {
+            throw originalAppError;
+          },
+          {
+            onCleanupError: (err) => {
+              rollbackCleanupWarning = err;
+            },
+          },
+        ),
+      ).rejects.toThrow(originalAppError);
+
+      expect(rollbackCleanupWarning).toBeDefined();
+      expect((rollbackCleanupWarning as Error).message).toContain(
+        'Injected post-rollback cleanup failure',
+      );
     });
 
     it('executes concurrent withTenant calls across Org A and Org B in complete isolation', async () => {

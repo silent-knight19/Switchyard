@@ -355,10 +355,11 @@ export async function withTenant<T>(
   SELECT pg_catalog.set_config('app.current_org_id', $1, true);
   ```
   Because `is_local = true`, the parameter automatically reverts when the transaction ends (commit or rollback).
-- **Connection Hygiene, Pool Invalidation & Session Cleanup (DB-31):**
+- **Connection Hygiene, Pool Invalidation & Session Cleanup (DB-31, DB-33, DB-34):**
   - Client release is intercepted during the callback to prevent premature release.
-  - **Connection Release Invariant (DB-31):** No reusable pooled connection may retain tenant identity from a completed transaction. Outside an active transaction upon completion, `withTenant` issues `DISCARD ALL` to purge any session-level GUC overrides (such as `SET app.current_org_id = ...` or `set_config('app.current_org_id', ..., false)`), prepared statements, and temporary state.
+  - **Connection Release Invariant (DB-31, DB-34):** No reusable pooled connection may retain tenant identity from a completed transaction. Outside an active transaction upon completion, `withTenant` issues `RESET ALL` and `DISCARD TEMP` to purge session-level GUC overrides (such as `SET app.current_org_id = ...` or `set_config('app.current_org_id', ..., false)`) and session temporary tables without destroying server-side prepared statements cached on client connections by `node-postgres` (DB-34 SQLSTATE `26000` prevention).
   - It then explicitly verifies `SELECT pg_catalog.current_setting('app.current_org_id', true) AS cur_org`. If residual context is detected or cleanup throws, the connection is marked uncertain and destroyed via `client.release(true)`.
+  - **Confirmed COMMIT Durability & Diagnostic Reporting (DB-33):** Once PostgreSQL confirms `COMMIT`, the transaction has durably succeeded. If post-commit connection cleanup fails thereafter, the contaminated connection is invalidated via `client.release(true)`, and the cleanup incident is reported via diagnostics (`WithTenantOptions.onCleanupError` or `process.emitWarning`) without throwing a false transaction error that would cause callers to retry already committed operations.
   - On confirmed rollback, the clean idle connection is returned to the pool after session cleanup.
   - On uncertain connection state (unhandled commit failure, failed rollback, or unconfirmed outcome), the connection is destroyed via `client.release(true)`.
   - **Residual Limitations:** Custom GUCs provide application context, not cryptographic tokens (§12.6). A process compromised by arbitrary code execution could manipulate memory or execute queries directly; defense-in-depth requires strict input parameterization and application sandbox isolation.
