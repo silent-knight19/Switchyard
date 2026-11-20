@@ -27,13 +27,15 @@ services:
     restart: unless-stopped
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD:-switchyard_dev_password}
+      REDIS_APP_USER: ${REDIS_APP_USER:-switchyard_app}
+      REDIS_APP_PASSWORD: ${REDIS_APP_PASSWORD:-switchyard_app_password}
       REDISCLI_AUTH: ${REDIS_PASSWORD:-switchyard_dev_password}
       REDIS_MAXMEMORY: ${REDIS_MAXMEMORY:-64mb}
     command:
       - /bin/sh
       - -c
       - |
-        printf "appendonly yes\nappendfsync everysec\nmaxmemory %s\nmaxmemory-policy noeviction\nrequirepass %s\n" "$$REDIS_MAXMEMORY" "$$REDIS_PASSWORD" | exec redis-server -
+        printf "appendonly yes\nappendfsync everysec\nmaxmemory %s\nmaxmemory-policy noeviction\nrequirepass %s\nuser default on >%s ~* &* +@all\nuser %s on >%s ~* &* +@all -@admin -@dangerous +info -FLUSHALL -FLUSHDB -CONFIG -DEBUG -SHUTDOWN -REPLICAOF -KEYS\n" "$$REDIS_MAXMEMORY" "$$REDIS_PASSWORD" "$$REDIS_PASSWORD" "$$REDIS_APP_USER" "$$REDIS_APP_PASSWORD" | exec redis-server -
     ports:
       - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     volumes:
@@ -41,11 +43,65 @@ services:
     networks:
       - switchyard-network
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli ping | grep PONG"]
+      test:
+        - CMD-SHELL
+        - >-
+          set -f &&
+          redis-cli ping | grep -q PONG &&
+          redis-cli info memory | grep -q 'maxmemory_policy:noeviction' &&
+          redis-cli info persistence | grep -q 'aof_enabled:1' &&
+          [ "$${REDIS_APP_USER:-switchyard_app}" != "default" ] &&
+          for cmd in "FLUSHALL" "FLUSHDB" "CONFIG GET maxmemory" "DEBUG OBJECT x" "SHUTDOWN" "REPLICAOF NO ONE" "KEYS *" "ACL LIST"; do
+            res=$$(redis-cli ACL DRYRUN "$${REDIS_APP_USER:-switchyard_app}" $$cmd) &&
+            echo "$$res" | grep -qi "no permissions" || exit 1;
+          done
       interval: 5s
       timeout: 3s
       retries: 5
       start_period: 5s
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: switchyard-gateway
+    restart: unless-stopped
+    environment:
+      NODE_ENV: development
+      PORT: 3000
+      HOST: 0.0.0.0
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-switchyard}
+      POSTGRES_USER: ${POSTGRES_USER:-switchyard}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-switchyard_dev_password}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_USER: ${REDIS_APP_USER:-switchyard_app}
+      REDIS_PASSWORD: ${REDIS_APP_PASSWORD:-switchyard_app_password}
+      REDIS_MAXMEMORY_POLICY: noeviction
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks:
+      - switchyard-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/health/ready').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    stop_grace_period: 10s
 
 networks:
   switchyard-network:

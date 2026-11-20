@@ -13,6 +13,7 @@
     "format:check": "prettier --check .",
     "lint": "pnpm -r --filter=!switchyard lint",
     "test": "pnpm -r --filter=!switchyard test",
+    "test:integration": "INTEGRATION_TESTS=required pnpm -r --filter=!switchyard test",
     "typecheck": "pnpm -r --filter=!switchyard typecheck"
   },
   "devDependencies": {

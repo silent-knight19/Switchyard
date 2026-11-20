@@ -107,7 +107,9 @@ cp .env.example .env
 | `POSTGRES_PASSWORD` | `switchyard_dev_password` | PostgreSQL development password | Local development only |
 | `POSTGRES_DB` | `switchyard` | PostgreSQL development database | Local development only |
 | `POSTGRES_PORT` | `5432` | Host loopback port for PostgreSQL | Bound to `127.0.0.1` |
-| `REDIS_PASSWORD` | `switchyard_dev_password` | Redis authentication password | Injected via stdin/environment |
+| `REDIS_PASSWORD` | `switchyard_dev_password` | Redis admin authentication password | Injected via stdin/environment for administrative/ops use |
+| `REDIS_APP_USER` | `switchyard_app` | Restricted Redis application user | Runtime ACL user for application services |
+| `REDIS_APP_PASSWORD` | `switchyard_app_password` | Restricted Redis application password | Runtime ACL password with prohibited administrative commands |
 | `REDIS_PORT` | `6379` | Host loopback port for Redis | Bound to `127.0.0.1` |
 | `REDIS_MAXMEMORY` | `64mb` | Redis memory allocation bound | Provisional development baseline; not benchmark-validated (production sizing requires Phase 2 load testing under `bench/`) |
 
@@ -156,7 +158,7 @@ docker compose stop
   docker compose exec postgres pg_isready -U switchyard -d switchyard
   ```
 - **Redis Readiness:**
-  Healthcheck executes `redis-cli ping` every 5s using the container's `REDISCLI_AUTH` environment variable (preventing command-line credential exposure).
+  Healthcheck executes Redis ping, verifies `noeviction` memory policy, verifies AOF persistence (`aof_enabled:1`), and performs comprehensive ACL attestation using `redis-cli ACL DRYRUN` against the configured application user identity to confirm all prohibited commands (`FLUSHALL`, `FLUSHDB`, `CONFIG`, `DEBUG`, `SHUTDOWN`, `REPLICAOF`, `KEYS`, `ACL LIST`) are denied without executing target commands. It runs every 5s using the container's `REDISCLI_AUTH` environment variable (preventing command-line credential exposure).
   To verify manually from host:
   ```bash
   docker compose exec redis redis-cli ping
@@ -170,5 +172,6 @@ docker compose stop
 ### 7.6 Local Security Limitations
 
 - **Loopback-Only Binding:** Both PostgreSQL and Redis are bound exclusively to host loopback (`127.0.0.1:5432` and `127.0.0.1:6379`) to prevent external network exposure.
+- **Restricted Redis Identity & ACL Enforcement:** Redis enforces distinct operational administrator (`default`) and application (`switchyard_app`) identities. The application role is granted `+@all -@admin -@dangerous +info -FLUSHALL -FLUSHDB -CONFIG -DEBUG -SHUTDOWN -REPLICAOF -KEYS`, preventing unauthorized administrative and destructive operations as required by Architecture v1.2 §19.1.
 - **Process Credential Masking & Docker Inspection Boundary:** Redis credentials are provided to `redis-server` via standard input stream and to `redis-cli` via `REDISCLI_AUTH`, avoiding password visibility in process table listings (`ps aux`) and suppressing CLI warning banners. However, environment variables remain visible via `docker inspect <container>`; therefore, this mechanism is strictly intended for local development. Production deployments must not rely on environment variables for sensitive secrets and must utilize external secret management with separate least-privilege database roles as defined in Architecture v1.2 §19.
-- **Development Credentials:** The default credentials (`switchyard_dev_password`) are strictly intended for local development.
+- **Development Credentials:** The default credentials (`switchyard_dev_password`, `switchyard_app_password`) are strictly intended for local development.
