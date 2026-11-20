@@ -650,7 +650,9 @@ describe('SW-1.2.4 Gateway Boot, Health, and Shutdown Lifecycle', () => {
   it('21. real postgresql integration: statement_timeout aborts delayed queries and prevents pool connection retention (Finding 3)', async () => {
     const reachable = await isPortReachable(5432);
     if (!reachable) {
-      console.warn('PostgreSQL service not reachable on 127.0.0.1:5432; skipping live integration test');
+      console.warn(
+        'PostgreSQL service not reachable on 127.0.0.1:5432; skipping live integration test',
+      );
       return;
     }
 
