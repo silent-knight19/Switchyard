@@ -35,6 +35,7 @@ const MIGRATION_FILES = [
   '0007-financial-observability-tables.sql',
   '0008-financial-integrity.sql',
   '0009-tenant-rls-policies.sql',
+  '0010-privileged-bootstrap-functions.sql',
 ];
 const ALL_VERSIONS = MIGRATION_FILES.map((fileName) => fileName.slice(0, 4));
 
@@ -164,12 +165,28 @@ describe('SW-1.3.1 migration runner: locking, integrity, bootstrap (real Postgre
       );
       expect(membership).toHaveLength(1);
 
-      const { rows: executorMembership } = await client.query<{ roleid: string }>(
-        `SELECT am.roleid::regrole::text AS roleid
+      const { rows: executorMembership } = await client.query<{
+        role: string;
+        member: string;
+        admin_option: boolean;
+        inherit_option: boolean;
+      }>(
+        `SELECT r.rolname AS role, m.rolname AS member, am.admin_option, am.inherit_option
          FROM pg_auth_members am
-         WHERE am.roleid IN ('gateway_auth_executor'::regrole, 'gateway_ops_executor'::regrole)`,
+         JOIN pg_roles r ON r.oid = am.roleid
+         JOIN pg_roles m ON m.oid = am.member
+         WHERE r.rolname IN ('gateway_auth_executor', 'gateway_ops_executor')
+         ORDER BY r.rolname`,
       );
-      expect(executorMembership).toHaveLength(0);
+      expect(executorMembership).toHaveLength(2);
+      expect(executorMembership[0]?.role).toBe('gateway_auth_executor');
+      expect(executorMembership[0]?.member).toBe('gateway_migrator');
+      expect(executorMembership[0]?.admin_option).toBe(false);
+      expect(executorMembership[0]?.inherit_option).toBe(false);
+      expect(executorMembership[1]?.role).toBe('gateway_ops_executor');
+      expect(executorMembership[1]?.member).toBe('gateway_migrator');
+      expect(executorMembership[1]?.admin_option).toBe(false);
+      expect(executorMembership[1]?.inherit_option).toBe(false);
 
       const { rows: schemaAcl } = await client.query<{ nspname: string; acl: string | null }>(
         `SELECT nspname, nspacl::text AS acl
@@ -240,10 +257,10 @@ describe('SW-1.3.1 migration runner: locking, integrity, bootstrap (real Postgre
     const database = await createDatabase('missing-file');
     await migrate(database);
 
-    const dir = copyMigrationsToTempDir(MIGRATION_FILES.filter((name) => !name.startsWith('0009')));
+    const dir = copyMigrationsToTempDir(MIGRATION_FILES.filter((name) => !name.startsWith('0010')));
     try {
       const error = await expectMigrationError(migrate(database, dir), 'MIGRATION_FILE_MISSING');
-      expect(error.message).toMatch(/0009/);
+      expect(error.message).toMatch(/0010/);
     } finally {
       removeTempDir(dir);
     }
@@ -492,7 +509,7 @@ describe('SW-1.3.1 migration runner: locking, integrity, bootstrap (real Postgre
     } finally {
       await pool.end();
     }
-    expect(applied).toEqual(['0003', '0004', '0005', '0006', '0007', '0008', '0009']);
+    expect(applied).toEqual(['0003', '0004', '0005', '0006', '0007', '0008', '0009', '0010']);
     expect(events).toContain('adopted:0001');
     expect(events).toContain('adopted:0002');
 

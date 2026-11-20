@@ -376,6 +376,53 @@ Migration `0009-tenant-rls-policies.sql` establishes:
   - `gateway_startup` & `PUBLIC`: Zero table grants on all tenant tables.
   - Runtime roles possess no `BYPASSRLS` attribute and cannot alter RLS policies.
 
+##### 3. Migration `0010-privileged-bootstrap-functions.sql` & Privileged Functions (SW-1.4.3 & SW-1.4.4)
+
+Migration `0010-privileged-bootstrap-functions.sql` establishes secure, narrowly scoped `SECURITY DEFINER` functions in the `app_private` schema to support pre-tenant authentication lookups and background maintenance enumeration without granting broad cross-tenant `SELECT` permissions to runtime roles (Architecture §12.4).
+
+- **Function Interfaces and Signatures:**
+  1. `app_private.lookup_virtual_key_by_hash(p_key_hash BYTEA)`:
+     - **Owner:** `gateway_auth_executor` (`NOLOGIN BYPASSRLS`).
+     - **Purpose:** Resolves a virtual API key by exact 32-byte SHA-256 hash before tenant context is known.
+     - **Return contract:** Minimal authorization columns only (`id`, `org_id`, `revoked_at`, `allowed_models`, `rpm_limit`, `tpm_limit`, `concurrent_stream_limit`, `exact_cache_enabled`, `semantic_cache_enabled`, `pii_redaction_enabled`, `store_payloads`). Returns zero rows for NULL, empty, malformed, or non-matching hashes. Never exposes plaintext keys, key hashes, DEKs, or provider secrets.
+     - **EXECUTE:** Granted strictly to `gateway_app`. Denied to `gateway_worker`, `gateway_startup`, and `PUBLIC`.
+  2. `app_private.lookup_user_for_login(p_email_normalized TEXT)`:
+     - **Owner:** `gateway_auth_executor` (`NOLOGIN BYPASSRLS`).
+     - **Purpose:** Resolves user identity for authentication by globally unique canonical normalized email before tenant context exists.
+     - **Return contract:** Minimal login columns only (`id`, `org_id`, `role`, `password_hash`). Returns zero rows for NULL, empty, oversized (> 255 chars), noncanonical (mixed-case, leading/trailing whitespace, missing `@`), or non-matching emails. Never exposes session tokens, CSRF secrets, or DEKs. Note that `password_hash` is intentionally returned because the trusted authentication handler in SW-1.5.1 requires the stored Argon2id verifier string to authenticate credentials.
+     - **EXECUTE:** Granted strictly to `gateway_app`. Denied to `gateway_worker`, `gateway_startup`, and `PUBLIC`.
+  3. `app_private.create_organization_with_admin(p_org_id UUID, p_org_name TEXT, p_monthly_budget_microdollars BIGINT, p_kek_version INT, p_wrapped_dek BYTEA, p_dek_iv BYTEA, p_dek_auth_tag BYTEA, p_admin_user_id UUID, p_admin_email_normalized TEXT, p_admin_password_hash TEXT)`:
+     - **Owner:** `gateway_auth_executor` (`NOLOGIN BYPASSRLS`).
+     - **Purpose:** Atomically provisions a new organization and its initial administrator (`role = 'admin'`) before a tenant-scoped session exists.
+     - **Return contract:** Confirmation record of two UUIDs (`org_id UUID`, `admin_user_id UUID`).
+     - **Atomicity & Validation:** Strict validation fails closed with SQLSTATE `22004` (null IDs) and `22023` (invalid parameters, bounded budget up to $10^{15}$ microdollars, non-empty DEKs). Enforces canonical email normalization (lowercase, trimmed, valid email format, $\le 255$ chars; DB-36) and complete Argon2id PHC verifier representation validation (algorithm `argon2id`, version `v=19`, required positive integer parameters `m, t, p`, and non-empty separate salt and derived-hash tokens; DB-37, DB-39). Any uniqueness or persistence failure rolls back both inserts atomically, guaranteeing no orphan organizations or orphaned admin users.
+     - **EXECUTE:** Granted strictly to `gateway_app`. Denied to `gateway_worker`, `gateway_startup`, and `PUBLIC`.
+  4. `app_private.list_active_org_ids(p_after_id UUID DEFAULT NULL, p_limit INT DEFAULT 100)`:
+     - **Owner:** `gateway_ops_executor` (`NOLOGIN BYPASSRLS`).
+     - **Purpose:** Enumerates organization UUIDs for background worker maintenance tasks (recovery, retention, reconciliation).
+     - **v1 Active Organization Interpretation:** Under accepted v1 design, every row currently existing in `public.organizations` is eligible for enumeration. No `is_active` column or artificial lifecycle is introduced.
+     - **Return contract:** Exactly one column: `org_id UUID`. Strictly prohibits organization names, budgets, DEKs, or timestamps.
+     - **Pagination:** Deterministic keyset pagination ordered strictly by `id ASC`. The cursor (`p_after_id`) is exclusive (`id > p_after_id`). Limit is strictly bounded between 1 and 100; invalid limits fail closed with SQLSTATE `22023`.
+     - **EXECUTE:** Granted strictly to `gateway_worker`. Denied to `gateway_app`, `gateway_startup`, and `PUBLIC`.
+
+- **Privileged Installation & Deployment Mechanism:**
+  - `provision-roles.sql` grants role membership in `gateway_auth_executor` and `gateway_ops_executor` to deployment-only role `gateway_migrator` with explicit `WITH INHERIT FALSE, SET TRUE, ADMIN FALSE`.
+  - `gateway_migrator` remains `NOCREATEROLE`, `NOSUPERUSER`, and `NOBYPASSRLS`. It explicitly assumes executor roles via `SET ROLE` within migration transactions.
+  - `provision-roles.sql` grants `USAGE, CREATE ON SCHEMA app_private` to `gateway_owner`, `gateway_migrator`, `gateway_auth_executor`, and `gateway_ops_executor`. Runtime roles (`gateway_app`, `gateway_worker`, `gateway_startup`) and `PUBLIC` receive zero `CREATE` privilege on `app_private`.
+  - Migration `0010` includes a fail-closed pre-flight assertion (`pg_has_role(CURRENT_USER, 'gateway_auth_executor', 'SET')`) verifying role assumption before applying DDL.
+  - Public execution is revoked (`REVOKE ALL FROM PUBLIC`) within the same transaction as function creation.
+- **Executor Column-Level Table Grants:**
+  - `gateway_auth_executor`: Column-level `SELECT` on `virtual_keys` and `users`; column-level `INSERT` on `organizations` and `users`; `SELECT (id)` for `RETURNING`. Zero `UPDATE`, `DELETE`, or `TRUNCATE`.
+  - `gateway_ops_executor`: Column-level `SELECT (id)` on `organizations` only. Zero access to any other column or table.
+- **Fresh Bootstrap & Upgrade Procedure:**
+  - **Fresh Bootstrap:** Superuser runs `pnpm bootstrap:roles --apply` (or Docker Compose entrypoint `01-provision-roles.sql`). Deployment role runs `pnpm migrate` applying migrations `0001` through `0010`.
+  - **Version Upgrade (0009 -> 0010):** Superuser reconciles role memberships by executing `pnpm bootstrap:roles --apply`. Deployment role applies `pnpm migrate`. If `bootstrap:roles` was omitted, migration `0010` fails closed with SQLSTATE `42501`.
+- **Known Limitations & Phase 1.5 Dependencies:**
+  - Password hashing verification via Argon2id, dummy timing verification, login rate limiting, and generic auth responses belong to SW-1.5.1.
+  - Server-side cookie sessions and CSRF synchronizer token protection belong to SW-1.5.2 and SW-1.5.3.
+  - Application-level bootstrap self-enrollment controls and rate limits belong to SW-1.5.1.
+  - Background maintenance execution with per-organization advisory locking belongs to Phase 2.
+
 #### 7.7.9 Known limitations (Phase 2)
 
 - `gateway_startup` may update `gateway_epoch` but not `updated_at`; the §12.1 column grant is

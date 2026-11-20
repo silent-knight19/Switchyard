@@ -44,8 +44,11 @@ ALTER ROLE gateway_worker LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATIO
 ALTER ROLE gateway_auth_executor NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION BYPASSRLS;
 ALTER ROLE gateway_ops_executor NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION BYPASSRLS;
 
--- The deployment role owns schema migrations and may assume the tenant-table owner (§12.1).
+-- The deployment role owns schema migrations and may assume the tenant-table owner (§12.1)
+-- and privileged executor roles during migration transactions with explicit SET ROLE (INHERIT FALSE, ADMIN FALSE).
 GRANT gateway_owner TO gateway_migrator;
+GRANT gateway_auth_executor, gateway_ops_executor TO gateway_migrator
+  WITH INHERIT FALSE, SET TRUE, ADMIN FALSE;
 
 -- Schema privileges: no CREATE for PUBLIC, migration roles only.
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
@@ -60,10 +63,11 @@ BEGIN
   END IF;
 END $$;
 
--- Protected namespace reserved for future SECURITY DEFINER functions (§12.4). No runtime role
--- receives CREATE here; the owning role is gateway_owner until executor-owned functions exist.
+-- Protected namespace reserved for SECURITY DEFINER functions (§12.4). No runtime role
+-- receives CREATE here; only migration and executor roles hold CREATE.
 CREATE SCHEMA IF NOT EXISTS app_private AUTHORIZATION gateway_owner;
 ALTER SCHEMA app_private OWNER TO gateway_owner;
 REVOKE ALL ON SCHEMA app_private FROM PUBLIC;
-GRANT USAGE ON SCHEMA app_private TO gateway_startup, gateway_app, gateway_worker,
+GRANT USAGE, CREATE ON SCHEMA app_private TO gateway_owner, gateway_migrator,
   gateway_auth_executor, gateway_ops_executor;
+GRANT USAGE ON SCHEMA app_private TO gateway_startup, gateway_app, gateway_worker;

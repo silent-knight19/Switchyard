@@ -259,15 +259,29 @@ describe('SW-1.3.1 role privileges under real authenticated sessions', () => {
     }
   });
 
-  it('gateway_migrator holds only its authorized owner assumption and no CREATEROLE', async () => {
+  it('gateway_migrator holds only authorized deployment assumptions and no CREATEROLE', async () => {
     const migrator = await connectAs('gateway_migrator');
     await migrator.query('SET ROLE gateway_owner');
-    const { rows } = await migrator.query<{ current_user: string }>('SELECT current_user');
-    expect(rows[0]?.current_user).toBe('gateway_owner');
+    const { rows: ownerRows } = await migrator.query<{ current_user: string }>(
+      'SELECT current_user',
+    );
+    expect(ownerRows[0]?.current_user).toBe('gateway_owner');
     await migrator.query('RESET ROLE');
 
-    await expectSqlState(migrator.query('SET ROLE gateway_auth_executor'), '42501');
-    await expectSqlState(migrator.query('SET ROLE gateway_ops_executor'), '42501');
+    // Authorized deployment assumptions for executor roles during migration
+    await migrator.query('SET ROLE gateway_auth_executor');
+    const { rows: authRows } = await migrator.query<{ current_user: string }>(
+      'SELECT current_user',
+    );
+    expect(authRows[0]?.current_user).toBe('gateway_auth_executor');
+    await migrator.query('RESET ROLE');
+
+    await migrator.query('SET ROLE gateway_ops_executor');
+    const { rows: opsRows } = await migrator.query<{ current_user: string }>('SELECT current_user');
+    expect(opsRows[0]?.current_user).toBe('gateway_ops_executor');
+    await migrator.query('RESET ROLE');
+
+    // Still no CREATEROLE or superuser escalation
     await expectSqlState(migrator.query('CREATE ROLE migrator_probe LOGIN'), '42501');
     await expectSqlState(migrator.query('ALTER ROLE gateway_app SUPERUSER'), '42501');
   });
@@ -385,7 +399,7 @@ describe('SW-1.3.1 role privileges under real authenticated sessions', () => {
     });
     try {
       const applied = await runMigrations(migrator);
-      expect(applied).toHaveLength(9);
+      expect(applied).toHaveLength(10);
     } finally {
       await migrator.end();
     }
