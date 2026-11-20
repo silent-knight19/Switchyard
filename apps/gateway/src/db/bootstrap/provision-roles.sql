@@ -52,6 +52,14 @@ REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 GRANT USAGE, CREATE ON SCHEMA public TO gateway_owner, gateway_migrator;
 GRANT USAGE ON SCHEMA public TO gateway_startup, gateway_app, gateway_worker;
 
+-- Ensure the migration ledger is owned by the migration role (drift reconciliation).
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_tables WHERE tablename = 'gateway_migrations') THEN
+    ALTER TABLE gateway_migrations OWNER TO gateway_migrator;
+  END IF;
+END $$;
+
 -- Protected namespace reserved for future SECURITY DEFINER functions (§12.4). No runtime role
 -- receives CREATE here; the owning role is gateway_owner until executor-owned functions exist.
 CREATE SCHEMA IF NOT EXISTS app_private AUTHORIZATION gateway_owner;

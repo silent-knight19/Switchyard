@@ -17,6 +17,31 @@ export const MIGRATION_ADVISORY_LOCK_KEY = '7312000001';
 /** Default bound for waiting on the migration advisory lock. */
 export const DEFAULT_LOCK_TIMEOUT_MS = 10_000;
 
+/**
+ * Trusted baseline for the two migrations that predate checksum recording (review finding
+ * DB-14). These digests are the SHA-256 of the immutable Git blobs introduced by the reviewed
+ * commits, not a hash computed from whatever bytes happen to be on disk today:
+ *
+ *   0001-roles.sql       blob bc34720035d2eb142a1b8f28a47b2781553683d9 (253933b, SW-1.3.1)
+ *   0002-org-tables.sql  blob fbf5d3088075a23ba8c1456f9de3ae7305f864c5 (0b4a141, SW-1.3.2)
+ *
+ * This manifest is closed. It exists only to reconcile a pre-checksum ledger for these two
+ * historical files; never add an entry for a new migration. New migrations are checksummed from
+ * their bytes when they are applied, and an unknown NULL-checksum row is not adopted.
+ */
+export const VERIFIED_LEGACY_MIGRATIONS: Readonly<
+  Record<string, { readonly name: string; readonly checksum: string }>
+> = {
+  '0001': {
+    name: '0001-roles',
+    checksum: '31e9876e704d448a5809512500b2f1e09f455467d202406af6bc09a8d7ffeb7f',
+  },
+  '0002': {
+    name: '0002-org-tables',
+    checksum: '3a47f0e5441162c89007ca06bb93d111cc574ea8786ac7151cd9bbb4815ff6d4',
+  },
+};
+
 /** Failure modes surfaced by the migration runner. */
 export type MigrationErrorCode =
   | 'MIGRATION_DIRECTORY_MISSING'
@@ -26,6 +51,7 @@ export type MigrationErrorCode =
   | 'MIGRATION_NAME_MISMATCH'
   | 'MIGRATION_CHECKSUM_MISMATCH'
   | 'MIGRATION_LEGACY_CHECKSUM_MISSING'
+  | 'MIGRATION_LEGACY_CHECKSUM_UNVERIFIED'
   | 'MIGRATION_LOCK_TIMEOUT'
   | 'MIGRATION_INVALID_OPTIONS'
   | 'MIGRATION_APPLY_FAILED';
@@ -63,9 +89,10 @@ export interface RunMigrationsOptions {
   /** Override the migration directory (tests use temporary directories). */
   migrationsDir?: string;
   /**
-   * Record checksums for ledger rows created before checksum support existed. Only meaningful
-   * for the historical Batch A ledger; it never changes applied SQL and never invents a
-   * checksum for a migration file that is absent.
+   * Adopt the trusted historical checksum for a pre-checksum ledger row. Adoption is restricted
+   * to the closed `VERIFIED_LEGACY_MIGRATIONS` manifest and requires the on-disk file to be
+   * byte-identical to the verified historical version; it never changes applied SQL and never
+   * invents a checksum for an unknown or modified migration.
    */
   adoptLegacyChecksums?: boolean;
   /** Bound on the advisory-lock wait; exceeding it fails with `MIGRATION_LOCK_TIMEOUT`. */
@@ -183,14 +210,36 @@ async function validateHistory(
       );
     }
     if (row.checksum === null) {
-      if (adoptLegacyChecksums) continue;
-      throw new MigrationError(
-        'MIGRATION_LEGACY_CHECKSUM_MISSING',
-        `Applied migration ${row.version} has no recorded checksum (pre-checksum ledger). ` +
-          'Re-run with --adopt-legacy to record the checksum of the unmodified file, or restore a verified backup.',
-      );
-    }
-    if (row.checksum !== file.checksum) {
+      if (!adoptLegacyChecksums) {
+        throw new MigrationError(
+          'MIGRATION_LEGACY_CHECKSUM_MISSING',
+          `Applied migration ${row.version} has no recorded checksum (pre-checksum ledger). ` +
+            'Re-run with --adopt-legacy to adopt the verified historical checksum, or restore a verified backup.',
+        );
+      }
+      const verified = VERIFIED_LEGACY_MIGRATIONS[row.version];
+      if (verified === undefined) {
+        throw new MigrationError(
+          'MIGRATION_LEGACY_CHECKSUM_UNVERIFIED',
+          `Applied migration ${row.version} (${row.name}) has no recorded checksum and no trusted ` +
+            'historical baseline; its checksum cannot be verified and will not be adopted',
+        );
+      }
+      if (verified.name !== file.name) {
+        throw new MigrationError(
+          'MIGRATION_LEGACY_CHECKSUM_UNVERIFIED',
+          `Applied migration ${row.version} is recorded as ${row.name} but the verified historical ` +
+            `migration is ${verified.name}; refusing to adopt`,
+        );
+      }
+      if (verified.checksum !== file.checksum) {
+        throw new MigrationError(
+          'MIGRATION_LEGACY_CHECKSUM_UNVERIFIED',
+          `Applied migration ${row.version} (${row.name}) differs from its verified historical ` +
+            `version (expected ${verified.checksum}, found ${file.checksum}); refusing to adopt`,
+        );
+      }
+    } else if (row.checksum !== file.checksum) {
       throw new MigrationError(
         'MIGRATION_CHECKSUM_MISMATCH',
         `Applied migration ${row.version} (${row.name}) does not match its recorded SHA-256 checksum; ` +
@@ -237,16 +286,15 @@ async function applyUnderLock(
   const appliedVersions = new Set(applied.map((row) => row.version));
   const pending = files.filter((file) => !appliedVersions.has(file.version));
 
-  const filesByVersion = new Map(files.map((file) => [file.version, file]));
   for (const row of applied) {
     if (row.checksum !== null) continue;
-    const file = filesByVersion.get(row.version);
-    if (file === undefined) continue;
+    const verified = VERIFIED_LEGACY_MIGRATIONS[row.version];
+    if (verified === undefined) continue;
     await client.query(
       `UPDATE ${MIGRATION_LEDGER_TABLE} SET checksum = $1 WHERE version = $2 AND checksum IS NULL`,
-      [file.checksum, row.version],
+      [verified.checksum, row.version],
     );
-    options.onEvent?.({ type: 'adopted', version: row.version, checksum: file.checksum });
+    options.onEvent?.({ type: 'adopted', version: row.version, checksum: verified.checksum });
   }
 
   const appliedNow: string[] = [];
@@ -325,13 +373,18 @@ export async function runMigrations(
   }
 }
 
+/**
+ * Migration CLI connection. It deliberately uses dedicated `MIGRATE_POSTGRES_*` credentials so a
+ * shell that exports the development administrator or runtime credentials cannot silently run
+ * migrations as the wrong role (review finding DB-12).
+ */
 function createMigratorPool(): pg.Pool {
   return new pg.Pool({
     host: process.env.POSTGRES_HOST ?? '127.0.0.1',
     port: Number(process.env.POSTGRES_PORT ?? '5432'),
     database: process.env.POSTGRES_DB ?? 'switchyard',
-    user: process.env.POSTGRES_USER ?? 'switchyard',
-    password: process.env.POSTGRES_PASSWORD ?? 'switchyard_dev_password',
+    user: process.env.MIGRATE_POSTGRES_USER ?? 'gateway_migrator',
+    password: process.env.MIGRATE_POSTGRES_PASSWORD ?? 'switchyard_migrator_password',
     connectionTimeoutMillis: 5000,
   });
 }

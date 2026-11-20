@@ -107,6 +107,8 @@ cp .env.example .env
 | `POSTGRES_PASSWORD` | `switchyard_dev_password` | PostgreSQL development password | Local development only |
 | `POSTGRES_DB` | `switchyard` | PostgreSQL development database | Local development only |
 | `POSTGRES_PORT` | `5432` | Host loopback port for PostgreSQL | Bound to `127.0.0.1` |
+| `GATEWAY_POSTGRES_USER` | `gateway_app` | Restricted Gateway runtime PostgreSQL user | Least-privilege runtime role (Architecture §12.1, DB-12) |
+| `GATEWAY_POSTGRES_PASSWORD` | `switchyard_app_password` | Gateway runtime PostgreSQL password | Runtime database connection password |
 | `REDIS_PASSWORD` | `switchyard_dev_password` | Redis admin authentication password | Injected via stdin/environment for administrative/ops use |
 | `REDIS_APP_USER` | `switchyard_app` | Restricted Redis application user | Runtime ACL user for application services |
 | `REDIS_APP_PASSWORD` | `switchyard_app_password` | Restricted Redis application password | Runtime ACL password with prohibited administrative commands |

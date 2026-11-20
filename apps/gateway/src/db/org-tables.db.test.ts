@@ -83,7 +83,7 @@ describe('SW-1.3.2 tenant core tables: constraints, RLS posture, upgrade safety'
 
   async function createDatabase(label: string): Promise<DisposableDatabase> {
     const database = await createDisposableDatabase(cluster, label);
-    await bootstrapDatabase(database.url, passwords);
+    await bootstrapDatabase(database, passwords);
     databases.push(database);
     return database;
   }

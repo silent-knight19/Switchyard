@@ -7,17 +7,30 @@ import pg from 'pg';
 import { provisionRoles } from '../bootstrap.js';
 
 /**
- * Disposable PostgreSQL infrastructure for the database integration suite (review finding
- * DB-01). Every test file starts its own throwaway PostgreSQL 16 container, creates
- * `switchyard_test_*` databases inside it, and destroys the container afterwards. The
- * persistent development database (`switchyard` on the Compose stack) is never contacted.
+ * Disposable PostgreSQL infrastructure for the database integration suite (review findings
+ * DB-01, DB-13). Every test file starts its own throwaway PostgreSQL 16 container, creates
+ * `switchyard_test_*` databases inside it, and destroys the container afterwards.
  *
- * `TEST_POSTGRES_ADMIN_URL` may point at an already-provisioned disposable cluster (for
- * example a CI service container). It must target the `postgres` maintenance database.
+ * The suite never accepts an externally supplied cluster URL: an environment-variable opt-in is
+ * not proof that a database is disposable, and role provisioning changes cluster-wide passwords.
+ * Instead, every cluster is created here and must present positive identity evidence (a Docker
+ * label plus a per-run token) before any database is created or any role password is changed.
  */
 
 const DEFAULT_IMAGE = 'postgres:16.8-alpine';
-const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
+
+/** Docker label stamped on every cluster this module creates. */
+export const CLUSTER_LABEL_KEY = 'switchyard.test';
+export const CLUSTER_LABEL_VALUE = 'db';
+
+/** Container environment variable carrying the per-run cluster identity token. */
+export const CLUSTER_ID_ENV = 'SWITCHYARD_TEST_CLUSTER_ID';
+
+/**
+ * Legacy external-cluster opt-in. It is rejected outright rather than trusted (DB-13); the
+ * variable is still recognised so an inherited value fails loudly instead of being ignored.
+ */
+export const UNSUPPORTED_ADMIN_URL_ENV = 'TEST_POSTGRES_ADMIN_URL';
 
 /** Only databases with this prefix may be created or dropped by tests. */
 export const DISPOSABLE_DATABASE_PATTERN = /^switchyard_test_[a-z0-9_]{1,40}$/;
@@ -33,14 +46,25 @@ export type LoginRole = (typeof LOGIN_ROLES)[number];
 
 export interface DisposableCluster {
   adminUrl: string;
-  containerName: string | null;
+  containerName: string;
+  /** Per-run token that must match the container's identity evidence. */
+  token: string;
   stop(): Promise<void>;
 }
 
 export interface DisposableDatabase {
   name: string;
   url: string;
+  cluster: DisposableCluster;
   drop(): Promise<void>;
+}
+
+/** Observable container state used to prove a cluster is the disposable container we created. */
+export interface ClusterIdentityEvidence {
+  containerName: string;
+  running: boolean;
+  labels: Record<string, string>;
+  environment: string[];
 }
 
 function delay(ms: number): Promise<void> {
@@ -76,32 +100,60 @@ export function assertSafeDisposableDatabaseName(name: string): void {
   }
 }
 
-/** Validate an externally supplied admin URL before any database is created or dropped. */
-export function assertSafeAdminUrl(raw: string): URL {
-  if (process.env.NODE_ENV === 'production') {
-    throw new Error('Refusing to run the disposable database suite with NODE_ENV=production');
-  }
-  let url: URL;
-  try {
-    url = new URL(raw);
-  } catch {
-    throw new Error('TEST_POSTGRES_ADMIN_URL is not a valid URL');
-  }
-  if (url.protocol !== 'postgres:' && url.protocol !== 'postgresql:') {
-    throw new Error(`TEST_POSTGRES_ADMIN_URL must use the postgres protocol, got ${url.protocol}`);
-  }
-  const database = decodeURIComponent(url.pathname.replace(/^\//, ''));
-  if (database !== 'postgres') {
+/**
+ * Prove that the container behind a cluster is the disposable container this module started.
+ * The label and the per-run token are stamped at creation time, so a development container that
+ * happens to listen on a loopback port cannot satisfy them.
+ */
+export function assertClusterIdentity(
+  cluster: { containerName: string; token: string },
+  evidence: ClusterIdentityEvidence,
+): void {
+  if (evidence.containerName !== cluster.containerName) {
     throw new Error(
-      `TEST_POSTGRES_ADMIN_URL must target the "postgres" maintenance database, got "${database}"`,
+      `Refusing to use PostgreSQL container "${evidence.containerName}": expected the disposable ` +
+        `test container "${cluster.containerName}"`,
     );
   }
-  if (!LOOPBACK_HOSTS.has(url.hostname) && process.env.ALLOW_NON_LOOPBACK_TEST_PG !== 'true') {
+  if (!evidence.running) {
     throw new Error(
-      `TEST_POSTGRES_ADMIN_URL host "${url.hostname}" is not loopback; set ALLOW_NON_LOOPBACK_TEST_PG=true only for a disposable CI cluster`,
+      `Refusing to use PostgreSQL container "${evidence.containerName}": the container is not running`,
     );
   }
-  return url;
+  if (evidence.labels[CLUSTER_LABEL_KEY] !== CLUSTER_LABEL_VALUE) {
+    throw new Error(
+      `Refusing to use PostgreSQL container "${evidence.containerName}": missing disposable-cluster ` +
+        `identity label ${CLUSTER_LABEL_KEY}=${CLUSTER_LABEL_VALUE}`,
+    );
+  }
+  const prefix = `${CLUSTER_ID_ENV}=`;
+  const tokenEntry = evidence.environment.find((entry) => entry.startsWith(prefix));
+  if (tokenEntry === undefined) {
+    throw new Error(
+      `Refusing to use PostgreSQL container "${evidence.containerName}": missing disposable-cluster identity token`,
+    );
+  }
+  if (tokenEntry.slice(prefix.length) !== cluster.token) {
+    throw new Error(
+      `Refusing to use PostgreSQL container "${evidence.containerName}": disposable-cluster identity token mismatch`,
+    );
+  }
+}
+
+/** Read identity evidence for a container; throws when the container does not exist. */
+export function readClusterIdentityEvidence(containerName: string): ClusterIdentityEvidence {
+  const raw = docker(['inspect', '--format', '{{json .}}', containerName]);
+  const inspected = JSON.parse(raw) as {
+    Name?: string;
+    State?: { Running?: boolean };
+    Config?: { Labels?: Record<string, string> | null; Env?: string[] | null };
+  };
+  return {
+    containerName: (inspected.Name ?? '').replace(/^\//, ''),
+    running: inspected.State?.Running === true,
+    labels: inspected.Config?.Labels ?? {},
+    environment: inspected.Config?.Env ?? [],
+  };
 }
 
 export function withDatabase(raw: string, database: string): string {
@@ -140,20 +192,20 @@ async function waitForPostgres(adminUrl: string, timeoutMs: number): Promise<voi
   );
 }
 
-/** Start an isolated PostgreSQL 16 cluster, or reuse an explicitly disposable admin URL. */
+/** Start an isolated PostgreSQL 16 cluster and verify its disposable identity. */
 export async function startDisposableCluster(): Promise<DisposableCluster> {
   if (process.env.NODE_ENV === 'production') {
     throw new Error('Refusing to start a disposable PostgreSQL cluster with NODE_ENV=production');
   }
-
-  const provided = process.env.TEST_POSTGRES_ADMIN_URL;
-  if (provided !== undefined && provided !== '') {
-    assertSafeAdminUrl(provided);
-    await waitForPostgres(provided, 60_000);
-    return { adminUrl: provided, containerName: null, stop: async () => undefined };
+  if (process.env[UNSUPPORTED_ADMIN_URL_ENV] !== undefined) {
+    throw new Error(
+      `${UNSUPPORTED_ADMIN_URL_ENV} is no longer supported: the database integration suite always ` +
+        'starts its own verified disposable container. Unset the variable to run the suite.',
+    );
   }
 
   const containerName = `switchyard-test-pg-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
+  const token = crypto.randomBytes(32).toString('hex');
   const password = crypto.randomBytes(18).toString('hex');
   docker([
     'run',
@@ -162,7 +214,9 @@ export async function startDisposableCluster(): Promise<DisposableCluster> {
     '--name',
     containerName,
     '--label',
-    'switchyard.test=db',
+    `${CLUSTER_LABEL_KEY}=${CLUSTER_LABEL_VALUE}`,
+    '-e',
+    `${CLUSTER_ID_ENV}=${token}`,
     '-e',
     `POSTGRES_PASSWORD=${password}`,
     '-e',
@@ -180,26 +234,43 @@ export async function startDisposableCluster(): Promise<DisposableCluster> {
     }
   };
 
+  const cluster: DisposableCluster = {
+    adminUrl: '',
+    containerName,
+    token,
+    stop,
+  };
+
   try {
+    const evidence = readClusterIdentityEvidence(containerName);
+    assertClusterIdentity(cluster, evidence);
+
     const portOutput = docker(['port', containerName, '5432']).trim();
     const port = portOutput.slice(portOutput.lastIndexOf(':') + 1);
     if (!/^\d+$/.test(port)) {
       throw new Error(`Could not determine the mapped PostgreSQL port from "${portOutput}"`);
     }
-    const adminUrl = `postgres://postgres:${password}@127.0.0.1:${port}/postgres`;
-    await waitForPostgres(adminUrl, 90_000);
-    return { adminUrl, containerName, stop };
+    cluster.adminUrl = `postgres://postgres:${password}@127.0.0.1:${port}/postgres`;
+    await waitForPostgres(cluster.adminUrl, 90_000);
+    return cluster;
   } catch (error) {
     await stop();
     throw error;
   }
 }
 
-/** Create a disposable database inside the disposable cluster. */
+/** Re-verify the cluster identity immediately before creating a disposable database. */
+function assertClusterStillDisposable(cluster: DisposableCluster): void {
+  assertClusterIdentity(cluster, readClusterIdentityEvidence(cluster.containerName));
+}
+
+/** Create a disposable database inside the verified disposable cluster. */
 export async function createDisposableDatabase(
   cluster: DisposableCluster,
   label: string,
 ): Promise<DisposableDatabase> {
+  assertClusterStillDisposable(cluster);
+
   const slug = label
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '_')
@@ -219,6 +290,7 @@ export async function createDisposableDatabase(
   return {
     name,
     url: withDatabase(cluster.adminUrl, name),
+    cluster,
     async drop() {
       assertSafeDisposableDatabaseName(name);
       const dropper = new pg.Client({ connectionString: cluster.adminUrl });
@@ -232,12 +304,19 @@ export async function createDisposableDatabase(
   };
 }
 
-/** Run the privileged bootstrap and set disposable test passwords for login roles. */
+/**
+ * Run the privileged bootstrap and set disposable test passwords for login roles. The database
+ * handle can only come from `createDisposableDatabase`, and the cluster identity is re-verified
+ * first so a development cluster can never reach the `ALTER ROLE ... PASSWORD` statements.
+ */
 export async function bootstrapDatabase(
-  databaseUrl: string,
+  database: DisposableDatabase,
   passwords: Record<LoginRole, string>,
 ): Promise<void> {
-  const client = new pg.Client({ connectionString: databaseUrl });
+  assertSafeDisposableDatabaseName(database.name);
+  assertClusterStillDisposable(database.cluster);
+
+  const client = new pg.Client({ connectionString: database.url });
   await client.connect();
   try {
     await provisionRoles(client);

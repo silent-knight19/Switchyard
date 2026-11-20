@@ -1,6 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import pg from 'pg';
 import { runMigrations } from './migrate.js';
+import { createPostgresClient } from '../infrastructure/postgres.js';
+import type { GatewayConfig } from '../config/index.js';
 import {
   bootstrapDatabase,
   createDisposableDatabase,
@@ -69,7 +71,7 @@ describe('SW-1.3.1 role privileges under real authenticated sessions', () => {
     cluster = await startDisposableCluster();
     database = await createDisposableDatabase(cluster, 'privileges');
     databases.push(database);
-    await bootstrapDatabase(database.url, passwords);
+    await bootstrapDatabase(database, passwords);
 
     const migrator = new pg.Pool({
       connectionString: roleConnectionString(
@@ -322,5 +324,70 @@ describe('SW-1.3.1 role privileges under real authenticated sessions', () => {
     const app = await connectAs('gateway_app');
     const privilegeError = await expectSqlState(app.query('SELECT * FROM users'), '42501');
     expect(errorMessage(privilegeError)).toMatch(/permission denied/i);
+  });
+
+  it('clean-clone bootstrap, migration, and Gateway startup succeed in documented order (DB-12)', async () => {
+    // 1. Fresh empty database on clean cluster
+    const freshDb = await createDisposableDatabase(cluster, 'clean_clone_order');
+    databases.push(freshDb);
+
+    // 2. Step 1 (Privileged): Superuser provisions roles and sets role passwords
+    await bootstrapDatabase(freshDb, passwords);
+
+    // 3. Step 2 (Unprivileged): Deployment role runs forward-only migrations
+    const migrator = new pg.Pool({
+      connectionString: roleConnectionString(
+        freshDb.url,
+        'gateway_migrator',
+        passwords.gateway_migrator,
+      ),
+    });
+    try {
+      const applied = await runMigrations(migrator);
+      expect(applied).toHaveLength(6);
+    } finally {
+      await migrator.end();
+    }
+
+    // 4. Step 3 (Gateway runtime): Fastify Gateway connects as restricted gateway_app
+    const parsedUrl = new URL(freshDb.url);
+    const gatewayPg = createPostgresClient({
+      POSTGRES_HOST: parsedUrl.hostname,
+      POSTGRES_PORT: Number(parsedUrl.port),
+      POSTGRES_DB: parsedUrl.pathname.slice(1),
+      POSTGRES_USER: 'gateway_app',
+      POSTGRES_PASSWORD: passwords.gateway_app,
+    } as unknown as GatewayConfig);
+
+    try {
+      const readiness = await gatewayPg.checkReadiness();
+      expect(readiness.ok).toBe(true);
+
+      const session = await gatewayPg.pool.query<{
+        current_user: string;
+        rolsuper: boolean;
+        rolbypassrls: boolean;
+      }>('SELECT current_user, rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user');
+      expect(session.rows[0]?.current_user).toBe('gateway_app');
+      expect(session.rows[0]?.rolsuper).toBe(false);
+      expect(session.rows[0]?.rolbypassrls).toBe(false);
+
+      // Verify Gateway runtime cannot perform DDL on tenant tables
+      await expectSqlState(
+        gatewayPg.pool.query('CREATE TABLE organizations_probe (id uuid PRIMARY KEY)'),
+        '42501',
+      );
+      await expectSqlState(
+        gatewayPg.pool.query('ALTER TABLE organizations ADD COLUMN probe text'),
+        '42501',
+      );
+      await expectSqlState(gatewayPg.pool.query('DROP TABLE organizations'), '42501');
+
+      // Verify Gateway runtime cannot assume owner or executor roles
+      await expectSqlState(gatewayPg.pool.query('SET ROLE gateway_owner'), '42501');
+      await expectSqlState(gatewayPg.pool.query('SET ROLE gateway_auth_executor'), '42501');
+    } finally {
+      await gatewayPg.close();
+    }
   });
 });

@@ -5,7 +5,7 @@ import { LifecycleCoordinator } from './lifecycle/state.js';
 import { GracefulShutdownManager, type ShutdownDependencies } from './lifecycle/shutdown.js';
 import { buildApp } from './app.js';
 import { createLogger } from './logging/index.js';
-import type { PostgresClient } from './infrastructure/postgres.js';
+import { createPostgresClient, type PostgresClient } from './infrastructure/postgres.js';
 import {
   createRedisClient,
   verifyRedisAclAttestation,
@@ -22,8 +22,8 @@ const VALID_DEV_ENV: Record<string, string> = {
   POSTGRES_HOST: '127.0.0.1',
   POSTGRES_PORT: '5432',
   POSTGRES_DB: 'switchyard',
-  POSTGRES_USER: 'switchyard',
-  POSTGRES_PASSWORD: 'switchyard_dev_password',
+  POSTGRES_USER: 'gateway_app',
+  POSTGRES_PASSWORD: 'switchyard_app_password',
   REDIS_HOST: '127.0.0.1',
   REDIS_PORT: '6379',
   REDIS_USER: 'switchyard_app',
@@ -687,8 +687,8 @@ describe('SW-1.2.4 Gateway Boot, Health, and Shutdown Lifecycle', () => {
       host: '127.0.0.1',
       port: 5432,
       database: 'switchyard',
-      user: 'switchyard',
-      password: 'switchyard_dev_password',
+      user: 'gateway_app',
+      password: 'switchyard_app_password',
       statement_timeout: 1000,
       connectionTimeoutMillis: 2000,
       max: 5,
@@ -927,5 +927,78 @@ describe('SW-1.2.4 Gateway Boot, Health, and Shutdown Lifecycle', () => {
 
     // Verify exactly and only the expected safe probes were invoked
     expect(interceptedCommands).toEqual(['ACL WHOAMI', 'CONFIG', 'KEYS', 'ACL']);
+  });
+
+  it('26. real postgresql integration: gateway runtime connects as restricted gateway_app role with least privilege (DB-12)', async () => {
+    const reachable = await isPortReachable(5432);
+    if (!reachable) {
+      if (REQUIRE_INTEGRATION) {
+        expect.fail('PostgreSQL integration test failed: service not reachable on 127.0.0.1:5432');
+      }
+      return;
+    }
+
+    const pgClient = createPostgresClient(VALID_DEV_ENV as unknown as GatewayConfig);
+    try {
+      // 1. Verify authenticated identity and least privilege flags
+      const roleRes = await pgClient.pool.query<{
+        current_user: string;
+        rolsuper: boolean;
+        rolbypassrls: boolean;
+      }>('SELECT current_user, rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user');
+      expect(roleRes.rows[0]?.current_user).toBe('gateway_app');
+      expect(roleRes.rows[0]?.rolsuper).toBe(false);
+      expect(roleRes.rows[0]?.rolbypassrls).toBe(false);
+
+      // 2. Gateway cannot CREATE, ALTER, or DROP tenant tables (SQLSTATE 42501)
+      await expect(
+        pgClient.pool.query('CREATE TABLE organizations_probe (id uuid PRIMARY KEY)'),
+      ).rejects.toMatchObject({ code: '42501' });
+
+      await expect(
+        pgClient.pool.query('ALTER TABLE organizations ADD COLUMN probe text'),
+      ).rejects.toMatchObject({ code: '42501' });
+
+      await expect(pgClient.pool.query('DROP TABLE organizations')).rejects.toMatchObject({
+        code: '42501',
+      });
+
+      // 3. Gateway cannot assume owner, migrator, or executor roles
+      await expect(pgClient.pool.query('SET ROLE gateway_owner')).rejects.toMatchObject({
+        code: '42501',
+      });
+      await expect(pgClient.pool.query('SET ROLE gateway_migrator')).rejects.toMatchObject({
+        code: '42501',
+      });
+      await expect(pgClient.pool.query('SET ROLE gateway_auth_executor')).rejects.toMatchObject({
+        code: '42501',
+      });
+      await expect(pgClient.pool.query('SET ROLE gateway_ops_executor')).rejects.toMatchObject({
+        code: '42501',
+      });
+
+      // 4. Gateway readiness remains fully functional
+      const readiness = await pgClient.checkReadiness();
+      expect(readiness.ok).toBe(true);
+    } finally {
+      await pgClient.close();
+    }
+  });
+
+  it('27. gateway startup fails closed with invalid or unavailable runtime database credentials (DB-12)', async () => {
+    // 1. Invalid database password fails startup
+    const invalidPassEnv = {
+      ...VALID_DEV_ENV,
+      POSTGRES_PASSWORD: 'wrong_app_password_987',
+    };
+    await expect(createServer(invalidPassEnv)).rejects.toThrow(StartupError);
+
+    // 2. Unreachable database host/port fails startup
+    const unreachableDbEnv = {
+      ...VALID_DEV_ENV,
+      POSTGRES_HOST: '127.0.0.1',
+      POSTGRES_PORT: '59998',
+    };
+    await expect(createServer(unreachableDbEnv)).rejects.toThrow(StartupError);
   });
 });

@@ -66,7 +66,7 @@ describe('SW-1.3.1 migration runner: locking, integrity, bootstrap (real Postgre
 
   async function createDatabase(label: string): Promise<DisposableDatabase> {
     const database = await createDisposableDatabase(cluster, label);
-    await bootstrapDatabase(database.url, passwords);
+    await bootstrapDatabase(database, passwords);
     databases.push(database);
     return database;
   }
@@ -506,6 +506,97 @@ describe('SW-1.3.1 migration runner: locking, integrity, bootstrap (real Postgre
       }
     } finally {
       await verifier.end();
+    }
+
+    // Repeated adoption on an already-adopted ledger is idempotent and stable
+    const secondEvents: string[] = [];
+    const secondPool = migratorPool(database);
+    let secondApplied: string[];
+    try {
+      secondApplied = await runMigrations(secondPool, {
+        adoptLegacyChecksums: true,
+        onEvent: (event) =>
+          secondEvents.push(`${event.type}:${'version' in event ? event.version : ''}`),
+      });
+    } finally {
+      await secondPool.end();
+    }
+    expect(secondApplied).toEqual([]);
+    expect(secondEvents).toEqual(['up-to-date:']);
+  });
+
+  it('rejects checksum adoption when legacy migration file on disk is modified (DB-14)', async () => {
+    const database = await createDatabase('legacy_modified');
+    const legacyDir = copyMigrationsToTempDir(['0001-roles.sql', '0002-org-tables.sql']);
+    try {
+      expect(await migrate(database, legacyDir)).toEqual(['0001', '0002']);
+    } finally {
+      removeTempDir(legacyDir);
+    }
+
+    const client = new pg.Client({ connectionString: database.url });
+    await client.connect();
+    try {
+      await client.query(`UPDATE ${MIGRATION_LEDGER_TABLE} SET checksum = NULL`);
+    } finally {
+      await client.end();
+    }
+
+    // Temp dir with modified 0001-roles.sql
+    const tempDir = writeMigrationsToTempDir({
+      '0001-roles.sql': '-- modified content that does not match historical baseline\nSELECT 1;\n',
+      '0002-org-tables.sql': fs.readFileSync(
+        path.join(process.cwd(), 'src', 'db', 'migrations', '0002-org-tables.sql'),
+        'utf8',
+      ),
+    });
+    try {
+      const pool = migratorPool(database);
+      try {
+        await expectMigrationError(
+          runMigrations(pool, { migrationsDir: tempDir, adoptLegacyChecksums: true }),
+          'MIGRATION_LEGACY_CHECKSUM_UNVERIFIED',
+        );
+      } finally {
+        await pool.end();
+      }
+    } finally {
+      removeTempDir(tempDir);
+    }
+  });
+
+  it('rejects checksum adoption for an unknown legacy migration without verified baseline (DB-14)', async () => {
+    const database = await createDatabase('legacy_unknown');
+    const legacyDir = copyMigrationsToTempDir([
+      '0001-roles.sql',
+      '0002-org-tables.sql',
+      '0003-rls-default-deny.sql',
+    ]);
+    try {
+      expect(await migrate(database, legacyDir)).toEqual(['0001', '0002', '0003']);
+    } finally {
+      removeTempDir(legacyDir);
+    }
+
+    const client = new pg.Client({ connectionString: database.url });
+    await client.connect();
+    try {
+      // Migration 0003 is NOT in VERIFIED_LEGACY_MIGRATIONS; having NULL checksum is rejected
+      await client.query(
+        `UPDATE ${MIGRATION_LEDGER_TABLE} SET checksum = NULL WHERE version = '0003'`,
+      );
+    } finally {
+      await client.end();
+    }
+
+    const pool = migratorPool(database);
+    try {
+      await expectMigrationError(
+        runMigrations(pool, { adoptLegacyChecksums: true }),
+        'MIGRATION_LEGACY_CHECKSUM_UNVERIFIED',
+      );
+    } finally {
+      await pool.end();
     }
   });
 });
