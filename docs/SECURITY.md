@@ -114,12 +114,73 @@ To prevent worker compromise from exposing provider credentials:
 
 ---
 
-## 5. Pre-Tenant Authentication Boundaries (Future SW-1.4.3 / SW-1.4.4)
+## 5. Privileged Pre-Tenant Authentication & Maintenance Functions (SW-1.4.3 & SW-1.4.4)
 
-Operations that occur before tenant identity is established (e.g., virtual API key lookup by hash, user login by normalized email) cannot rely on `app.current_org_id`.
+Operations that occur before tenant identity is established (e.g., virtual API key lookup by hash, user login by normalized email, organization/admin bootstrap) or during tenant discovery (worker maintenance enumeration) cannot rely on `app.current_org_id`.
 
-In Subphase 1.4 Batch B (SW-1.4.3 & SW-1.4.4):
-- These operations will be implemented exclusively via `SECURITY DEFINER` functions in the protected `app_private` schema.
-- Functions are owned by dedicated `NOLOGIN BYPASSRLS` executor roles (`gateway_auth_executor`, `gateway_ops_executor`).
-- Functions declare a hardened search path (`SET search_path = pg_catalog, app_private, pg_temp`), have `REVOKE ALL FROM PUBLIC`, and return only the minimal columns required by the caller.
-- Neither `gateway_app` nor `gateway_worker` will ever receive broad cross-tenant `SELECT` permissions.
+To fulfill these requirements without granting broad cross-tenant `SELECT` permissions to `gateway_app` or `gateway_worker`, Switchyard implements isolated, hardened `SECURITY DEFINER` functions in the `app_private` schema (Architecture §12.4).
+
+### 5.1 Dedicated Executor Roles and Bounded BYPASSRLS
+
+- **`gateway_auth_executor` (`NOLOGIN BYPASSRLS`):**
+  - Owns authentication functions: `app_private.lookup_virtual_key_by_hash`, `app_private.lookup_user_for_login`, and `app_private.create_organization_with_admin`.
+  - Holds narrow column-level `SELECT` on `virtual_keys` (12 fields) and `users` (4 login fields), plus column-level `INSERT` on `organizations` and `users` for bootstrap.
+  - Zero `UPDATE`, `DELETE`, or `TRUNCATE` privileges on any table.
+  - Does NOT own any tenant tables.
+- **`gateway_ops_executor` (`NOLOGIN BYPASSRLS`):**
+  - Owns maintenance enumerator: `app_private.list_active_org_ids`.
+  - Holds column-level `SELECT (id)` on `public.organizations` only.
+  - Zero privileges on any other column, tenant table, credential, or key.
+  - Does NOT own any tenant tables.
+- **BYPASSRLS Confinement:** `BYPASSRLS` is restricted exclusively to these non-login executor roles. Neither `gateway_app`, `gateway_worker`, `gateway_startup`, nor `gateway_migrator` holds `BYPASSRLS`.
+
+### 5.2 Deployment Provisioning & Assumption Model
+
+To allow deployment role `gateway_migrator` to install executor-owned functions without violating least privilege:
+- `provision-roles.sql` grants `gateway_auth_executor` and `gateway_ops_executor` to `gateway_migrator` with explicit `WITH INHERIT FALSE, SET TRUE, ADMIN FALSE`.
+- `gateway_migrator` does not automatically inherit executor privileges (`INHERIT FALSE`), cannot grant them to others (`ADMIN FALSE`), and may only assume them via explicit `SET ROLE` within migration transactions.
+- Runtime principals (`gateway_app`, `gateway_worker`, `gateway_startup`) are strictly prohibited from assuming or administering either executor role.
+- `app_private` schema creation privileges are granted only to `gateway_owner`, `gateway_migrator`, `gateway_auth_executor`, and `gateway_ops_executor`. Runtime roles receive `USAGE` only.
+
+### 5.3 Function Hardening & Attack Mitigations
+
+1. **Hardened Fixed Search Path:**
+   - Every privileged function declares:
+     ```sql
+     SET search_path = pg_catalog, app_private, pg_temp
+     ```
+   - Schema references inside function bodies are explicitly qualified (`public.virtual_keys`, `public.users`, `public.organizations`).
+   - `pg_temp` is placed last, completely thwarting search-path poisoning and malicious temporary table/function shadowing attacks.
+2. **Default EXECUTE Revocation:**
+   - `REVOKE ALL ON FUNCTION ... FROM PUBLIC` is executed within the same migration transaction as function creation.
+   - `GRANT EXECUTE` is issued strictly to the authorized runtime role (`gateway_app` for authentication functions, `gateway_worker` for maintenance enumeration).
+   - `gateway_startup` and `PUBLIC` have zero execution privileges.
+3. **Fail-Closed Input Contracts:**
+   - `lookup_virtual_key_by_hash`: Fails closed and returns 0 rows on NULL, empty, or wrong-length hash (!= 32 bytes).
+   - `lookup_user_for_login`: Fails closed and returns 0 rows on NULL, empty, or oversized email (> 255 chars). Exact matching on `email_normalized` avoids inconsistent casing behavior.
+   - `create_organization_with_admin`: Bounded parameters (budget $\le 10^{15}$, non-empty DEKs) with controlled SQLSTATE exceptions (`22004`, `22023`). Atomic rollback on any constraint violation (`23505`) prevents orphan organizations or orphaned admin users.
+   - `list_active_org_ids`: Bounded limits (1..100). Invalid limits fail closed with SQLSTATE `22023`. Keyset pagination ensures deterministic, duplicate-free enumeration.
+4. **Maintenance Enumeration Privacy Boundary:**
+   - `list_active_org_ids` returns only `org_id UUID`. It never returns organization names, budgets, wrapped DEKs, or created timestamps.
+   - Background workers must execute all subsequent maintenance operations inside `withTenant(orgId, callback)`.
+
+### 5.4 What SECURITY DEFINER Does and Does Not Protect Against
+
+- **What It Protects Against:** It allows unauthenticated Gateway processes to look up virtual keys and user credentials by exact hash/email without granting `gateway_app` global `SELECT` on `virtual_keys` or `users`. It prevents accidental cross-tenant data leaks and SQL injection attacks from accessing arbitrary rows.
+- **What It Does NOT Protect Against:**
+  - A compromised Gateway process can still invoke `lookup_virtual_key_by_hash` or `lookup_user_for_login`.
+  - Database functions do not implement application-level brute-force abuse rate limiting, IP rate limiting, or Argon2id password verification.
+  - **Required Mitigations:** Strict Fastify pre-admission IP rate limiting (Architecture §6.1), dummy timing verification on unknown emails to prevent timing enumeration (SW-1.5.1), and Argon2id hashing bounds.
+
+---
+
+## 6. Subphase 1.4 Architecture Tracking & Verification
+
+| Requirement / Task | Status | Reference | Verified Evidence |
+| :--- | :---: | :--- | :--- |
+| **Batch A: Transaction Context (SW-1.4.1)** | ACCEPTED | PR #9 (merge commit `21ae53c5b28e4eaeda33ad2658c47297fe653e49`) | `tenant.ts`, `tenant.test.ts`, `tenant-rls.db.test.ts` (32 tests) |
+| **Batch A: Tenant RLS Policies (SW-1.4.2)** | ACCEPTED | PR #9, Migration `0009-tenant-rls-policies.sql` | 9 tenant tables FORCE RLS, unified permissive policies |
+| **Batch B: Auth Functions (SW-1.4.3)** | IMPLEMENTED | Migration `0010-privileged-bootstrap-functions.sql` | Owned by `gateway_auth_executor`, hardened `search_path`, 0 rows on invalid inputs, atomic bootstrap |
+| **Batch B: Maintenance Enumerator (SW-1.4.4)**| IMPLEMENTED | Migration `0010-privileged-bootstrap-functions.sql` | Owned by `gateway_ops_executor`, UUID-only return, bounded keyset pagination |
+| **Batch B: Executor Provisioning Decision** | APPROVED | Owner-approved Option 1 (`provision-roles.sql`) | `gateway_migrator` granted `INHERIT FALSE, SET TRUE, ADMIN FALSE` |
+| **Batch B: v1 Active Org Interpretation** | APPROVED | Owner-approved v1 decision | All existing rows in `public.organizations` enumerated via keyset pagination; no column added |

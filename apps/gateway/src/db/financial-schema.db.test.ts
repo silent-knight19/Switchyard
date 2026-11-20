@@ -1441,9 +1441,9 @@ describe('SW-1.3.3 financial and observability schema: constraints, FKs, generat
           await seeder.end();
         }
 
-        // Apply remaining migrations using authoritative directory (applies 0007, 0008, 0009)
+        // Apply remaining migrations using authoritative directory (applies 0007, 0008, 0009, 0010)
         const secondRun = await migrate(upgradedDb);
-        expect(secondRun).toEqual(['0007', '0008', '0009']);
+        expect(secondRun).toEqual(['0007', '0008', '0009', '0010']);
 
         // Verify seeded data intact
         const verifier = new pg.Client({ connectionString: upgradedDb.url });

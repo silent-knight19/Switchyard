@@ -137,6 +137,7 @@ describe('SW-1.3.2 tenant core tables: constraints, RLS posture, upgrade safety'
       '0007',
       '0008',
       '0009',
+      '0010',
     ]);
   });
 
