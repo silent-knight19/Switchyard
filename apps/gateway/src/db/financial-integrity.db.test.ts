@@ -428,13 +428,22 @@ describe('SW-1.3.4 Financial Immutability, Append-Only Adjustments, and Monetary
       );
     });
 
-    it('enforces UTC billing period consistency across diverse session time zones (Asia/Kolkata, America/New_York) (DB-23)', async () => {
+    it('enforces UTC billing period consistency across diverse session time zones (Asia/Kolkata, America/New_York) (DB-23, DB-25)', async () => {
       const client = await pool.connect();
-      try {
-        // 1. Session in Asia/Kolkata (+05:30)
-        await client.query("SET LOCAL TimeZone = 'Asia/Kolkata'");
+      const { rows: initialTzRows } = await client.query<{ tz: string }>(
+        "SELECT current_setting('TimeZone') AS tz",
+      );
+      const initialTimeZone = initialTzRows[0]?.tz;
 
-        // 2026-11-30 23:30:00 UTC is 2026-12-01 05:00:00 in Kolkata.
+      try {
+        // 1. Session in Asia/Kolkata (+05:30) - session-scoped SET (DB-25)
+        await client.query("SET TimeZone = 'Asia/Kolkata'");
+        const { rows: kolkataTzRows } = await client.query<{ tz: string }>(
+          "SELECT current_setting('TimeZone') AS tz",
+        );
+        expect(kolkataTzRows[0]?.tz).toBe('Asia/Kolkata');
+
+        // 2026-11-30 23:30:00 UTC is 2026-12-01 05:00:00 in Kolkata (+05:30).
         // But its UTC month is strictly November ('2026-11').
         const reqKolkataOk = 'a0000001-0000-4000-8000-0000000000b1';
         const admittedNovUtc = '2026-11-30T23:30:00.000Z';
@@ -463,10 +472,20 @@ describe('SW-1.3.4 Financial Immutability, Append-Only Adjustments, and Monetary
           '23514',
         );
 
-        // 2. Session in America/New_York (-05:00)
-        await client.query("SET LOCAL TimeZone = 'America/New_York'");
+        // Verify connection is healthy and not in an aborted transaction block (DB-25)
+        const { rows: healthCheckKolkata } = await client.query<{ tz: string }>(
+          "SELECT current_setting('TimeZone') AS tz",
+        );
+        expect(healthCheckKolkata[0]?.tz).toBe('Asia/Kolkata');
 
-        // 2026-12-01 02:00:00 UTC is 2026-11-30 21:00:00 in New York.
+        // 2. Session in America/New_York (-05:00) - session-scoped SET (DB-25)
+        await client.query("SET TimeZone = 'America/New_York'");
+        const { rows: nyTzRows } = await client.query<{ tz: string }>(
+          "SELECT current_setting('TimeZone') AS tz",
+        );
+        expect(nyTzRows[0]?.tz).toBe('America/New_York');
+
+        // 2026-12-01 02:00:00 UTC is 2026-11-30 21:00:00 in New York (-05:00).
         // But its UTC month is strictly December ('2026-12').
         const reqNyOk = 'a0000001-0000-4000-8000-0000000000c1';
         const admittedDecUtc = '2026-12-01T02:00:00.000Z';
@@ -494,8 +513,20 @@ describe('SW-1.3.4 Financial Immutability, Append-Only Adjustments, and Monetary
           ),
           '23514',
         );
+
+        // Verify connection is healthy and not in an aborted transaction block (DB-25)
+        const { rows: healthCheckNy } = await client.query<{ tz: string }>(
+          "SELECT current_setting('TimeZone') AS tz",
+        );
+        expect(healthCheckNy[0]?.tz).toBe('America/New_York');
       } finally {
         await client.query('RESET TimeZone').catch(() => undefined);
+        if (initialTimeZone !== undefined) {
+          const { rows: restoredTz } = await client.query<{ tz: string }>(
+            "SELECT current_setting('TimeZone') AS tz",
+          );
+          expect(restoredTz[0]?.tz).toBe(initialTimeZone);
+        }
         client.release();
       }
     });
