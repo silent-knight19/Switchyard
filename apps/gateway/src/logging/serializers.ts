@@ -1,4 +1,4 @@
-import { ZodError } from 'zod';
+import { ZodError, type ZodIssue } from 'zod';
 import { sanitizeString } from './redaction.js';
 
 const MAX_MESSAGE_LENGTH = 1024;
@@ -13,6 +13,82 @@ const ALLOWED_REQ_HEADERS = new Set([
   'x-request-id',
 ]);
 
+export const ALLOWED_STATIC_ROUTES = new Set([
+  '/health/live',
+  '/health/ready',
+  '/v1/chat/completions',
+  '/v1/models',
+  '/v1/embeddings',
+]);
+
+/**
+ * Returns a safe route identifier, never leaking arbitrary URL path segments or query strings.
+ */
+export function getSafeRouteIdentifier(
+  rawUrl?: string | undefined,
+  routePattern?: string | undefined,
+): string {
+  if (routePattern && typeof routePattern === 'string') {
+    return routePattern;
+  }
+  if (rawUrl && typeof rawUrl === 'string') {
+    const cleanPath = rawUrl.split('?')[0];
+    if (cleanPath && ALLOWED_STATIC_ROUTES.has(cleanPath)) {
+      return cleanPath;
+    }
+  }
+  return '[UNMATCHED_ROUTE]';
+}
+
+export const SAFE_ERROR_TYPES = new Set([
+  'StartupError',
+  'ConfigValidationError',
+  'FastifyError',
+  'ZodError',
+  'DatabaseError',
+  'PostgresError',
+  'RedisError',
+  'ReplyError',
+  'Error',
+  'TypeError',
+  'RangeError',
+  'SyntaxError',
+  'URIError',
+  'ReferenceError',
+  'CyclicReference',
+]);
+
+export const SAFE_ERROR_MESSAGES = new Set([
+  'PostgreSQL readiness check failed during startup',
+  'Redis readiness check failed during startup',
+  'Redis ACL verification failed: runtime identity is not properly restricted',
+  'Unsafe Redis policy: expected "noeviction"',
+  'Configuration validation failed',
+  'PostgreSQL readiness check timed out',
+  'PostgreSQL readiness check query failed',
+  'PostgreSQL database operation failed',
+  'Redis operation failed',
+  'Redis readiness check timed out',
+  'Redis ping failed',
+  'Redis ACL verification failed',
+  'Database operation failed',
+  'Database connection failed',
+  'Database query timed out',
+  'Upstream provider request failed',
+  'Parent cyclic error',
+  'Child error',
+  'Gateway fatal startup failure',
+  'Not Found',
+  'Internal Server Error',
+  'Service Unavailable',
+  'Bad Request',
+  'Method Not Allowed',
+  'Gateway server is listening and ready',
+  'Process signal received; shutting down',
+  'Fatal error during graceful shutdown',
+  '[CIRCULAR REFERENCE DETECTED]',
+]);
+
 export interface SerializedError {
   type: string;
   message: string;
@@ -23,17 +99,37 @@ export interface SerializedError {
   cause?: SerializedError | undefined;
 }
 
-/**
- * Truncates overly long messages to prevent log injection or denial-of-service via huge strings.
- */
 export function truncateMessage(msg: string, maxLength = MAX_MESSAGE_LENGTH): string {
   if (msg.length <= maxLength) return msg;
   return `${msg.slice(0, maxLength)}... [TRUNCATED]`;
 }
 
 /**
- * Sanitizes and bounds error serialization.
- * Never serializes raw DB credentials, connection strings, unbounded cause chains, cyclic references, or raw validation inputs.
+ * Formats a safe Zod issue message that never echoes raw input values.
+ */
+export function formatSafeZodMessage(issue: ZodIssue): string {
+  switch (issue.code) {
+    case 'invalid_type':
+      return `Expected ${issue.expected}`;
+    case 'invalid_value':
+      return `Invalid option: expected one of ${issue.values.map(String).join(' | ')}`;
+    case 'too_small':
+      return `Must contain at least ${issue.minimum} character(s)`;
+    case 'too_big':
+      return `Must contain at most ${issue.maximum} character(s)`;
+    case 'invalid_format':
+      return `Invalid format: ${issue.format}`;
+    case 'custom':
+      return sanitizeString(issue.message);
+    default:
+      return 'Invalid configuration value';
+  }
+}
+
+/**
+ * Safe error serializer enforcing strict allowlisting (Finding 1).
+ * Never serializes arbitrary upstream, database, Redis, or validation error text into production logs.
+ * Never exposes raw stack traces containing untrusted values.
  */
 export function safeErrorSerializer(
   err: unknown,
@@ -41,9 +137,11 @@ export function safeErrorSerializer(
   seen = new WeakSet<object>(),
 ): SerializedError {
   if (typeof err !== 'object' || err === null) {
+    const raw = String(err);
+    const safeMsg = SAFE_ERROR_MESSAGES.has(raw) ? raw : '[UNVETTED_PRIMITIVE_ERROR]';
     return {
       type: typeof err,
-      message: sanitizeString(truncateMessage(String(err))),
+      message: safeMsg,
     };
   }
 
@@ -56,44 +154,86 @@ export function safeErrorSerializer(
   seen.add(err);
 
   const errorObj = err as Record<string, unknown>;
-  const type = typeof errorObj['name'] === 'string' ? errorObj['name'] : 'Error';
-  const rawMessage =
-    typeof errorObj['message'] === 'string' ? errorObj['message'] : 'Unknown error';
+  const rawType = typeof errorObj['name'] === 'string' ? errorObj['name'] : 'Error';
+  const type = SAFE_ERROR_TYPES.has(rawType) ? rawType : 'OperationalError';
 
-  // Sanitize message: strip connection URLs, bearer tokens, passwords, query credentials
-  const message = truncateMessage(sanitizeString(rawMessage));
+  // Handle Safe Error Code
+  let code: string | number | undefined;
+  if (
+    'code' in errorObj &&
+    (typeof errorObj['code'] === 'string' || typeof errorObj['code'] === 'number')
+  ) {
+    const rawCode = String(errorObj['code']);
+    if (/^[A-Za-z0-9_.-]{1,64}$/.test(rawCode)) {
+      code = errorObj['code'];
+    } else {
+      code = 'ERR_UNKNOWN';
+    }
+  }
+
+  // Handle Safe Status Code
+  let statusCode: number | undefined;
+  if ('statusCode' in errorObj && typeof errorObj['statusCode'] === 'number') {
+    if (errorObj['statusCode'] >= 100 && errorObj['statusCode'] <= 599) {
+      statusCode = errorObj['statusCode'];
+    }
+  }
+
+  // Determine Safe Message via Allowlist / Error Classification
+  let message: string;
+  const rawMessage = typeof errorObj['message'] === 'string' ? errorObj['message'] : '';
+
+  if (type === 'StartupError' && errorObj['message']) {
+    message = truncateMessage(sanitizeString(rawMessage));
+  } else if (type === 'ConfigValidationError') {
+    message = 'Configuration validation failed';
+  } else if (type === 'DatabaseError' || type === 'PostgresError') {
+    message = 'PostgreSQL database operation failed';
+  } else if (type === 'RedisError' || type === 'ReplyError') {
+    message = 'Redis operation failed';
+  } else if (SAFE_ERROR_MESSAGES.has(rawMessage)) {
+    message = rawMessage;
+  } else if (rawMessage.startsWith('ERR_PAYLOAD_TOO_LARGE')) {
+    message = truncateMessage(rawMessage);
+  } else if (type === 'FastifyError' && statusCode) {
+    message = statusCode === 404 ? 'Not Found' : 'HTTP Request Failed';
+  } else {
+    // Un-allowlisted arbitrary error text: do not emit into logs to prevent secret leakage
+    message = code ? `Operation failed: ${String(code)}` : 'Operation failed';
+  }
 
   const serialized: SerializedError = {
     type,
     message,
   };
 
-  if (
-    'code' in errorObj &&
-    (typeof errorObj['code'] === 'string' || typeof errorObj['code'] === 'number')
-  ) {
-    serialized.code = errorObj['code'];
+  if (code !== undefined) {
+    serialized.code = code;
+  }
+  if (statusCode !== undefined) {
+    serialized.statusCode = statusCode;
   }
 
-  if ('statusCode' in errorObj && typeof errorObj['statusCode'] === 'number') {
-    serialized.statusCode = errorObj['statusCode'];
-  }
-
+  // Safe Stack Trace: never expose line 0 (which contains raw error message).
+  // Filter only call site frames ('at ...') to prevent leaking sensitive values.
   if (typeof errorObj['stack'] === 'string') {
-    // Sanitize stack trace: never leak credentials or tokens embedded in stack traces
-    const sanitizedStack = sanitizeString(errorObj['stack']);
-    const lines = sanitizedStack.split('\n').slice(0, 10);
-    if (lines[0]) {
-      lines[0] = truncateMessage(lines[0], MAX_MESSAGE_LENGTH);
-    }
-    serialized.stack = lines.join('\n');
+    const lines = errorObj['stack'].split('\n');
+    const callFrames = lines.filter((l) => /^\s*at\s+/.test(l)).slice(0, 10);
+    serialized.stack = [`${type}: [STACK_FRAMES]`, ...callFrames].join('\n');
   }
 
-  // Sanitize ZodError issues: never serialize raw inputs or received values
+  // Safe Issues (Zod / Config issues)
   if (err instanceof ZodError) {
     serialized.issues = err.issues.map((i) => ({
       path: i.path.join('.'),
-      message: sanitizeString(i.message),
+      message: formatSafeZodMessage(i),
+    }));
+  } else if (Array.isArray(errorObj['issues'])) {
+    serialized.issues = (
+      errorObj['issues'] as Array<{ field?: string; path?: string; message?: string }>
+    ).map((i) => ({
+      path: String(i.field ?? i.path ?? 'field'),
+      message: sanitizeString(String(i.message ?? 'Invalid value')),
     }));
   }
 
@@ -107,14 +247,19 @@ export function safeErrorSerializer(
 
 /**
  * Serializes HTTP request metadata safely.
- * Strips query strings from URLs and filters headers against an explicit safe allowlist.
+ * Never logs raw query strings or arbitrary path segments.
  */
 export function safeReqSerializer(req: unknown): Record<string, unknown> {
   if (typeof req !== 'object' || req === null) return {};
   const r = req as Record<string, unknown>;
 
   const rawUrl = typeof r['url'] === 'string' ? r['url'] : '';
-  const safePath = rawUrl.split('?')[0] ?? '';
+  const routeUrl =
+    typeof (r['routeOptions'] as Record<string, unknown> | undefined)?.['url'] === 'string'
+      ? ((r['routeOptions'] as Record<string, unknown>)['url'] as string)
+      : undefined;
+
+  const safeRoute = getSafeRouteIdentifier(rawUrl, routeUrl);
 
   const safeHeaders: Record<string, unknown> = {};
   if (typeof r['headers'] === 'object' && r['headers'] !== null) {
@@ -129,7 +274,8 @@ export function safeReqSerializer(req: unknown): Record<string, unknown> {
   return {
     id: r['id'],
     method: r['method'],
-    url: safePath,
+    url: safeRoute,
+    route: safeRoute,
     headers: safeHeaders,
   };
 }

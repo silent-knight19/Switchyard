@@ -91,6 +91,20 @@ export function createRedisClient(config: GatewayConfig): RedisClient {
       }
     },
 
+    /**
+     * Verifies runtime Redis identity and mandatory ACL restrictions (Finding 2, Architecture v1.2 §19.1).
+     *
+     * BOUNDARY AND VERIFICATION LIMITATION REPORT:
+     * - In the Gateway runtime, destructive administrative commands (e.g. FLUSHALL, FLUSHDB, SHUTDOWN, REPLICAOF)
+     *   must NEVER be executed to test authorization, as executing them would compromise system state or availability.
+     * - Gateway runtime verification uses safe, non-destructive probes:
+     *   1. Identity check (ACL WHOAMI): Confirms the connection is not using the default unrestricted user.
+     *   2. Administrative check (CONFIG GET): Confirms administrative category (-@admin, -CONFIG) is denied with NOPERM.
+     *   3. Key enumeration check (KEYS probe): Confirms unrestricted key scans (-KEYS) are denied with NOPERM.
+     *   4. ACL administration check (ACL LIST): Confirms user cannot view or modify ACLs.
+     * - Exhaustive authorization verification of all prohibited commands (FLUSHALL, FLUSHDB, DEBUG, SHUTDOWN, REPLICAOF)
+     *   is performed safely via ACL DRYRUN in isolated test infrastructure where administrative credentials reside.
+     */
     async verifyAclRestrictions(timeoutMs = 2000) {
       let timer: NodeJS.Timeout | null = null;
       const timeoutPromise = new Promise<{
@@ -105,8 +119,30 @@ export function createRedisClient(config: GatewayConfig): RedisClient {
 
       const verifyPromise = (async () => {
         try {
-          // Probe 1: Non-destructive administrative probe (CONFIG GET maxmemory)
-          // Under least-privilege runtime constraints, CONFIG must be denied with NOPERM.
+          // Check 1: Runtime Identity Verification (ACL WHOAMI)
+          // The Gateway must run under a dedicated restricted user, never the overprivileged 'default' admin user.
+          let currentUser = '';
+          try {
+            currentUser = (await redis.acl('WHOAMI')) as string;
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            return {
+              ok: false,
+              code: 'WHOAMI_FAILED',
+              error: `Failed to verify Redis runtime identity: ${msg}`,
+            };
+          }
+
+          if (currentUser === 'default') {
+            return {
+              ok: false,
+              code: 'DEFAULT_USER_FORBIDDEN',
+              error:
+                'Redis runtime identity is the overprivileged "default" user; a dedicated restricted identity is required',
+            };
+          }
+
+          // Check 2: Non-destructive administrative probe (CONFIG GET maxmemory)
           let configDenied = false;
           try {
             await redis.call('CONFIG', 'GET', 'maxmemory');
@@ -128,8 +164,7 @@ export function createRedisClient(config: GatewayConfig): RedisClient {
             };
           }
 
-          // Probe 2: Non-destructive key-enumeration probe (KEYS dummy_probe)
-          // Unrestricted key enumeration must be denied with NOPERM.
+          // Check 3: Non-destructive key-enumeration probe (KEYS dummy_probe)
           let keysDenied = false;
           try {
             await redis.call('KEYS', '__switchyard_probe__');
@@ -148,6 +183,28 @@ export function createRedisClient(config: GatewayConfig): RedisClient {
               code: 'OVERPRIVILEGED_KEYS_PERMITTED',
               error:
                 'Redis runtime identity is overprivileged: unrestricted KEYS command was permitted',
+            };
+          }
+
+          // Check 4: Non-destructive ACL administration probe (ACL LIST)
+          let aclDenied = false;
+          try {
+            await redis.call('ACL', 'LIST');
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (msg.startsWith('NOPERM')) {
+              aclDenied = true;
+            } else {
+              throw err;
+            }
+          }
+
+          if (!aclDenied) {
+            return {
+              ok: false,
+              code: 'OVERPRIVILEGED_ACL_PERMITTED',
+              error:
+                'Redis runtime identity is overprivileged: administrative ACL LIST command was permitted',
             };
           }
 

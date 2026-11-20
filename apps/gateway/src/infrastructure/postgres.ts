@@ -19,14 +19,18 @@ export function createPostgresClient(config: GatewayConfig): PostgresClient {
     max: 10,
     idleTimeoutMillis: 10000,
     connectionTimeoutMillis: 2000,
+    statement_timeout: 2000,
   });
 
   return {
     pool,
     async checkReadiness(timeoutMs = 2000) {
       let timer: NodeJS.Timeout | null = null;
+      let isTimedOut = false;
+
       const timeoutPromise = new Promise<{ ok: false; code: string; error: string }>((resolve) => {
         timer = setTimeout(() => {
+          isTimedOut = true;
           resolve({ ok: false, code: 'TIMEOUT', error: 'PostgreSQL readiness check timed out' });
         }, timeoutMs);
       });
@@ -34,10 +38,34 @@ export function createPostgresClient(config: GatewayConfig): PostgresClient {
       const checkPromise = (async (): Promise<{ ok: boolean; code?: string; error?: string }> => {
         let client: pg.PoolClient | null = null;
         try {
+          // Bounded connection acquisition
           client = await pool.connect();
+          if (isTimedOut) {
+            client.release(true);
+            client = null;
+            return {
+              ok: false,
+              code: 'TIMEOUT',
+              error: 'PostgreSQL connection acquired after timeout',
+            };
+          }
+
+          // Enforce statement timeout at database level
           await client.query('SELECT 1');
+
+          if (isTimedOut) {
+            client.release(true);
+            client = null;
+            return { ok: false, code: 'TIMEOUT', error: 'PostgreSQL query finished after timeout' };
+          }
+
           return { ok: true };
         } catch (err: unknown) {
+          if (client) {
+            // Invalidate/destroy errored or canceled connection to prevent retention/pool exhaustion
+            client.release(true);
+            client = null;
+          }
           const code =
             err && typeof err === 'object' && 'code' in err && typeof err.code === 'string'
               ? err.code

@@ -4,6 +4,7 @@ import type { PostgresClient } from './infrastructure/postgres.js';
 import type { RedisClient } from './infrastructure/redis.js';
 import type { LifecycleCoordinator } from './lifecycle/state.js';
 import { registerHealthRoutes } from './routes/health.js';
+import { getSafeRouteIdentifier } from './logging/serializers.js';
 
 export type AppInstance = ReturnType<typeof fastify>;
 
@@ -22,26 +23,26 @@ export async function buildApp(options: BuildAppOptions): Promise<AppInstance> {
     disableRequestLogging: true,
   });
 
-  // Safe Request Lifecycle Logging (D4, R2): Never log raw query strings
+  // Safe Request Lifecycle Logging (Finding 4): Log route templates or allowlisted identifiers only; never raw paths or query strings
   app.addHook('onRequest', async (req) => {
-    const safePath = req.url.split('?')[0] ?? '';
+    const safeRoute = getSafeRouteIdentifier(req.url, req.routeOptions?.url);
     logger.info(
       {
         requestId: req.id,
         method: req.method,
-        url: safePath,
+        route: safeRoute,
       },
       'Incoming request',
     );
   });
 
   app.addHook('onResponse', async (req, reply) => {
-    const safePath = req.url.split('?')[0] ?? '';
+    const safeRoute = getSafeRouteIdentifier(req.url, req.routeOptions?.url);
     logger.info(
       {
         requestId: req.id,
         method: req.method,
-        url: safePath,
+        route: safeRoute,
         statusCode: reply.statusCode,
         responseTimeMs: reply.elapsedTime,
       },

@@ -75,6 +75,8 @@ const SENSITIVE_KEY_ROOTS = [
   'secretkey',
   'signature',
   'sig',
+  'credential',
+  'credentials',
   'prompt',
   'prompts',
   'response',
@@ -102,6 +104,8 @@ export function isSensitiveKey(key: string): boolean {
     normalized.endsWith('secret') ||
     normalized.endsWith('token') ||
     normalized.endsWith('apikey') ||
+    normalized.endsWith('credential') ||
+    normalized.endsWith('credentials') ||
     normalized.endsWith('kek') ||
     normalized.endsWith('dek') ||
     normalized.endsWith('prompt') ||

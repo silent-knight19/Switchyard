@@ -306,7 +306,7 @@ describe('SW-1.2.3 Structured Logging and Redaction', () => {
     expect(entry.API_KEY).toBe(CENSOR_VALUE);
   });
 
-  it('16. sanitizes raw connection strings and credentials embedded in Error messages (R1, R7)', () => {
+  it('16. sanitizes raw connection strings and credentials embedded in Error messages (Finding 1)', () => {
     const { stream, getLogs, getRawOutput } = createLogCapture();
     const logger = createLogger({ stream });
 
@@ -314,13 +314,14 @@ describe('SW-1.2.3 Structured Logging and Redaction', () => {
     const connectionError = new Error(
       `connect ECONNREFUSED postgresql://switchyard:${secretPassword}@127.0.0.1:5432/switchyard_db`,
     );
+    (connectionError as unknown as Record<string, unknown>).code = 'ECONNREFUSED';
 
     logger.error({ err: connectionError }, 'Database connection failed');
 
     expect(getRawOutput()).not.toContain(secretPassword);
     const logs = getLogs();
     const loggedErr = logs[0]?.err as Record<string, unknown>;
-    expect(loggedErr?.message).toContain('postgresql://[REDACTED]:[REDACTED]@127.0.0.1:5432');
+    expect(loggedErr?.code).toBe('ECONNREFUSED');
     expect(loggedErr?.stack).not.toContain(secretPassword);
   });
 
@@ -341,5 +342,113 @@ describe('SW-1.2.3 Structured Logging and Redaction', () => {
     expect(logs.length).toBe(1);
     const raw = JSON.stringify(logs[0]);
     expect(raw).toContain('[DEPTH_LIMIT_EXCEEDED]');
+  });
+
+  it('18. error allowlisting strips arbitrary secret strings and unexpected credential formats from unknown errors (Finding 1)', () => {
+    const { stream, getLogs, getRawOutput } = createLogCapture();
+    const logger = createLogger({ stream });
+
+    const arbitrarySecret = 'custom_unrecognized_secret_entropy_81923810293';
+    const customFormatSecret = 'Bearer-Custom-Format:opaque_token_val_449911';
+
+    const errWithArbitrarySecret = new Error(
+      `Fatal external provider failure with secret: ${arbitrarySecret} and ${customFormatSecret}`,
+    );
+    (errWithArbitrarySecret as unknown as Record<string, unknown>).code = 'ERR_UPSTREAM_FAILURE';
+
+    logger.error({ err: errWithArbitrarySecret }, 'Upstream call failed');
+
+    const raw = getRawOutput();
+    expect(raw).not.toContain(arbitrarySecret);
+    expect(raw).not.toContain(customFormatSecret);
+
+    const logs = getLogs();
+    const loggedErr = logs[0]?.err as Record<string, unknown>;
+    expect(loggedErr?.code).toBe('ERR_UPSTREAM_FAILURE');
+    expect(loggedErr?.message).toBe('Operation failed: ERR_UPSTREAM_FAILURE');
+    expect(loggedErr?.stack).not.toContain(arbitrarySecret);
+    expect(loggedErr?.stack).not.toContain(customFormatSecret);
+  });
+
+  it('19. error allowlisting redacts nested errors and cause chains containing arbitrary secrets (Finding 1)', () => {
+    const { stream, getLogs, getRawOutput } = createLogCapture();
+    const logger = createLogger({ stream });
+
+    const nestedSecret = 'nested_cause_secret_string_998877';
+    const rootErr = new Error('Top-level operational error');
+    const causeErr = new Error(`Nested cause error with sensitive payload: ${nestedSecret}`);
+    (causeErr as unknown as Record<string, unknown>).code = 'ERR_NESTED_ROOT';
+    (rootErr as unknown as Record<string, unknown>).cause = causeErr;
+
+    logger.error({ err: rootErr }, 'Nested error logged');
+
+    const raw = getRawOutput();
+    expect(raw).not.toContain(nestedSecret);
+
+    const logs = getLogs();
+    const loggedErr = logs[0]?.err as Record<string, unknown>;
+    const cause = loggedErr?.cause as Record<string, unknown>;
+    expect(cause).toBeDefined();
+    expect(cause?.code).toBe('ERR_NESTED_ROOT');
+    expect(cause?.message).toBe('Operation failed: ERR_NESTED_ROOT');
+    expect(cause?.stack).not.toContain(nestedSecret);
+  });
+
+  it('20. error allowlisting handles malformed exceptions and non-object errors without leaking values (Finding 1)', () => {
+    const { stream, getRawOutput } = createLogCapture();
+    const logger = createLogger({ stream });
+
+    const secretPrimitive = 'primitive_secret_thrown_directly_12345';
+    logger.error({ err: secretPrimitive }, 'Primitive thrown error');
+
+    const raw = getRawOutput();
+    expect(raw).not.toContain(secretPrimitive);
+    expect(raw).toContain('[UNVETTED_PRIMITIVE_ERROR]');
+  });
+
+  it('21. safeReqSerializer logs safe route identifiers and never logs URL path segments containing secrets (Finding 4)', () => {
+    const { stream, getLogs, getRawOutput } = createLogCapture();
+    const logger = createLogger({ stream });
+
+    const pathSecret = 'sk_live_synthetic_secret_path_segment_123';
+    const querySecret = 'synthetic_query_token_456';
+
+    // Test A: Unmatched route with path secret and query secret
+    logger.info(
+      {
+        req: {
+          id: 'req-path-test-1',
+          method: 'GET',
+          url: `/v1/keys/${pathSecret}?api_key=${querySecret}`,
+        },
+      },
+      'Testing path confidentiality',
+    );
+
+    const rawA = getRawOutput();
+    expect(rawA).not.toContain(pathSecret);
+    expect(rawA).not.toContain(querySecret);
+
+    const logs = getLogs();
+    const reqA = logs[0]?.req as Record<string, unknown>;
+    expect(reqA?.route).toBe('[UNMATCHED_ROUTE]');
+
+    // Test B: Allowlisted route with query secret
+    logger.info(
+      {
+        req: {
+          id: 'req-path-test-2',
+          method: 'GET',
+          url: `/health/live?token=${querySecret}`,
+        },
+      },
+      'Testing allowlisted route with query secret',
+    );
+
+    const rawB = getRawOutput();
+    expect(rawB).not.toContain(querySecret);
+    const logsB = getLogs();
+    const reqB = logsB[1]?.req as Record<string, unknown>;
+    expect(reqB?.route).toBe('/health/live');
   });
 });

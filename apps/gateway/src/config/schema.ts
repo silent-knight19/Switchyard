@@ -1,5 +1,7 @@
 import { z } from 'zod';
 import type { ConfigIssue } from './errors.js';
+import { isSensitiveKey } from '../logging/redaction.js';
+import { formatSafeZodMessage } from '../logging/serializers.js';
 
 const FORBIDDEN_SECURITY_FLAGS = [
   'FAIL_OPEN',
@@ -215,10 +217,10 @@ export function parseConfig(envInput: Record<string, string | undefined>):
     for (const zodIssue of result.error.issues) {
       const field = zodIssue.path.join('.') || 'environment';
       // Ensure no sensitive values are echoed in error messages
-      const isSensitive = SENSITIVE_FIELD_NAMES.has(field);
+      const isSensitive = SENSITIVE_FIELD_NAMES.has(field) || isSensitiveKey(field);
       const safeMessage = isSensitive
         ? 'Invalid value provided for sensitive credential'
-        : zodIssue.message;
+        : formatSafeZodMessage(zodIssue);
 
       issues.push({
         field,

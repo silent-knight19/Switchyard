@@ -195,20 +195,22 @@ describe('SW-1.2.2 Central Zod Configuration', () => {
     expect(() => loadConfig(rlsBypassEnv)).toThrowError(ConfigValidationError);
   });
 
-  it('16. ensures injected synthetic secrets never appear in validation errors (R1, R7)', () => {
+  it('16. ensures injected synthetic secrets never appear in validation errors (Finding 1, Finding 5)', () => {
     const syntheticDbPass = 'synthetic_ultra_secret_db_pass_999';
     const syntheticRedisPass = 'synthetic_ultra_secret_redis_pass_888';
+    const syntheticCustomSecret = 'synthetic_custom_secret_token_777';
 
-    const invalidWithSecret = {
+    // Test A: Actually inject synthetic secrets directly into sensitive password fields along with invalid config
+    const invalidWithInjectedSecrets = {
       ...VALID_PROD_ENV,
-      POSTGRES_PASSWORD: 'password', // Triggers default credential issue
-      REDIS_PASSWORD: 'admin', // Triggers default credential issue
-      COOKIE_SECURE: 'false',
+      POSTGRES_PASSWORD: syntheticDbPass,
+      REDIS_PASSWORD: syntheticRedisPass,
+      COOKIE_SECURE: 'false', // Triggers validation error in production
     };
 
     try {
-      loadConfig(invalidWithSecret);
-      expect.fail('Expected loadConfig to throw');
+      loadConfig(invalidWithInjectedSecrets);
+      expect.fail('Expected loadConfig to throw ConfigValidationError');
     } catch (e) {
       const err = e as ConfigValidationError;
       expect(err.message).not.toContain(syntheticDbPass);
@@ -216,6 +218,23 @@ describe('SW-1.2.2 Central Zod Configuration', () => {
       for (const issue of err.issues) {
         expect(issue.message).not.toContain(syntheticDbPass);
         expect(issue.message).not.toContain(syntheticRedisPass);
+      }
+    }
+
+    // Test B: Inject synthetic secret into enum field (NODE_ENV) - must not echo secret in 'invalid_enum_value'
+    const invalidEnumWithSecret = {
+      ...VALID_PROD_ENV,
+      NODE_ENV: syntheticCustomSecret,
+    };
+
+    try {
+      loadConfig(invalidEnumWithSecret);
+      expect.fail('Expected loadConfig to throw ConfigValidationError');
+    } catch (e) {
+      const err = e as ConfigValidationError;
+      expect(err.message).not.toContain(syntheticCustomSecret);
+      for (const issue of err.issues) {
+        expect(issue.message).not.toContain(syntheticCustomSecret);
       }
     }
   });

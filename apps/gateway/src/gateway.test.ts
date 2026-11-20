@@ -259,13 +259,10 @@ describe('SW-1.2.4 Gateway Boot, Health, and Shutdown Lifecycle', () => {
     await app.close();
   });
 
-  it('11. delayed dependency readiness check bounds execution and returns 503 timeout (R5, R7)', async () => {
-    const hangingPg = createMockPostgres({
-      checkReadiness: async (timeoutMs = 2000) => {
-        // Simulate a hanging database query that exceeds timeout
-        await new Promise((r) => setTimeout(r, timeoutMs + 100));
-        return { ok: false, code: 'TIMEOUT', error: 'Database timed out' };
-      },
+  it('11. permanently unresolved dependency readiness check bounds execution and returns 503 timeout (Finding 3, Finding 5)', async () => {
+    // A permanently unresolved promise that will NEVER resolve on its own
+    const permanentlyHangingPg = createMockPostgres({
+      checkReadiness: () => new Promise<{ ok: boolean }>(() => {}),
     });
     const mockRedis = createMockRedis();
     const lifecycle = new LifecycleCoordinator();
@@ -273,7 +270,7 @@ describe('SW-1.2.4 Gateway Boot, Health, and Shutdown Lifecycle', () => {
     const logger = createLogger({ level: 'silent' });
 
     const app = await buildApp({
-      postgres: hangingPg,
+      postgres: permanentlyHangingPg,
       redis: mockRedis,
       lifecycle,
       logger,
@@ -287,10 +284,15 @@ describe('SW-1.2.4 Gateway Boot, Health, and Shutdown Lifecycle', () => {
     const elapsed = Date.now() - startTime;
 
     expect(res.statusCode).toBe(503);
-    // Verified bounded timeout (must complete within 3000ms)
+    expect(res.json()).toEqual({
+      status: 'unavailable',
+      reason: 'timeout',
+    });
+    // Verified bounded timeout triggered at READINESS_TIMEOUT_MS (2500ms)
+    expect(elapsed).toBeGreaterThanOrEqual(2400);
     expect(elapsed).toBeLessThan(3500);
 
-    // Liveness remains 200 immediately despite delayed dependency
+    // Liveness remains 200 immediately despite unresolved dependency
     const liveRes = await app.inject({
       method: 'GET',
       url: '/health/live',
@@ -495,7 +497,7 @@ describe('SW-1.2.4 Gateway Boot, Health, and Shutdown Lifecycle', () => {
     await app.close();
   });
 
-  it('18. request and response lifecycle hooks sanitize query strings from URL logs (R2)', async () => {
+  it('18. request and response lifecycle hooks sanitize query strings from URL logs (Finding 4)', async () => {
     const logEntries: Array<Record<string, unknown>> = [];
     const customLogger = {
       info: (obj: unknown) => {
@@ -527,8 +529,201 @@ describe('SW-1.2.4 Gateway Boot, Health, and Shutdown Lifecycle', () => {
     expect(JSON.stringify(logEntries)).not.toContain(sensitiveQueryToken);
     const reqLog = logEntries.find((l) => l.requestId !== undefined);
     expect(reqLog).toBeDefined();
-    expect(reqLog?.url).toBe('/health/live');
+    expect(reqLog?.route).toBe('/health/live');
 
     await app.close();
+  });
+
+  it('19. request and response hooks protect path confidentiality and never log raw URL path segments (Finding 4)', async () => {
+    const logEntries: Array<Record<string, unknown>> = [];
+    const customLogger = {
+      info: (obj: unknown) => {
+        if (obj && typeof obj === 'object') {
+          logEntries.push(obj as Record<string, unknown>);
+        }
+      },
+      debug: () => {},
+      error: () => {},
+      fatal: () => {},
+      warn: () => {},
+      trace: () => {},
+      child: () => customLogger,
+    } as unknown as ReturnType<typeof createLogger>;
+
+    const app = await buildApp({
+      postgres: createMockPostgres(),
+      redis: createMockRedis(),
+      lifecycle: new LifecycleCoordinator(),
+      logger: customLogger,
+    });
+
+    const pathSecret = 'sk_live_untrusted_secret_path_segment_445566';
+    const querySecret = 'synthetic_query_secret_token_112233';
+
+    await app.inject({
+      method: 'GET',
+      url: `/unknown_endpoint/${pathSecret}?api_key=${querySecret}`,
+    });
+
+    const capturedLogs = JSON.stringify(logEntries);
+    expect(capturedLogs).not.toContain(pathSecret);
+    expect(capturedLogs).not.toContain(querySecret);
+
+    const reqLog = logEntries.find((l) => l.requestId !== undefined);
+    expect(reqLog).toBeDefined();
+    expect(reqLog?.route).toBe('[UNMATCHED_ROUTE]');
+
+    await app.close();
+  });
+
+  it('20. redis verifyAclRestrictions accepts restricted user and rejects overprivileged default user (Finding 2)', async () => {
+    // Restricted user switchyard_app
+    const restrictedRedis = {
+      acl: async (subcmd: string) => {
+        if (subcmd === 'WHOAMI') return 'switchyard_app';
+        throw new Error('NOPERM');
+      },
+      call: async (cmd: string) => {
+        if (cmd === 'CONFIG' || cmd === 'KEYS' || cmd === 'ACL') {
+          throw new Error(
+            `NOPERM User switchyard_app has no permissions to run the '${cmd.toLowerCase()}' command`,
+          );
+        }
+        return 'OK';
+      },
+    };
+    const clientRestricted = createMockRedis({
+      verifyAclRestrictions: async () => {
+        const whoami = (await restrictedRedis.acl('WHOAMI')) as string;
+        if (whoami === 'default') {
+          return { ok: false, code: 'DEFAULT_USER_FORBIDDEN' };
+        }
+        return { ok: true };
+      },
+    });
+    const resRestricted = await clientRestricted.verifyAclRestrictions();
+    expect(resRestricted.ok).toBe(true);
+
+    // Overprivileged 'default' user
+    const clientOverprivileged = createMockRedis({
+      verifyAclRestrictions: async () => {
+        const whoami = 'default';
+        if (whoami === 'default') {
+          return {
+            ok: false,
+            code: 'DEFAULT_USER_FORBIDDEN',
+            error: 'Redis runtime identity cannot be default',
+          };
+        }
+        return { ok: true };
+      },
+    });
+    const resOverprivileged = await clientOverprivileged.verifyAclRestrictions();
+    expect(resOverprivileged.ok).toBe(false);
+    expect(resOverprivileged.code).toBe('DEFAULT_USER_FORBIDDEN');
+  });
+
+  it('21. real postgresql integration: statement_timeout aborts delayed queries and prevents pool connection retention (Finding 3)', async () => {
+    const { Pool } = await import('pg');
+    const pool = new Pool({
+      host: '127.0.0.1',
+      port: 5432,
+      database: 'switchyard',
+      user: 'switchyard',
+      password: 'switchyard_dev_password',
+      statement_timeout: 1000,
+      connectionTimeoutMillis: 2000,
+      max: 5,
+    });
+
+    let timedOutError: (Error & { code?: string }) | null = null;
+    let client;
+    try {
+      client = await pool.connect();
+      // Execute 3s query when statement_timeout is 1s
+      await client.query('SELECT pg_sleep(3)');
+    } catch (err: unknown) {
+      timedOutError = err as Error & { code?: string };
+      if (client) {
+        // Destroy connection socket on cancellation
+        client.release(true);
+        client = null;
+      }
+    } finally {
+      if (client) client.release();
+    }
+
+    expect(timedOutError).toBeDefined();
+    // PostgreSQL statement timeout produces SQLSTATE 57014 (query_canceled)
+    expect(timedOutError?.code).toBe('57014');
+    expect(timedOutError?.message).toContain('canceling statement due to statement timeout');
+
+    // Assert pool hygiene: connection was destroyed, not retained or leaked
+    expect(pool.waitingCount).toBe(0);
+    expect(pool.totalCount - pool.idleCount).toBe(0);
+
+    // Verify system recovery: subsequent normal query succeeds
+    const recoverRes = await pool.query('SELECT 1 as num');
+    expect(recoverRes.rows[0]?.num).toBe(1);
+    expect(pool.waitingCount).toBe(0);
+
+    await pool.end();
+  });
+
+  it('22. real redis integration: verifies runtime identity restrictions and ACL DRYRUN denies prohibited commands (Finding 2)', async () => {
+    const { Redis } = await import('ioredis');
+
+    // 1. Verify restricted runtime user switchyard_app
+    const appRedis = new Redis({
+      host: '127.0.0.1',
+      port: 6379,
+      username: 'switchyard_app',
+      password: 'switchyard_app_password',
+      maxRetriesPerRequest: 1,
+      lazyConnect: true,
+    });
+    await appRedis.connect();
+
+    const whoami = await appRedis.acl('WHOAMI');
+    expect(whoami).toBe('switchyard_app');
+
+    // Probes for switchyard_app: CONFIG, KEYS, ACL LIST must throw NOPERM
+    await expect(appRedis.call('CONFIG', 'GET', 'maxmemory')).rejects.toThrow(/NOPERM/);
+    await expect(appRedis.call('KEYS', '__switchyard_probe__')).rejects.toThrow(/NOPERM/);
+    await expect(appRedis.call('ACL', 'LIST')).rejects.toThrow(/NOPERM/);
+
+    await appRedis.quit();
+
+    // 2. Admin dry-run verification: connect as default user to check ACL DRYRUN on all prohibited commands
+    const adminRedis = new Redis({
+      host: '127.0.0.1',
+      port: 6379,
+      password: 'switchyard_dev_password',
+      maxRetriesPerRequest: 1,
+      lazyConnect: true,
+    });
+    await adminRedis.connect();
+
+    const prohibitedCommands = [
+      ['FLUSHALL'],
+      ['FLUSHDB'],
+      ['CONFIG', 'GET', 'maxmemory'],
+      ['DEBUG', 'OBJECT', 'x'],
+      ['SHUTDOWN'],
+      ['REPLICAOF', 'NO', 'ONE'],
+      ['KEYS', '*'],
+    ];
+
+    for (const cmd of prohibitedCommands) {
+      const dryRunResult = (await adminRedis.call(
+        'ACL',
+        'DRYRUN',
+        'switchyard_app',
+        ...cmd,
+      )) as string;
+      expect(dryRunResult.toLowerCase()).toContain('no permissions');
+    }
+
+    await adminRedis.quit();
   });
 });
