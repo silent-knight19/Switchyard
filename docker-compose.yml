@@ -43,7 +43,18 @@ services:
     networks:
       - switchyard-network
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli ping | grep PONG"]
+      test:
+        - CMD-SHELL
+        - >-
+          set -f &&
+          redis-cli ping | grep -q PONG &&
+          redis-cli info memory | grep -q 'maxmemory_policy:noeviction' &&
+          redis-cli info persistence | grep -q 'aof_enabled:1' &&
+          [ "$${REDIS_APP_USER:-switchyard_app}" != "default" ] &&
+          for cmd in "FLUSHALL" "FLUSHDB" "CONFIG GET maxmemory" "DEBUG OBJECT x" "SHUTDOWN" "REPLICAOF NO ONE" "KEYS *" "ACL LIST"; do
+            res=$$(redis-cli ACL DRYRUN "$${REDIS_APP_USER:-switchyard_app}" $$cmd) &&
+            echo "$$res" | grep -qi "no permissions" || exit 1;
+          done
       interval: 5s
       timeout: 3s
       retries: 5

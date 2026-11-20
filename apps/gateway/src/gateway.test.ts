@@ -6,8 +6,13 @@ import { GracefulShutdownManager, type ShutdownDependencies } from './lifecycle/
 import { buildApp } from './app.js';
 import { createLogger } from './logging/index.js';
 import type { PostgresClient } from './infrastructure/postgres.js';
-import { createRedisClient, type RedisClient } from './infrastructure/redis.js';
-import { loadConfig, type GatewayConfig } from './config/index.js';
+import {
+  createRedisClient,
+  verifyRedisAclAttestation,
+  PROHIBITED_REDIS_COMMANDS,
+  type RedisClient,
+} from './infrastructure/redis.js';
+import type { GatewayConfig } from './config/index.js';
 import type { Redis } from 'ioredis';
 
 const VALID_DEV_ENV: Record<string, string> = {
@@ -615,21 +620,10 @@ describe('SW-1.2.4 Gateway Boot, Health, and Shutdown Lifecycle', () => {
         throw new Error('NOPERM');
       },
       call: async (cmd: string) => {
-        if (
-          cmd === 'CONFIG' ||
-          cmd === 'KEYS' ||
-          cmd === 'ACL' ||
-          cmd === 'FLUSHALL' ||
-          cmd === 'FLUSHDB' ||
-          cmd === 'SHUTDOWN' ||
-          cmd === 'REPLICAOF'
-        ) {
+        if (cmd === 'CONFIG' || cmd === 'KEYS' || cmd === 'ACL') {
           throw new Error(
             `NOPERM User switchyard_app has no permissions to run the '${cmd.toLowerCase()}' command`,
           );
-        }
-        if (cmd === 'DEBUG') {
-          throw new Error('ERR DEBUG command not allowed');
         }
         return 'OK';
       },
@@ -656,6 +650,22 @@ describe('SW-1.2.4 Gateway Boot, Health, and Shutdown Lifecycle', () => {
     const resOverprivileged = await clientOverprivileged.verifyAclRestrictions();
     expect(resOverprivileged.ok).toBe(false);
     expect(resOverprivileged.code).toBe('DEFAULT_USER_FORBIDDEN');
+
+    // Mismatched runtime user identity
+    const mismatchRedis = {
+      acl: async (subcmd: string) => {
+        if (subcmd === 'WHOAMI') return 'unexpected_user';
+        throw new Error('NOPERM');
+      },
+      call: async () => 'OK',
+    };
+    const clientMismatch = createRedisClient(
+      VALID_DEV_ENV as unknown as GatewayConfig,
+      mismatchRedis as unknown as Redis,
+    );
+    const resMismatch = await clientMismatch.verifyAclRestrictions();
+    expect(resMismatch.ok).toBe(false);
+    expect(resMismatch.code).toBe('REDIS_USER_MISMATCH');
   });
 
   it('21. real postgresql integration: statement_timeout aborts delayed queries and prevents pool connection retention (Finding 3)', async () => {
@@ -753,7 +763,7 @@ describe('SW-1.2.4 Gateway Boot, Health, and Shutdown Lifecycle', () => {
 
     await appRedis.quit();
 
-    // 2. Admin dry-run verification: connect as default user to check ACL DRYRUN on all prohibited commands
+    // 2. Admin dry-run verification: verify complete prohibited command set using verifyRedisAclAttestation
     const adminRedis = new Redis({
       host: '127.0.0.1',
       port: 6379,
@@ -763,17 +773,10 @@ describe('SW-1.2.4 Gateway Boot, Health, and Shutdown Lifecycle', () => {
     });
     await adminRedis.connect();
 
-    const prohibitedCommands = [
-      ['FLUSHALL'],
-      ['FLUSHDB'],
-      ['CONFIG', 'GET', 'maxmemory'],
-      ['DEBUG', 'OBJECT', 'x'],
-      ['SHUTDOWN'],
-      ['REPLICAOF', 'NO', 'ONE'],
-      ['KEYS', '*'],
-    ];
+    const attestation = await verifyRedisAclAttestation(adminRedis, 'switchyard_app');
+    expect(attestation.ok).toBe(true);
 
-    for (const cmd of prohibitedCommands) {
+    for (const cmd of PROHIBITED_REDIS_COMMANDS) {
       const dryRunResult = (await adminRedis.call(
         'ACL',
         'DRYRUN',
@@ -812,7 +815,7 @@ describe('SW-1.2.4 Gateway Boot, Health, and Shutdown Lifecycle', () => {
     );
   });
 
-  it('24. real redis integration: named non-default user permitting FLUSHALL fails verifyAclRestrictions gate (Finding S1)', async () => {
+  it('24. real redis integration: disposable overprivileged identity permitting FLUSHALL fails startup attestation (Finding S1)', async () => {
     const reachable = await isPortReachable(6379);
     if (!reachable) {
       if (REQUIRE_INTEGRATION) {
@@ -833,6 +836,11 @@ describe('SW-1.2.4 Gateway Boot, Health, and Shutdown Lifecycle', () => {
       lazyConnect: false,
     });
 
+    // 1. Verify properly restricted runtime identity passes startup attestation
+    const restrictedAttestation = await verifyRedisAclAttestation(adminRedis, 'switchyard_app');
+    expect(restrictedAttestation.ok).toBe(true);
+
+    // 2. Test disposable overprivileged user permitting FLUSHALL fails startup attestation
     const testUserName = `switchyard_test_flushall_${Date.now()}`;
     const testPassword = 'test_disposable_password_987';
 
@@ -854,25 +862,70 @@ describe('SW-1.2.4 Gateway Boot, Health, and Shutdown Lifecycle', () => {
     );
 
     try {
-      // Connect using real createRedisClient with this user's credentials
-      const testConfig = loadConfig({
-        ...VALID_DEV_ENV,
-        REDIS_USER: testUserName,
-        REDIS_PASSWORD: testPassword,
-      });
+      // Execute side-effect-free ACL DRYRUN attestation without executing FLUSHALL
+      const attestationResult = await verifyRedisAclAttestation(adminRedis, testUserName);
 
-      const overprivilegedClient = createRedisClient(testConfig);
-      const aclResult = await overprivilegedClient.verifyAclRestrictions();
-
-      // The gate must fail-closed because FLUSHALL is permitted
-      expect(aclResult.ok).toBe(false);
-      expect(aclResult.code).toBe('OVERPRIVILEGED_FLUSHALL_PERMITTED');
-
-      await overprivilegedClient.close();
+      // The attestation must fail-closed because FLUSHALL is permitted
+      expect(attestationResult.ok).toBe(false);
+      expect(attestationResult.code).toBe('OVERPRIVILEGED_FLUSHALL_PERMITTED');
+      expect(attestationResult.prohibitedCommand).toBe('FLUSHALL');
     } finally {
       // Clean up disposable test user
       await adminRedis.acl('DELUSER', testUserName);
       await adminRedis.quit();
     }
+  });
+
+  it('25. regression test: gateway startup authorization verification never sends any prohibited state-changing command', async () => {
+    const PROHIBITED_STATE_CHANGING_COMMANDS = [
+      'FLUSHALL',
+      'FLUSHDB',
+      'SHUTDOWN',
+      'REPLICAOF',
+      'DEBUG',
+    ];
+
+    const interceptedCommands: string[] = [];
+    const recordingRedis = {
+      acl: async (subcmd: string) => {
+        interceptedCommands.push(`ACL ${subcmd.toUpperCase()}`);
+        if (subcmd === 'WHOAMI') return 'switchyard_app';
+        throw new Error('NOPERM User switchyard_app has no permissions');
+      },
+      call: async (cmd: string) => {
+        const upper = cmd.toUpperCase();
+        interceptedCommands.push(upper);
+
+        // Fail-safe regression assertion: if any prohibited command is dispatched, reject immediately
+        if (PROHIBITED_STATE_CHANGING_COMMANDS.includes(upper)) {
+          throw new Error(`CRITICAL_REGRESSION: Gateway sent prohibited command "${cmd}"`);
+        }
+
+        if (upper === 'CONFIG' || upper === 'KEYS' || upper === 'ACL') {
+          throw new Error(
+            `NOPERM User switchyard_app has no permissions to run the '${cmd.toLowerCase()}' command`,
+          );
+        }
+
+        return 'OK';
+      },
+    };
+
+    const client = createRedisClient(
+      VALID_DEV_ENV as unknown as GatewayConfig,
+      recordingRedis as unknown as Redis,
+    );
+
+    const aclResult = await client.verifyAclRestrictions();
+    expect(aclResult.ok).toBe(true);
+
+    // Verify NONE of the prohibited commands were executed
+    for (const prohibited of PROHIBITED_STATE_CHANGING_COMMANDS) {
+      expect(interceptedCommands).not.toContain(prohibited);
+      expect(interceptedCommands.some((c) => c.startsWith(prohibited))).toBe(false);
+    }
+
+    // Verify exactly and only the expected safe probes were invoked
+    expect(interceptedCommands).toEqual(['ACL WHOAMI', 'CONFIG', 'KEYS', 'ACL']);
   });
 });

@@ -158,7 +158,7 @@ docker compose stop
   docker compose exec postgres pg_isready -U switchyard -d switchyard
   ```
 - **Redis Readiness:**
-  Healthcheck executes `redis-cli ping` every 5s using the container's `REDISCLI_AUTH` environment variable (preventing command-line credential exposure).
+  Healthcheck executes Redis ping, verifies `noeviction` memory policy, verifies AOF persistence (`aof_enabled:1`), and performs comprehensive ACL attestation using `redis-cli ACL DRYRUN` against the configured application user identity to confirm all prohibited commands (`FLUSHALL`, `FLUSHDB`, `CONFIG`, `DEBUG`, `SHUTDOWN`, `REPLICAOF`, `KEYS`, `ACL LIST`) are denied without executing target commands. It runs every 5s using the container's `REDISCLI_AUTH` environment variable (preventing command-line credential exposure).
   To verify manually from host:
   ```bash
   docker compose exec redis redis-cli ping

@@ -78,6 +78,19 @@ export function createRedisClient(config: GatewayConfig, existingRedis?: Redis):
             };
           }
 
+          const persistenceInfo = await redis.info('persistence');
+          const aofMatch = persistenceInfo.match(/aof_enabled:([^\r\n]+)/);
+          const aofEnabled = aofMatch ? aofMatch[1]?.trim() : undefined;
+
+          if (aofEnabled !== '1') {
+            return {
+              ok: false,
+              policy,
+              code: 'UNSAFE_AOF_PERSISTENCE',
+              error: 'Redis AOF persistence is not enabled: expected "aof_enabled:1"',
+            };
+          }
+
           return { ok: true, policy };
         } catch (err: unknown) {
           const code =
@@ -96,18 +109,19 @@ export function createRedisClient(config: GatewayConfig, existingRedis?: Redis):
     },
 
     /**
-     * Verifies runtime Redis identity and mandatory ACL restrictions (Finding 2, Architecture v1.2 §19.1).
+     * Verifies runtime Redis identity and safe, non-destructive ACL restrictions (Architecture v1.2 §19.1).
      *
-     * BOUNDARY AND VERIFICATION LIMITATION REPORT:
-     * - In the Gateway runtime, destructive administrative commands (e.g. FLUSHALL, FLUSHDB, SHUTDOWN, REPLICAOF)
-     *   must NEVER be executed to test authorization, as executing them would compromise system state or availability.
-     * - Gateway runtime verification uses safe, non-destructive probes:
-     *   1. Identity check (ACL WHOAMI): Confirms the connection is not using the default unrestricted user.
-     *   2. Administrative check (CONFIG GET): Confirms administrative category (-@admin, -CONFIG) is denied with NOPERM.
-     *   3. Key enumeration check (KEYS probe): Confirms unrestricted key scans (-KEYS) are denied with NOPERM.
+     * BOUNDARY AND VERIFICATION DESIGN:
+     * - In the Gateway runtime, destructive/state-changing administrative commands (FLUSHALL, FLUSHDB,
+     *   SHUTDOWN, REPLICAOF, DEBUG) must NEVER be executed to test authorization, even with invalid arguments.
+     * - Gateway runtime verification uses safe, side-effect-free probes:
+     *   1. Identity check (ACL WHOAMI): Confirms connection is not using the default unrestricted user,
+     *      and confirms the active identity strictly matches the Gateway configured REDIS_USER.
+     *   2. Administrative check (CONFIG GET maxmemory): Confirms administrative category (-@admin, -CONFIG) is denied.
+     *   3. Key enumeration check (KEYS probe): Confirms unrestricted key scans (-KEYS) are denied.
      *   4. ACL administration check (ACL LIST): Confirms user cannot view or modify ACLs.
-     * - Exhaustive authorization verification of all prohibited commands (FLUSHALL, FLUSHDB, DEBUG, SHUTDOWN, REPLICAOF)
-     *   is performed safely via ACL DRYRUN in isolated test infrastructure where administrative credentials reside.
+     * - Comprehensive authorization verification of all prohibited commands (FLUSHALL, FLUSHDB, CONFIG, DEBUG,
+     *   SHUTDOWN, REPLICAOF, KEYS) is performed via side-effect-free Redis `ACL DRYRUN` attestation at startup.
      */
     async verifyAclRestrictions(timeoutMs = 2000) {
       let timer: NodeJS.Timeout | null = null;
@@ -143,6 +157,14 @@ export function createRedisClient(config: GatewayConfig, existingRedis?: Redis):
               code: 'DEFAULT_USER_FORBIDDEN',
               error:
                 'Redis runtime identity is the overprivileged "default" user; a dedicated restricted identity is required',
+            };
+          }
+
+          if (config.REDIS_USER && currentUser !== config.REDIS_USER) {
+            return {
+              ok: false,
+              code: 'REDIS_USER_MISMATCH',
+              error: `Redis runtime identity "${currentUser}" does not match configured user "${config.REDIS_USER}"`,
             };
           }
 
@@ -212,131 +234,6 @@ export function createRedisClient(config: GatewayConfig, existingRedis?: Redis):
             };
           }
 
-          // Check 5: Non-destructive FLUSHALL probe (syntax check: invalid args prevent execution if permitted)
-          let flushallDenied = false;
-          try {
-            await redis.call('FLUSHALL', '__switchyard_probe_syntax_check__');
-          } catch (err: unknown) {
-            const msg = err instanceof Error ? err.message : String(err);
-            if (msg.startsWith('NOPERM')) {
-              flushallDenied = true;
-            } else if (msg.includes('ERR syntax error') || msg.includes('syntax error')) {
-              // Permission was granted by ACL; syntax check rejected execution safely
-              flushallDenied = false;
-            } else {
-              throw err;
-            }
-          }
-
-          if (!flushallDenied) {
-            return {
-              ok: false,
-              code: 'OVERPRIVILEGED_FLUSHALL_PERMITTED',
-              error:
-                'Redis runtime identity is overprivileged: administrative FLUSHALL command was permitted',
-            };
-          }
-
-          // Check 6: Non-destructive FLUSHDB probe (syntax check: invalid args prevent execution if permitted)
-          let flushdbDenied = false;
-          try {
-            await redis.call('FLUSHDB', '__switchyard_probe_syntax_check__');
-          } catch (err: unknown) {
-            const msg = err instanceof Error ? err.message : String(err);
-            if (msg.startsWith('NOPERM')) {
-              flushdbDenied = true;
-            } else if (msg.includes('ERR syntax error') || msg.includes('syntax error')) {
-              flushdbDenied = false;
-            } else {
-              throw err;
-            }
-          }
-
-          if (!flushdbDenied) {
-            return {
-              ok: false,
-              code: 'OVERPRIVILEGED_FLUSHDB_PERMITTED',
-              error:
-                'Redis runtime identity is overprivileged: administrative FLUSHDB command was permitted',
-            };
-          }
-
-          // Check 7: Non-destructive SHUTDOWN probe (SHUTDOWN ABORT safely errors if no shutdown in progress)
-          let shutdownDenied = false;
-          try {
-            await redis.call('SHUTDOWN', 'ABORT');
-          } catch (err: unknown) {
-            const msg = err instanceof Error ? err.message : String(err);
-            if (msg.startsWith('NOPERM')) {
-              shutdownDenied = true;
-            } else if (
-              msg.includes('ERR No shutdown in progress') ||
-              msg.includes('No shutdown in progress')
-            ) {
-              shutdownDenied = false;
-            } else {
-              throw err;
-            }
-          }
-
-          if (!shutdownDenied) {
-            return {
-              ok: false,
-              code: 'OVERPRIVILEGED_SHUTDOWN_PERMITTED',
-              error:
-                'Redis runtime identity is overprivileged: administrative SHUTDOWN command was permitted',
-            };
-          }
-
-          // Check 8: Non-destructive REPLICAOF probe (invalid port argument prevents replication changes)
-          let replicaofDenied = false;
-          try {
-            await redis.call('REPLICAOF', '__switchyard_probe__', '__switchyard_probe__');
-          } catch (err: unknown) {
-            const msg = err instanceof Error ? err.message : String(err);
-            if (msg.startsWith('NOPERM')) {
-              replicaofDenied = true;
-            } else if (
-              msg.includes('ERR Invalid master port') ||
-              msg.includes('Invalid master port')
-            ) {
-              replicaofDenied = false;
-            } else {
-              throw err;
-            }
-          }
-
-          if (!replicaofDenied) {
-            return {
-              ok: false,
-              code: 'OVERPRIVILEGED_REPLICAOF_PERMITTED',
-              error:
-                'Redis runtime identity is overprivileged: administrative REPLICAOF command was permitted',
-            };
-          }
-
-          // Check 9: Non-destructive DEBUG probe (DEBUG command not allowed or NOPERM)
-          let debugDenied = false;
-          try {
-            await redis.call('DEBUG', '__switchyard_probe__');
-          } catch (err: unknown) {
-            const msg = err instanceof Error ? err.message : String(err);
-            if (msg.startsWith('NOPERM') || msg.includes('DEBUG command not allowed')) {
-              debugDenied = true;
-            } else {
-              throw err;
-            }
-          }
-
-          if (!debugDenied) {
-            return {
-              ok: false,
-              code: 'OVERPRIVILEGED_DEBUG_PERMITTED',
-              error:
-                'Redis runtime identity is overprivileged: administrative DEBUG command was permitted',
-            };
-          }
-
           return { ok: true };
         } catch (err: unknown) {
           const code =
@@ -370,4 +267,69 @@ export function createRedisClient(config: GatewayConfig, existingRedis?: Redis):
       }
     },
   };
+}
+
+export const PROHIBITED_REDIS_COMMANDS: ReadonlyArray<readonly string[]> = [
+  ['FLUSHALL'],
+  ['FLUSHDB'],
+  ['CONFIG', 'GET', 'maxmemory'],
+  ['DEBUG', 'OBJECT', 'x'],
+  ['SHUTDOWN'],
+  ['REPLICAOF', 'NO', 'ONE'],
+  ['KEYS', '*'],
+];
+
+export interface RedisAclAttestationResult {
+  ok: boolean;
+  code?: string;
+  error?: string;
+  prohibitedCommand?: string;
+}
+
+/**
+ * Executes comprehensive ACL authorization attestation via administrative Redis context (Architecture v1.2 §19.1).
+ * Uses side-effect-free Redis `ACL DRYRUN` to verify that the target runtime user identity
+ * is denied from executing all mandatory prohibited commands without executing target commands.
+ */
+export async function verifyRedisAclAttestation(
+  adminRedis: Redis,
+  targetUser: string,
+): Promise<RedisAclAttestationResult> {
+  if (targetUser === 'default') {
+    return {
+      ok: false,
+      code: 'DEFAULT_USER_FORBIDDEN',
+      error: 'Target identity cannot be the overprivileged "default" user',
+    };
+  }
+
+  for (const cmd of PROHIBITED_REDIS_COMMANDS) {
+    const commandName = cmd[0] ?? 'UNKNOWN';
+    try {
+      const result = (await adminRedis.call('ACL', 'DRYRUN', targetUser, ...cmd)) as string;
+      // Redis 7 ACL DRYRUN contract:
+      // - If permitted: returns "OK"
+      // - If denied: returns "User <targetUser> has no permissions to run the '<cmd>' command"
+      // - If user not found: returns "ERR User '<targetUser>' not found"
+      if (typeof result !== 'string' || !result.toLowerCase().includes('no permissions')) {
+        const code = `OVERPRIVILEGED_${commandName}_PERMITTED`;
+        return {
+          ok: false,
+          code,
+          prohibitedCommand: commandName,
+          error: `Redis ACL attestation failed: command "${cmd.join(' ')}" was permitted or indeterminate (${result}) for user "${targetUser}"`,
+        };
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        ok: false,
+        code: 'ATTESTATION_ERROR',
+        prohibitedCommand: commandName,
+        error: `Redis ACL attestation failed for command "${cmd.join(' ')}": ${msg}`,
+      };
+    }
+  }
+
+  return { ok: true };
 }
