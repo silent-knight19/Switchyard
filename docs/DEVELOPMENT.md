@@ -175,3 +175,21 @@ docker compose stop
 - **Restricted Redis Identity & ACL Enforcement:** Redis enforces distinct operational administrator (`default`) and application (`switchyard_app`) identities. The application role is granted `+@all -@admin -@dangerous +info -FLUSHALL -FLUSHDB -CONFIG -DEBUG -SHUTDOWN -REPLICAOF -KEYS`, preventing unauthorized administrative and destructive operations as required by Architecture v1.2 §19.1.
 - **Process Credential Masking & Docker Inspection Boundary:** Redis credentials are provided to `redis-server` via standard input stream and to `redis-cli` via `REDISCLI_AUTH`, avoiding password visibility in process table listings (`ps aux`) and suppressing CLI warning banners. However, environment variables remain visible via `docker inspect <container>`; therefore, this mechanism is strictly intended for local development. Production deployments must not rely on environment variables for sensitive secrets and must utilize external secret management with separate least-privilege database roles as defined in Architecture v1.2 §19.
 - **Development Credentials:** The default credentials (`switchyard_dev_password`, `switchyard_app_password`) are strictly intended for local development.
+
+### 7.7 Database Migrations and Roles (SW-1.3.1)
+
+The migration process applies versioned SQL migrations from `apps/gateway/src/db/migrations/` (`NNNN-name.sql`) into the `gateway_migrations` ledger table, in version order, each in its own transaction (`apps/gateway/src/db/migrate.ts`).
+
+- Apply pending migrations from the gateway package root:
+
+  ```bash
+  pnpm --filter @switchyard/gateway migrate
+  ```
+
+- Local development runs migrations as the database superuser (`switchyard`); reruns are idempotent (no new ledger rows).
+- Real PostgreSQL migration and role-security tests: `pnpm --filter @switchyard/gateway test:integration` (real PG at `127.0.0.1:5432`; requires the local Compose stack from SW-1.2.1).
+- Production bootstrap (one time, run as the `switchyard` superuser before the first production `migrate`):
+  1. `CREATE ROLE gateway_migrator LOGIN NOSUPERUSER NOBYPASSRLS;`
+  2. Run `pnpm --filter @switchyard/gateway migrate` as `gateway_migrator` with `POSTGRES_USER=gateway_migrator POSTGRES_PASSWORD=<secret>` (per `§19.2`, production credentials are separate from development ones).
+
+The role matrix created by `0001-roles.sql` (Architecture v1.2 §12.1): `gateway_owner` (tenant-table owner; NOLOGIN), `gateway_migrator` (deployment-only; LOGIN, NOSUPERUSER, NOBYPASSRLS), `gateway_startup` (LOGIN, NOSUPERUSER, NOBYPASSRLS), `gateway_app` (LOGIN, NOSUPERUSER, NOBYPASSRLS), `gateway_worker` (LOGIN, NOSUPERUSER, NOBYPASSRLS), `gateway_auth_executor` (NOLOGIN, BYPASSRLS; owns restricted authentication/bootstrap functions only), `gateway_ops_executor` (NOLOGIN, BYPASSRLS; owns the restricted maintenance enumerator only).
