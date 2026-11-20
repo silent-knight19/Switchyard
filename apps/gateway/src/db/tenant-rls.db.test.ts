@@ -50,6 +50,7 @@ describe('SW-1.4.1 Transaction-Scoped Tenant Context & SW-1.4.2 PostgreSQL RLS P
   let database: DisposableDatabase;
   let poolApp: pg.Pool;
   let poolWorker: pg.Pool;
+  let poolStartup: pg.Pool;
 
   const ORG_A = 'a0000001-0000-4000-8000-000000000001';
   const ORG_B = 'b0000002-0000-4000-8000-000000000002';
@@ -184,7 +185,7 @@ describe('SW-1.4.1 Transaction-Scoped Tenant Context & SW-1.4.2 PostgreSQL RLS P
       await seeder.end();
     }
 
-    // Create pooled connections for gateway_app and gateway_worker
+    // Create pooled connections for gateway_app, gateway_worker, and gateway_startup
     poolApp = new pg.Pool({
       connectionString: roleConnectionString(database.url, 'gateway_app', passwords.gateway_app),
       max: 5,
@@ -197,11 +198,20 @@ describe('SW-1.4.1 Transaction-Scoped Tenant Context & SW-1.4.2 PostgreSQL RLS P
       ),
       max: 5,
     });
+    poolStartup = new pg.Pool({
+      connectionString: roleConnectionString(
+        database.url,
+        'gateway_startup',
+        passwords.gateway_startup,
+      ),
+      max: 5,
+    });
   });
 
   afterAll(async () => {
     await poolApp?.end().catch(() => undefined);
     await poolWorker?.end().catch(() => undefined);
+    await poolStartup?.end().catch(() => undefined);
     for (const db of databases) await db.drop().catch(() => undefined);
     await cluster?.stop();
   });
@@ -271,61 +281,124 @@ describe('SW-1.4.1 Transaction-Scoped Tenant Context & SW-1.4.2 PostgreSQL RLS P
       });
     });
 
-    it('re-uses constrained pool (max: 1) without leaking tenant context across tenants', async () => {
+    it('DB-31: guarantees connection hygiene and prevents session-level tenant GUC leakage on pool reuse (max: 1)', async () => {
       const singleConnPool = new pg.Pool({
         connectionString: roleConnectionString(database.url, 'gateway_app', passwords.gateway_app),
         max: 1,
       });
 
       try {
-        // Run 1: Org A
+        // 1. Normal Org A transaction completes
         await withTenant(singleConnPool, ORG_A, async (client) => {
-          const { rows } = await client.query<{ count: number }>(
-            'SELECT count(*)::int AS count FROM users',
-          );
-          expect(rows[0]?.count).toBe(1);
+          const { rows } = await client.query<{ id: string }>('SELECT id FROM users');
+          expect(rows).toHaveLength(1);
+          expect(rows[0]?.id).toBe(USER_A);
         });
 
-        // Run 2: Same pooled connection reused for Org B
+        // 2. Same connection subsequently serves Org B
         await withTenant(singleConnPool, ORG_B, async (client) => {
-          const { rows: currentGuc } = await client.query<{ current_org: string }>(
-            "SELECT current_setting('app.current_org_id', true) AS current_org",
-          );
-          expect(currentGuc[0]?.current_org).toBe(ORG_B);
-
-          const { rows: users } = await client.query<{ id: string }>('SELECT id FROM users');
-          expect(users).toHaveLength(1);
-          expect(users[0]?.id).toBe(USER_B);
+          const { rows } = await client.query<{ id: string }>('SELECT id FROM users');
+          expect(rows).toHaveLength(1);
+          expect(rows[0]?.id).toBe(USER_B);
         });
 
-        // Run 3: Same pooled connection reused outside withTenant (no context)
-        const noContextClient = await singleConnPool.connect();
+        // 3. No-context reads on the same connection return zero tenant rows
+        let noCtx = await singleConnPool.connect();
         try {
-          const { rows: gucOutside } = await noContextClient.query<{ current_org: string }>(
-            "SELECT current_setting('app.current_org_id', true) AS current_org",
+          const guc = await noCtx.query<{ org: string | null }>(
+            "SELECT current_setting('app.current_org_id', true) AS org",
           );
-          expect(gucOutside[0]?.current_org).toBe('');
-
-          const { rows: usersOutside } = await noContextClient.query('SELECT * FROM users');
-          expect(usersOutside).toHaveLength(0);
+          expect(guc.rows[0]?.org === '' || guc.rows[0]?.org === null).toBe(true);
+          const users = await noCtx.query('SELECT * FROM users');
+          expect(users.rows).toHaveLength(0);
         } finally {
-          noContextClient.release();
+          noCtx.release();
         }
 
-        // Run 4: Repeat reuse after an injected rollback
-        await expect(
-          withTenant(singleConnPool, ORG_A, async () => {
-            throw new Error('injected error on max=1 pool');
-          }),
-        ).rejects.toThrow('injected error on max=1 pool');
-
-        // Next checkout must succeed cleanly with zero leakage
-        await withTenant(singleConnPool, ORG_B, async (client) => {
-          const { rows } = await client.query<{ current_org: string }>(
-            "SELECT current_setting('app.current_org_id', true) AS current_org",
-          );
-          expect(rows[0]?.current_org).toBe(ORG_B);
+        // 4. Callback deliberately sets session-level tenant context via SET app.current_org_id
+        await withTenant(singleConnPool, ORG_A, async (client) => {
+          await client.query(`SET app.current_org_id = '${ORG_A}'`);
         });
+
+        // After completion, the pooled connection must NOT expose tenant rows under a no-context query
+        noCtx = await singleConnPool.connect();
+        try {
+          const guc = await noCtx.query<{ org: string | null }>(
+            "SELECT current_setting('app.current_org_id', true) AS org",
+          );
+          expect(guc.rows[0]?.org === '' || guc.rows[0]?.org === null).toBe(true);
+          const users = await noCtx.query('SELECT * FROM users');
+          expect(users.rows).toHaveLength(0);
+        } finally {
+          noCtx.release();
+        }
+
+        // 5. Repeat after callback failure and rollback
+        await expect(
+          withTenant(singleConnPool, ORG_A, async (client) => {
+            await client.query(`SET app.current_org_id = '${ORG_A}'`);
+            throw new Error('deliberate-error-with-session-guc');
+          }),
+        ).rejects.toThrow('deliberate-error-with-session-guc');
+
+        noCtx = await singleConnPool.connect();
+        try {
+          const guc = await noCtx.query<{ org: string | null }>(
+            "SELECT current_setting('app.current_org_id', true) AS org",
+          );
+          expect(guc.rows[0]?.org === '' || guc.rows[0]?.org === null).toBe(true);
+          const users = await noCtx.query('SELECT * FROM users');
+          expect(users.rows).toHaveLength(0);
+        } finally {
+          noCtx.release();
+        }
+
+        // 6. Repeat for set_config(..., false)
+        await withTenant(singleConnPool, ORG_A, async (client) => {
+          await client.query(`SELECT set_config('app.current_org_id', '${ORG_A}', false)`);
+        });
+
+        noCtx = await singleConnPool.connect();
+        try {
+          const guc = await noCtx.query<{ org: string | null }>(
+            "SELECT current_setting('app.current_org_id', true) AS org",
+          );
+          expect(guc.rows[0]?.org === '' || guc.rows[0]?.org === null).toBe(true);
+          const users = await noCtx.query('SELECT * FROM users');
+          expect(users.rows).toHaveLength(0);
+        } finally {
+          noCtx.release();
+        }
+
+        // Repeat for set_config(..., false) with callback failure and rollback
+        await expect(
+          withTenant(singleConnPool, ORG_A, async (client) => {
+            await client.query(`SELECT set_config('app.current_org_id', '${ORG_A}', false)`);
+            throw new Error('set_config failure probe');
+          }),
+        ).rejects.toThrow('set_config failure probe');
+
+        noCtx = await singleConnPool.connect();
+        try {
+          const guc = await noCtx.query<{ org: string | null }>(
+            "SELECT current_setting('app.current_org_id', true) AS org",
+          );
+          expect(guc.rows[0]?.org === '' || guc.rows[0]?.org === null).toBe(true);
+          const users = await noCtx.query('SELECT * FROM users');
+          expect(users.rows).toHaveLength(0);
+        } finally {
+          noCtx.release();
+        }
+
+        // 7. Verify safe connection disposal when cleanup fails or client destroyed
+        const deadClient = await singleConnPool.connect();
+        deadClient.release(true); // destroy connection
+        expect(singleConnPool.waitingCount).toBe(0);
+
+        // Verify no connection remains checked out after failure; pool continues to serve
+        const freshClient = await singleConnPool.connect();
+        expect(freshClient).toBeDefined();
+        freshClient.release();
       } finally {
         await singleConnPool.end();
       }
@@ -405,30 +478,136 @@ describe('SW-1.4.1 Transaction-Scoped Tenant Context & SW-1.4.2 PostgreSQL RLS P
       });
     });
 
-    it('DB-27: prevents callback from executing COMMIT, ROLLBACK, BEGIN, or multi-statement transaction commands', async () => {
-      // Callback attempts COMMIT
+    it('DB-30: rejects transaction control and multi-statement queries across formats, bindings, and aliases', async () => {
+      // 1. Direct COMMIT, ROLLBACK, BEGIN with and without semicolons
       await withTenant(poolApp, ORG_A, async (client) => {
         await expect(client.query('COMMIT')).rejects.toThrow(TenantTransactionError);
-      });
-
-      // Callback attempts ROLLBACK
-      await withTenant(poolApp, ORG_A, async (client) => {
+        await expect(client.query('commit;')).rejects.toThrow(TenantTransactionError);
         await expect(client.query('ROLLBACK')).rejects.toThrow(TenantTransactionError);
-      });
-
-      // Callback attempts nested BEGIN
-      await withTenant(poolApp, ORG_A, async (client) => {
+        await expect(client.query('rollback;')).rejects.toThrow(TenantTransactionError);
         await expect(client.query('BEGIN')).rejects.toThrow(TenantTransactionError);
+        await expect(client.query('begin;')).rejects.toThrow(TenantTransactionError);
       });
 
-      // Callback attempts multi-statement transaction control
+      // 2. Transaction aliases: START TRANSACTION, END, ABORT
       await withTenant(poolApp, ORG_A, async (client) => {
-        await expect(client.query('SELECT 1; COMMIT;')).rejects.toThrow(TenantTransactionError);
+        await expect(client.query('START TRANSACTION')).rejects.toThrow(TenantTransactionError);
+        await expect(client.query('END')).rejects.toThrow(TenantTransactionError);
+        await expect(client.query('ABORT')).rejects.toThrow(TenantTransactionError);
       });
 
-      // Callback attempts transaction control via QueryConfig
+      // 3. Savepoint controls: SAVEPOINT, RELEASE, ROLLBACK TO
       await withTenant(poolApp, ORG_A, async (client) => {
-        await expect(client.query({ text: 'ROLLBACK' })).rejects.toThrow(TenantTransactionError);
+        await expect(client.query('SAVEPOINT sp1')).rejects.toThrow(TenantTransactionError);
+        await expect(client.query('RELEASE SAVEPOINT sp1')).rejects.toThrow(TenantTransactionError);
+        await expect(client.query('ROLLBACK TO sp1')).rejects.toThrow(TenantTransactionError);
+      });
+
+      // 4. Leading comments (line and block comments)
+      await withTenant(poolApp, ORG_A, async (client) => {
+        await expect(client.query('/* block comment */ COMMIT;')).rejects.toThrow(
+          TenantTransactionError,
+        );
+        await expect(client.query('-- line comment\nROLLBACK;')).rejects.toThrow(
+          TenantTransactionError,
+        );
+      });
+
+      // 5. QueryConfig-based attempts (with caller queryMode override attempt)
+      await withTenant(poolApp, ORG_A, async (client) => {
+        await expect(client.query({ text: 'COMMIT' })).rejects.toThrow(TenantTransactionError);
+      });
+      await expect(
+        withTenant(poolApp, ORG_A, async (client) => {
+          await client.query({ text: 'SELECT 1; COMMIT;', queryMode: 'simple' } as pg.QueryConfig);
+        }),
+      ).rejects.toThrow();
+
+      // 6. Multiple commands submitted through one query rejected by PostgreSQL (42601)
+      await expectSqlState(
+        withTenant(poolApp, ORG_A, async (client) => {
+          await client.query('SELECT 1; SELECT 2;');
+        }),
+        '42601',
+      );
+
+      // 7. Confirmed standard-conforming-string lexer discrepancy: SELECT 'a\'; COMMIT; SELECT 'b'
+      // Under PostgreSQL 16 standard_conforming_strings=on, 'a\' closes the string.
+      // Rejected fail-closed before any COMMIT can execute.
+      await expect(
+        withTenant(poolApp, ORG_A, async (client) => {
+          await client.query("SELECT 'a\\'; COMMIT; SELECT 'b'");
+        }),
+      ).rejects.toThrow();
+
+      // 8. Queries with parameter bindings: legitimate query succeeds, multi-command with bindings rejected
+      await withTenant(poolApp, ORG_A, async (client) => {
+        const goodRes = await client.query('SELECT $1::text AS val', ['hello']);
+        expect(goodRes.rows[0]?.val).toBe('hello');
+      });
+      await expectSqlState(
+        withTenant(poolApp, ORG_A, async (client) => {
+          await client.query('SELECT $1::text; SELECT 2;', ['hello']);
+        }),
+        '42601',
+      );
+
+      // 9. Legitimate query containing transaction words inside literals or identifiers succeeds
+      await withTenant(poolApp, ORG_A, async (client) => {
+        const res = await client.query<{ literal_val: string; lit2: string }>(
+          "SELECT 'COMMIT' AS literal_val, 'BEGIN' AS lit2",
+        );
+        expect(res.rows[0]?.literal_val).toBe('COMMIT');
+        expect(res.rows[0]?.lit2).toBe('BEGIN');
+      });
+    });
+
+    it('DB-30: mandatory persistent-state verification — write then unauthorized query rejection', async () => {
+      const probeWriteId = 'a1000009-0000-4000-8000-000000000008';
+
+      // 1. Inside withTenant: perform valid write, then attempt unauthorized query, then force failure
+      await expect(
+        withTenant(poolApp, ORG_A, async (client) => {
+          // Valid write
+          await client.query(
+            `INSERT INTO users (id, org_id, email_normalized, password_hash, role)
+             VALUES ($1, $2, 'persistent-state-probe@example.com', 'h', 'member')`,
+            [probeWriteId, ORG_A],
+          );
+
+          // Attempt to terminate transaction through unauthorized query (the confirmed parser discrepancy)
+          try {
+            await client.query("SELECT 'a\\'; COMMIT; SELECT 'b'");
+          } catch {
+            // Unauthorized query was rejected before transaction boundary altered!
+          }
+
+          // Force the callback to fail
+          throw new Error('deliberate-failure-after-unauthorized-attempt');
+        }),
+      ).rejects.toThrow('deliberate-failure-after-unauthorized-attempt');
+
+      // 2. Verify NO write persisted in PostgreSQL
+      await withTenant(poolApp, ORG_A, async (client) => {
+        const { rows } = await client.query('SELECT id FROM users WHERE id = $1', [probeWriteId]);
+        expect(rows).toHaveLength(0);
+      });
+
+      // 3. Confirm subsequent normal transactions continue to operate cleanly
+      const subsequentId = 'a1000009-0000-4000-8000-000000000009';
+      await withTenant(poolApp, ORG_A, async (client) => {
+        await client.query(
+          `INSERT INTO users (id, org_id, email_normalized, password_hash, role)
+           VALUES ($1, $2, 'subsequent-normal-probe@example.com', 'h', 'member')`,
+          [subsequentId, ORG_A],
+        );
+      });
+
+      // Row from subsequent normal transaction persisted
+      await withTenant(poolApp, ORG_A, async (client) => {
+        const { rows } = await client.query('SELECT id FROM users WHERE id = $1', [subsequentId]);
+        expect(rows).toHaveLength(1);
+        await client.query('DELETE FROM users WHERE id = $1', [subsequentId]);
       });
     });
 
@@ -1029,6 +1208,498 @@ describe('SW-1.4.1 Transaction-Scoped Tenant Context & SW-1.4.2 PostgreSQL RLS P
         }),
         '23514',
       );
+    });
+  });
+
+  // =========================================================================
+  // Gate A2 — DB-32: Complete Role-by-Table Operation Matrix
+  // =========================================================================
+  describe('Gate A2 — DB-32: Complete role-by-table mutation matrix (app, worker, startup)', () => {
+    const ALL_NINE_TABLES = [
+      'organizations',
+      'users',
+      'web_sessions',
+      'provider_keys',
+      'virtual_keys',
+      'gateway_requests',
+      'provider_attempts',
+      'provider_cost_adjustments',
+      'trace_payloads',
+    ] as const;
+
+    const TABLE_UPDATE_PROBES: Record<(typeof ALL_NINE_TABLES)[number], string> = {
+      organizations: 'UPDATE organizations SET name = name',
+      users: 'UPDATE users SET email_normalized = email_normalized',
+      web_sessions: 'UPDATE web_sessions SET idle_expires_at = idle_expires_at',
+      provider_keys: 'UPDATE provider_keys SET label = label',
+      virtual_keys: 'UPDATE virtual_keys SET name = name',
+      gateway_requests: 'UPDATE gateway_requests SET status = status',
+      provider_attempts: 'UPDATE provider_attempts SET status = status',
+      provider_cost_adjustments:
+        'UPDATE provider_cost_adjustments SET delta_microdollars = delta_microdollars',
+      trace_payloads: 'UPDATE trace_payloads SET response_text = response_text',
+    };
+
+    const TABLE_INSERT_PROBES: Record<(typeof ALL_NINE_TABLES)[number], string> = {
+      organizations: `INSERT INTO organizations (id, name, monthly_budget_microdollars, kek_version, wrapped_dek, dek_iv, dek_auth_tag) VALUES ('${ORG_A}', 'X', 1, 1, '\\x01', '\\x01', '\\x01')`,
+      users: `INSERT INTO users (id, org_id, email_normalized, password_hash, role) VALUES ('${USER_A}', '${ORG_A}', 'x@x.com', 'h', 'member')`,
+      web_sessions: `INSERT INTO web_sessions (session_id_hash, user_id, org_id, csrf_token_hash, last_seen_at, idle_expires_at, absolute_expires_at) VALUES ('\\x01', '${USER_A}', '${ORG_A}', '\\x01', clock_timestamp(), clock_timestamp(), clock_timestamp())`,
+      provider_keys: `INSERT INTO provider_keys (id, org_id, provider, label, key_hint, ciphertext, iv, auth_tag) VALUES ('${PK_A}', '${ORG_A}', 'openai', 'L', 'h', '\\x01', '\\x01', '\\x01')`,
+      virtual_keys: `INSERT INTO virtual_keys (id, org_id, name, key_prefix, allowed_models) VALUES ('${VK_A}', '${ORG_A}', 'test', 'sk-test', '{"gpt-4o"}')`,
+      gateway_requests: `INSERT INTO gateway_requests (request_id, org_id, virtual_key_id, gateway_instance_id, gateway_epoch, requested_model, billing_period, status, cache_status, admitted_at, deadline_at) VALUES ('30000009-0000-4000-8000-000000000099', '${ORG_A}', '${VK_A}', '${GW_INSTANCE}', 1, 'm', '2026-11', 'in_progress', 'miss', '2026-11-15T12:00:00.000Z', '2026-11-15T12:01:00.000Z')`,
+      provider_attempts: `INSERT INTO provider_attempts (attempt_id, request_id, org_id, virtual_key_id, attempt_number, gateway_instance_id, gateway_epoch, billing_period, provider, model, status, cost_status, estimated_cost_microdollars, admitted_at, hard_deadline_at) VALUES ('40000009-0000-4000-8000-000000000099', '${REQ_A}', '${ORG_A}', '${VK_A}', 1, '${GW_INSTANCE}', 1, '2026-11', 'p', 'm', 'reserved', 'estimated', 1000, '2026-11-15T12:00:00.000Z', '2026-11-15T12:01:00.000Z')`,
+      provider_cost_adjustments: `INSERT INTO provider_cost_adjustments (adjustment_id, attempt_id, org_id, previous_cost_microdollars, corrected_cost_microdollars, delta_microdollars, source, source_reference) VALUES ('50000003-0000-4000-8000-000000000099', '${ATT_A_SETTLED}', '${ORG_A}', 4000, 3900, -100, 'provider_usage', 'usage-ref-99')`,
+      trace_payloads: `INSERT INTO trace_payloads (request_id, org_id, request_body, response_text, expires_at) VALUES ('${REQ_A}', '${ORG_A}', '{"req":true}', 'res', clock_timestamp() + interval '1 day')`,
+    };
+
+    // 1. gateway_startup: strictly denied across all 9 tenant tables for SELECT, INSERT, UPDATE, DELETE (42501)
+    it('DB-32: gateway_startup is strictly denied across all 9 tenant tables for SELECT, INSERT, UPDATE, DELETE (42501)', async () => {
+      const client = await poolStartup.connect();
+      try {
+        for (const tbl of ALL_NINE_TABLES) {
+          // SELECT denied (42501)
+          const selErr = await captureError(client.query(`SELECT * FROM ${tbl} LIMIT 1`));
+          expect(errorCode(selErr), `SELECT ${tbl}: ${(selErr as Error)?.message}`).toBe('42501');
+          expect((selErr as Error).message).toMatch(/permission denied for (table|relation)/i);
+
+          // INSERT denied (42501)
+          const insErr = await captureError(client.query(TABLE_INSERT_PROBES[tbl]));
+          expect(errorCode(insErr), `INSERT ${tbl}: ${(insErr as Error)?.message}`).toBe('42501');
+          expect((insErr as Error).message).toMatch(/permission denied for (table|relation)/i);
+
+          // UPDATE denied (42501)
+          const updErr = await captureError(client.query(TABLE_UPDATE_PROBES[tbl]));
+          expect(errorCode(updErr), `UPDATE ${tbl}: ${(updErr as Error)?.message}`).toBe('42501');
+          expect((updErr as Error).message).toMatch(/permission denied for (table|relation)/i);
+
+          // DELETE denied (42501)
+          const delErr = await captureError(client.query(`DELETE FROM ${tbl}`));
+          expect(errorCode(delErr), `DELETE ${tbl}: ${(delErr as Error)?.message}`).toBe('42501');
+          expect((delErr as Error).message).toMatch(/permission denied for (table|relation)/i);
+        }
+
+        // Positive control: gateway_startup CAN read and update gateway_epoch on gateway_control
+        const ctrlRes = await client.query<{ gateway_epoch: number }>(
+          'SELECT gateway_epoch FROM gateway_control WHERE id = 1',
+        );
+        expect(ctrlRes.rows).toHaveLength(1);
+        const updCtrl = await client.query(
+          'UPDATE gateway_control SET gateway_epoch = gateway_epoch + 1 WHERE id = 1',
+        );
+        expect(updCtrl.rowCount).toBe(1);
+      } finally {
+        client.release();
+      }
+    });
+
+    // 2. gateway_worker: table-by-table privilege boundaries, tenant-scoping, and mutation restrictions
+    it('DB-32: gateway_worker positive operations, row filtering, and mutation restrictions', async () => {
+      // Positive and row-filtered operations (non-aborting)
+      await withTenant(poolWorker, ORG_A, async (client) => {
+        // organizations: metadata SELECT ok, cross-tenant rowCount=0
+        const orgMeta = await client.query('SELECT id, name FROM organizations WHERE id = $1', [
+          ORG_A,
+        ]);
+        expect(orgMeta.rowCount).toBe(1);
+        const orgCross = await client.query('SELECT id, name FROM organizations WHERE id = $1', [
+          ORG_B,
+        ]);
+        expect(orgCross.rowCount).toBe(0);
+
+        // provider_keys: metadata SELECT ok, cross-tenant rowCount=0
+        const pkMeta = await client.query('SELECT id, provider FROM provider_keys WHERE id = $1', [
+          PK_A,
+        ]);
+        expect(pkMeta.rowCount).toBe(1);
+        const pkCross = await client.query('SELECT id, provider FROM provider_keys WHERE id = $1', [
+          PK_B,
+        ]);
+        expect(pkCross.rowCount).toBe(0);
+
+        // virtual_keys: SELECT ok and tenant-scoped
+        const vkRes = await client.query('SELECT id FROM virtual_keys WHERE id = $1', [VK_A]);
+        expect(vkRes.rowCount).toBe(1);
+        const vkCross = await client.query('SELECT id FROM virtual_keys WHERE id = $1', [VK_B]);
+        expect(vkCross.rowCount).toBe(0);
+
+        // gateway_requests: SELECT ok, permitted columns UPDATE ok on same tenant, cross-tenant UPDATE rowCount=0
+        const reqRes = await client.query(
+          'SELECT request_id FROM gateway_requests WHERE request_id = $1',
+          [REQ_A],
+        );
+        expect(reqRes.rowCount).toBe(1);
+        const reqUpd = await client.query(
+          "UPDATE gateway_requests SET status = 'completed', http_status = 200, finalized_at = clock_timestamp() WHERE request_id = $1",
+          [REQ_A],
+        );
+        expect(reqUpd.rowCount).toBe(1);
+        const reqUpdCross = await client.query(
+          "UPDATE gateway_requests SET status = 'completed' WHERE request_id = $1",
+          [REQ_B],
+        );
+        expect(reqUpdCross.rowCount).toBe(0);
+
+        // provider_attempts: SELECT ok, permitted columns UPDATE ok on unsettled attempt, cross-tenant rowCount=0
+        const attRes = await client.query(
+          'SELECT attempt_id FROM provider_attempts WHERE attempt_id = $1',
+          [ATT_A],
+        );
+        expect(attRes.rowCount).toBe(1);
+        const attUpd = await client.query(
+          "UPDATE provider_attempts SET status = 'interrupted', outcome = 'interrupted' WHERE attempt_id = $1",
+          [ATT_A],
+        );
+        expect(attUpd.rowCount).toBe(1);
+        const attUpdCross = await client.query(
+          "UPDATE provider_attempts SET status = 'interrupted' WHERE attempt_id = $1",
+          [ATT_B],
+        );
+        expect(attUpdCross.rowCount).toBe(0);
+
+        // provider_cost_adjustments: SELECT ok, same-tenant INSERT ok
+        const adjRes = await client.query(
+          'SELECT adjustment_id FROM provider_cost_adjustments WHERE adjustment_id = $1',
+          [ADJ_A],
+        );
+        expect(adjRes.rowCount).toBe(1);
+        const workerAdjId = '50000003-0000-4000-8000-000000000099';
+        await client.query(
+          `INSERT INTO provider_cost_adjustments (adjustment_id, attempt_id, org_id, previous_cost_microdollars, corrected_cost_microdollars, delta_microdollars, source, source_reference)
+           VALUES ($1, $2, $3, 4000, 3900, -100, 'provider_usage', 'usage-ref-99')`,
+          [workerAdjId, ATT_A_SETTLED, ORG_A],
+        );
+
+        // trace_payloads: INSERT ok, SELECT ok, UPDATE ok, DELETE ok for same tenant; cross-tenant UPDATE/DELETE rowCount=0
+        await client.query(
+          `INSERT INTO trace_payloads (request_id, org_id, request_body, response_text, expires_at)
+           VALUES ($1, $2, '{"trace":true}', 'init', clock_timestamp() + interval '7 days')
+           ON CONFLICT (request_id) DO UPDATE SET response_text = 'init'`,
+          [REQ_A, ORG_A],
+        );
+        const traceRes = await client.query(
+          'SELECT request_id FROM trace_payloads WHERE request_id = $1',
+          [REQ_A],
+        );
+        expect(traceRes.rowCount).toBe(1);
+        const traceUpd = await client.query(
+          "UPDATE trace_payloads SET response_text = 'updated' WHERE request_id = $1",
+          [REQ_A],
+        );
+        expect(traceUpd.rowCount).toBe(1);
+        const traceUpdCross = await client.query(
+          "UPDATE trace_payloads SET response_text = 'hack' WHERE request_id = $1",
+          [REQ_B],
+        );
+        expect(traceUpdCross.rowCount).toBe(0);
+        const traceDel = await client.query('DELETE FROM trace_payloads WHERE request_id = $1', [
+          REQ_A,
+        ]);
+        expect(traceDel.rowCount).toBe(1);
+        const traceDelCross = await client.query(
+          'DELETE FROM trace_payloads WHERE request_id = $1',
+          [REQ_B],
+        );
+        expect(traceDelCross.rowCount).toBe(0);
+      });
+
+      // Negative operations: column and table privileges strictly denied (42501)
+      // organizations: column privilege on wrapped_dek, table INSERT, UPDATE, DELETE denied
+      await expectSqlState(
+        withTenant(poolWorker, ORG_A, (c) => c.query('SELECT wrapped_dek FROM organizations')),
+        '42501',
+      );
+      await expectSqlState(
+        withTenant(poolWorker, ORG_A, (c) => c.query(TABLE_INSERT_PROBES.organizations)),
+        '42501',
+      );
+      await expectSqlState(
+        withTenant(poolWorker, ORG_A, (c) => c.query('UPDATE organizations SET name = $1', ['X'])),
+        '42501',
+      );
+      await expectSqlState(
+        withTenant(poolWorker, ORG_A, (c) => c.query('DELETE FROM organizations')),
+        '42501',
+      );
+
+      // users: all operations denied
+      await expectSqlState(
+        withTenant(poolWorker, ORG_A, (c) => c.query('SELECT * FROM users')),
+        '42501',
+      );
+      await expectSqlState(
+        withTenant(poolWorker, ORG_A, (c) => c.query(TABLE_INSERT_PROBES.users)),
+        '42501',
+      );
+      await expectSqlState(
+        withTenant(poolWorker, ORG_A, (c) => c.query('UPDATE users SET role = $1', ['admin'])),
+        '42501',
+      );
+      await expectSqlState(
+        withTenant(poolWorker, ORG_A, (c) => c.query('DELETE FROM users')),
+        '42501',
+      );
+
+      // web_sessions: all operations denied
+      await expectSqlState(
+        withTenant(poolWorker, ORG_A, (c) => c.query('SELECT * FROM web_sessions')),
+        '42501',
+      );
+      await expectSqlState(
+        withTenant(poolWorker, ORG_A, (c) => c.query(TABLE_INSERT_PROBES.web_sessions)),
+        '42501',
+      );
+      await expectSqlState(
+        withTenant(poolWorker, ORG_A, (c) =>
+          c.query('UPDATE web_sessions SET idle_expires_at = clock_timestamp()'),
+        ),
+        '42501',
+      );
+      await expectSqlState(
+        withTenant(poolWorker, ORG_A, (c) => c.query('DELETE FROM web_sessions')),
+        '42501',
+      );
+
+      // provider_keys: column privilege on ciphertext, table INSERT, UPDATE, DELETE denied
+      await expectSqlState(
+        withTenant(poolWorker, ORG_A, (c) => c.query('SELECT ciphertext FROM provider_keys')),
+        '42501',
+      );
+      await expectSqlState(
+        withTenant(poolWorker, ORG_A, (c) => c.query(TABLE_INSERT_PROBES.provider_keys)),
+        '42501',
+      );
+      await expectSqlState(
+        withTenant(poolWorker, ORG_A, (c) => c.query('UPDATE provider_keys SET label = $1', ['X'])),
+        '42501',
+      );
+      await expectSqlState(
+        withTenant(poolWorker, ORG_A, (c) => c.query('DELETE FROM provider_keys')),
+        '42501',
+      );
+
+      // virtual_keys: table INSERT, UPDATE, DELETE denied
+      await expectSqlState(
+        withTenant(poolWorker, ORG_A, (c) => c.query(TABLE_INSERT_PROBES.virtual_keys)),
+        '42501',
+      );
+      await expectSqlState(
+        withTenant(poolWorker, ORG_A, (c) =>
+          c.query('UPDATE virtual_keys SET revoked_at = clock_timestamp() WHERE id = $1', [VK_A]),
+        ),
+        '42501',
+      );
+      await expectSqlState(
+        withTenant(poolWorker, ORG_A, (c) => c.query('DELETE FROM virtual_keys')),
+        '42501',
+      );
+
+      // gateway_requests: column UPDATE on ungranted column, table INSERT and DELETE denied
+      await expectSqlState(
+        withTenant(poolWorker, ORG_A, (c) =>
+          c.query("UPDATE gateway_requests SET billing_period = '2026-12' WHERE request_id = $1", [
+            REQ_A,
+          ]),
+        ),
+        '42501',
+      );
+      await expectSqlState(
+        withTenant(poolWorker, ORG_A, (c) => c.query(TABLE_INSERT_PROBES.gateway_requests)),
+        '42501',
+      );
+      await expectSqlState(
+        withTenant(poolWorker, ORG_A, (c) => c.query('DELETE FROM gateway_requests')),
+        '42501',
+      );
+
+      // provider_attempts: column UPDATE on ungranted column, table INSERT and DELETE denied
+      await expectSqlState(
+        withTenant(poolWorker, ORG_A, (c) =>
+          c.query("UPDATE provider_attempts SET model = 'custom' WHERE attempt_id = $1", [ATT_A]),
+        ),
+        '42501',
+      );
+      await expectSqlState(
+        withTenant(poolWorker, ORG_A, (c) => c.query(TABLE_INSERT_PROBES.provider_attempts)),
+        '42501',
+      );
+      await expectSqlState(
+        withTenant(poolWorker, ORG_A, (c) => c.query('DELETE FROM provider_attempts')),
+        '42501',
+      );
+
+      // provider_cost_adjustments: cross-tenant INSERT fails foreign-key parent isolation (23503), UPDATE and DELETE denied (append-only 42501)
+      const crossWorkerAdjErr = await captureError(
+        withTenant(poolWorker, ORG_A, (c) =>
+          c.query(
+            `INSERT INTO provider_cost_adjustments (adjustment_id, attempt_id, org_id, previous_cost_microdollars, corrected_cost_microdollars, delta_microdollars, source, source_reference)
+             VALUES ('50000003-0000-4000-8000-000000000098', $1, $2, 4000, 3900, -100, 'provider_usage', 'usage-ref-98')`,
+            [ATT_B_SETTLED, ORG_B],
+          ),
+        ),
+      );
+      expect(errorCode(crossWorkerAdjErr)).toBe('23503');
+
+      await expectSqlState(
+        withTenant(poolWorker, ORG_A, (c) =>
+          c.query(
+            'UPDATE provider_cost_adjustments SET delta_microdollars = 0 WHERE adjustment_id = $1',
+            [ADJ_A],
+          ),
+        ),
+        '42501',
+      );
+      await expectSqlState(
+        withTenant(poolWorker, ORG_A, (c) => c.query('DELETE FROM provider_cost_adjustments')),
+        '42501',
+      );
+    });
+
+    // 3. gateway_app: full tenant operation with clear differentiation of RLS WITH CHECK, row filtering, and financial immutability
+    it('DB-32: gateway_app operation matrix across all nine tables', async () => {
+      // Positive operations and row filtering
+      await withTenant(poolApp, ORG_A, async (client) => {
+        // users: same-tenant CRUD succeeds; cross-tenant UPDATE/DELETE rowCount=0
+        const testUserId = 'a1000009-0000-4000-8000-000000000088';
+        await client.query(
+          `INSERT INTO users (id, org_id, email_normalized, password_hash, role) VALUES ($1, $2, 'crud@example.com', 'h', 'member')`,
+          [testUserId, ORG_A],
+        );
+        const userUpd = await client.query('UPDATE users SET role = $1 WHERE id = $2', [
+          'admin',
+          testUserId,
+        ]);
+        expect(userUpd.rowCount).toBe(1);
+        const crossUserUpd = await client.query('UPDATE users SET role = $1 WHERE id = $2', [
+          'admin',
+          USER_B,
+        ]);
+        expect(crossUserUpd.rowCount).toBe(0); // RLS row filtering
+        const userDel = await client.query('DELETE FROM users WHERE id = $1', [testUserId]);
+        expect(userDel.rowCount).toBe(1);
+        const crossUserDel = await client.query('DELETE FROM users WHERE id = $1', [USER_B]);
+        expect(crossUserDel.rowCount).toBe(0); // RLS row filtering
+
+        // organizations: same-tenant SELECT and UPDATE ok; cross-tenant UPDATE rowCount=0
+        const orgUpdCross = await client.query('UPDATE organizations SET name = $1 WHERE id = $2', [
+          'Hack',
+          ORG_B,
+        ]);
+        expect(orgUpdCross.rowCount).toBe(0);
+
+        // gateway_requests: cross-tenant UPDATE rowCount=0
+        const reqUpdCross = await client.query(
+          "UPDATE gateway_requests SET status = 'completed' WHERE request_id = $1",
+          [REQ_B],
+        );
+        expect(reqUpdCross.rowCount).toBe(0);
+
+        // provider_attempts: cross-tenant UPDATE rowCount=0
+        const attUpdCross = await client.query(
+          "UPDATE provider_attempts SET status = 'interrupted' WHERE attempt_id = $1",
+          [ATT_B],
+        );
+        expect(attUpdCross.rowCount).toBe(0);
+
+        // provider_cost_adjustments: same-tenant INSERT succeeds
+        const appAdjId = '50000003-0000-4000-8000-000000000077';
+        await client.query(
+          `INSERT INTO provider_cost_adjustments (adjustment_id, attempt_id, org_id, previous_cost_microdollars, corrected_cost_microdollars, delta_microdollars, source, source_reference)
+           VALUES ($1, $2, $3, 4500, 4200, -300, 'provider_usage', 'app-ref-77')`,
+          [appAdjId, ATT_A_SETTLED, ORG_A],
+        );
+
+        // trace_payloads: same-tenant INSERT/UPDATE/DELETE succeeds; cross-tenant rowCount=0
+        const traceUpdCross = await client.query(
+          "UPDATE trace_payloads SET response_text = 'hack' WHERE request_id = $1",
+          [REQ_B],
+        );
+        expect(traceUpdCross.rowCount).toBe(0);
+        const traceDelCross = await client.query(
+          'DELETE FROM trace_payloads WHERE request_id = $1',
+          [REQ_B],
+        );
+        expect(traceDelCross.rowCount).toBe(0);
+      });
+
+      // Negative operations: RLS WITH CHECK, least privilege DELETE, and financial immutability triggers
+      // users: cross-tenant INSERT fails RLS WITH CHECK (42501)
+      const crossUserInsErr = await captureError(
+        withTenant(poolApp, ORG_A, (c) =>
+          c.query(
+            `INSERT INTO users (id, org_id, email_normalized, password_hash, role) VALUES ('b1000009-0000-4000-8000-000000000088', '${ORG_B}', 'cross@example.com', 'h', 'member')`,
+          ),
+        ),
+      );
+      expect(errorCode(crossUserInsErr)).toBe('42501');
+      expect((crossUserInsErr as Error).message).toMatch(/violates row-level security policy/i);
+
+      // organizations: DELETE denied by privilege (42501)
+      await expectSqlState(
+        withTenant(poolApp, ORG_A, (c) =>
+          c.query('DELETE FROM organizations WHERE id = $1', [ORG_A]),
+        ),
+        '42501',
+      );
+
+      // gateway_requests: DELETE denied by privilege (42501); immutable billing_period UPDATE fails with 23514
+      await expectSqlState(
+        withTenant(poolApp, ORG_A, (c) =>
+          c.query('DELETE FROM gateway_requests WHERE request_id = $1', [REQ_A]),
+        ),
+        '42501',
+      );
+      await expectSqlState(
+        withTenant(poolApp, ORG_A, (c) =>
+          c.query("UPDATE gateway_requests SET billing_period = '2026-12' WHERE request_id = $1", [
+            REQ_A,
+          ]),
+        ),
+        '23514',
+      );
+
+      // provider_attempts: DELETE denied by privilege (42501); settled cost UPDATE fails with 23514 (chk_provider_attempts_settled_cost_immutable)
+      await expectSqlState(
+        withTenant(poolApp, ORG_A, (c) =>
+          c.query('DELETE FROM provider_attempts WHERE attempt_id = $1', [ATT_A]),
+        ),
+        '42501',
+      );
+      await expectSqlState(
+        withTenant(poolApp, ORG_A, (c) =>
+          c.query(
+            'UPDATE provider_attempts SET actual_cost_microdollars = 99999 WHERE attempt_id = $1',
+            [ATT_A_SETTLED],
+          ),
+        ),
+        '23514',
+      );
+
+      // provider_cost_adjustments: UPDATE/DELETE denied by privilege (42501); cross-tenant INSERT fails foreign-key parent isolation (23503)
+      await expectSqlState(
+        withTenant(poolApp, ORG_A, (c) =>
+          c.query(
+            'UPDATE provider_cost_adjustments SET delta_microdollars = 0 WHERE adjustment_id = $1',
+            [ADJ_A],
+          ),
+        ),
+        '42501',
+      );
+      await expectSqlState(
+        withTenant(poolApp, ORG_A, (c) =>
+          c.query('DELETE FROM provider_cost_adjustments WHERE adjustment_id = $1', [ADJ_A]),
+        ),
+        '42501',
+      );
+      const crossAdjErr = await captureError(
+        withTenant(poolApp, ORG_A, (c) =>
+          c.query(
+            `INSERT INTO provider_cost_adjustments (adjustment_id, attempt_id, org_id, previous_cost_microdollars, corrected_cost_microdollars, delta_microdollars, source, source_reference)
+             VALUES ('50000003-0000-4000-8000-000000000076', $1, $2, 4500, 4200, -300, 'provider_usage', 'app-ref-76')`,
+            [ATT_B_SETTLED, ORG_B],
+          ),
+        ),
+      );
+      expect(errorCode(crossAdjErr)).toBe('23503');
     });
   });
 });

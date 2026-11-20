@@ -5,6 +5,7 @@ import {
   assertNoTransactionControl,
   getActiveTenantContext,
   stripCommentsAndLiterals,
+  stripLeadingCommentsAndWhitespace,
   validateTenantId,
 } from './tenant.js';
 
@@ -93,14 +94,46 @@ describe('SW-1.4.1 tenant helper unit tests: input validation & context tracking
     it('strips single-quoted string literals including escaped quotes', () => {
       expect(stripCommentsAndLiterals("SELECT 'hello world';").trim()).toBe('SELECT  ;');
       expect(stripCommentsAndLiterals("SELECT 'hello ''nested'' world';").trim()).toBe('SELECT  ;');
-      expect(stripCommentsAndLiterals("SELECT 'hello \\'escaped\\' world';").trim()).toBe(
+      expect(stripCommentsAndLiterals("SELECT E'hello \\'escaped\\' world';").trim()).toBe(
         'SELECT  ;',
       );
+    });
+
+    it('DB-30: respects standard_conforming_strings=on where backslash does not escape quotes in standard literals', () => {
+      // In standard SQL ('...'), a backslash is a literal character, not an escape.
+      // Therefore, 'a\' ends at the quote, exposing the following COMMIT statement.
+      const sql = "SELECT 'a\\'; COMMIT; SELECT 'b'";
+      const stripped = stripCommentsAndLiterals(sql);
+      expect(stripped).toContain('COMMIT');
     });
 
     it('strips dollar-quoted string literals', () => {
       expect(stripCommentsAndLiterals('SELECT $$hello world$$;').trim()).toBe('SELECT  ;');
       expect(stripCommentsAndLiterals('SELECT $tag$hello world$tag$;').trim()).toBe('SELECT  ;');
+    });
+  });
+
+  describe('stripLeadingCommentsAndWhitespace', () => {
+    it('strips leading whitespace without altering body', () => {
+      expect(stripLeadingCommentsAndWhitespace('   \n\t  SELECT 1')).toBe('SELECT 1');
+    });
+
+    it('strips leading line comments', () => {
+      expect(stripLeadingCommentsAndWhitespace('-- line comment\nCOMMIT')).toBe('COMMIT');
+    });
+
+    it('strips leading block comments including nested block comments', () => {
+      expect(stripLeadingCommentsAndWhitespace('/* block */ ROLLBACK')).toBe('ROLLBACK');
+      expect(stripLeadingCommentsAndWhitespace('/* outer /* inner */ */ BEGIN')).toBe('BEGIN');
+      expect(stripLeadingCommentsAndWhitespace('/* comment */ -- line\n   START TRANSACTION')).toBe(
+        'START TRANSACTION',
+      );
+    });
+
+    it('does not strip non-leading comments or strings', () => {
+      expect(stripLeadingCommentsAndWhitespace("SELECT '/* not comment */'")).toBe(
+        "SELECT '/* not comment */'",
+      );
     });
   });
 
@@ -134,6 +167,9 @@ describe('SW-1.4.1 tenant helper unit tests: input validation & context tracking
         TenantTransactionError,
       );
       expect(() => assertNoTransactionControl('SELECT 1; START TRANSACTION;')).toThrow(
+        TenantTransactionError,
+      );
+      expect(() => assertNoTransactionControl("SELECT 'a\\'; COMMIT; SELECT 'b'")).toThrow(
         TenantTransactionError,
       );
     });

@@ -56,12 +56,66 @@ export function validateTenantId(orgId: unknown): string {
  * Transaction ownership and boundary management belong exclusively to withTenant.
  */
 const PROHIBITED_TX_COMMANDS =
-  /^\s*(BEGIN|COMMIT|ROLLBACK|START\s+TRANSACTION|END|ABORT|SAVEPOINT|RELEASE\s+SAVEPOINT|ROLLBACK\s+TO)\b/i;
+  /^\s*(BEGIN|COMMIT|ROLLBACK|START\s+TRANSACTION|END|ABORT|SAVEPOINT|RELEASE|PREPARE\s+TRANSACTION)\b/i;
+
+/**
+ * Strips leading whitespace, single-line SQL comments (`-- ...`), and block
+ * comments (`/* ... *\/`, including nested block comments per PostgreSQL 16 standard)
+ * from a SQL command string. Returns the string slice beginning at the first
+ * non-comment, non-whitespace token.
+ */
+export function stripLeadingCommentsAndWhitespace(sql: string): string {
+  let i = 0;
+  const len = sql.length;
+
+  while (i < len) {
+    const ch = sql[i] ?? '';
+    // 1. Skip whitespace
+    if (/\s/.test(ch)) {
+      i++;
+      continue;
+    }
+
+    // 2. Single-line comment: -- ...
+    if (sql[i] === '-' && i + 1 < len && sql[i + 1] === '-') {
+      i += 2;
+      while (i < len && sql[i] !== '\n' && sql[i] !== '\r') {
+        i++;
+      }
+      continue;
+    }
+
+    // 3. Block comment: /* ... */ (supports nested block comments per PostgreSQL specification)
+    if (sql[i] === '/' && i + 1 < len && sql[i + 1] === '*') {
+      i += 2;
+      let depth = 1;
+      while (i < len && depth > 0) {
+        if (sql[i] === '/' && i + 1 < len && sql[i + 1] === '*') {
+          depth++;
+          i += 2;
+        } else if (sql[i] === '*' && i + 1 < len && sql[i + 1] === '/') {
+          depth--;
+          i += 2;
+        } else {
+          i++;
+        }
+      }
+      continue;
+    }
+
+    break;
+  }
+
+  return sql.slice(i);
+}
 
 /**
  * Strips comments (line `--` and block `/* ... *\/`) and string literals (`'...'` and `$...$`)
  * from a SQL string to allow robust lexical inspection of top-level SQL commands without
  * mistaking string literal values or comments for transaction control statements.
+ *
+ * Adheres to PostgreSQL 16 `standard_conforming_strings = on`, where a backslash inside an
+ * ordinary single-quoted string `'...'` is treated as a literal character rather than an escape.
  */
 export function stripCommentsAndLiterals(sql: string): string {
   let result = '';
@@ -82,18 +136,49 @@ export function stripCommentsAndLiterals(sql: string): string {
       continue;
     }
 
-    // Block comment: /* ... */
+    // Block comment: /* ... */ (supports nested block comments)
     if (ch === '/' && next === '*') {
       i += 2;
-      while (i < len && !(sql[i] === '*' && i + 1 < len && sql[i + 1] === '/')) {
-        i++;
+      let depth = 1;
+      while (i < len && depth > 0) {
+        if (sql[i] === '/' && i + 1 < len && sql[i + 1] === '*') {
+          depth++;
+          i += 2;
+        } else if (sql[i] === '*' && i + 1 < len && sql[i + 1] === '/') {
+          depth--;
+          i += 2;
+        } else {
+          i++;
+        }
       }
-      i += 2; // skip */
       result += ' ';
       continue;
     }
 
-    // Single-quoted literal: '...'
+    // C-style escape string literal: E'...' or e'...' (where \' is an escaped quote)
+    if ((ch === 'E' || ch === 'e') && next === "'") {
+      i += 2; // skip E and '
+      while (i < len) {
+        if (sql[i] === "'") {
+          if (i + 1 < len && sql[i + 1] === "'") {
+            // Escaped quote ''
+            i += 2;
+          } else {
+            i++;
+            break;
+          }
+        } else if (sql[i] === '\\' && i + 1 < len) {
+          // Escaped char \' or \\ in C-escape string
+          i += 2;
+        } else {
+          i++;
+        }
+      }
+      result += ' ';
+      continue;
+    }
+
+    // Standard single-quoted literal: '...' (standard_conforming_strings=on: backslash is literal)
     if (ch === "'") {
       i++;
       while (i < len) {
@@ -105,9 +190,6 @@ export function stripCommentsAndLiterals(sql: string): string {
             i++;
             break;
           }
-        } else if (sql[i] === '\\' && i + 1 < len) {
-          // Escaped char \'
-          i += 2;
         } else {
           i++;
         }
@@ -142,10 +224,19 @@ export function stripCommentsAndLiterals(sql: string): string {
 
 /**
  * Asserts that the SQL string contains no prohibited transaction-control commands
- * (BEGIN, COMMIT, ROLLBACK, START TRANSACTION, END, ABORT, SAVEPOINT, etc.),
- * checking both standalone statements and multi-statement sequences.
+ * (BEGIN, COMMIT, ROLLBACK, START TRANSACTION, END, ABORT, SAVEPOINT, RELEASE, PREPARE TRANSACTION, etc.),
+ * checking both the leading command statement and multi-statement sequences.
  */
 export function assertNoTransactionControl(sql: string): void {
+  // 1. Check leading statement token (ignoring leading whitespace and comments)
+  const leading = stripLeadingCommentsAndWhitespace(sql);
+  if (leading.length > 0 && PROHIBITED_TX_COMMANDS.test(leading)) {
+    throw new TenantTransactionError(
+      'Transaction control statements (BEGIN, COMMIT, ROLLBACK, etc.) are prohibited inside withTenant callback. Transaction lifecycle is owned exclusively by withTenant.',
+    );
+  }
+
+  // 2. Also inspect statements across semicolons using standard_conforming_strings-aware lexer
   const stripped = stripCommentsAndLiterals(sql);
   const statements = stripped.split(';');
 
@@ -269,6 +360,8 @@ export async function withTenant<T>(
 
       // Extract SQL query text
       let sqlText: string;
+      let callerConfig: pg.QueryConfig<I> | undefined;
+
       if (typeof queryTextOrConfig === 'string') {
         sqlText = queryTextOrConfig;
       } else if (
@@ -276,7 +369,8 @@ export async function withTenant<T>(
         queryTextOrConfig !== null &&
         typeof (queryTextOrConfig as pg.QueryConfig<I>).text === 'string'
       ) {
-        sqlText = (queryTextOrConfig as pg.QueryConfig<I>).text;
+        callerConfig = queryTextOrConfig as pg.QueryConfig<I>;
+        sqlText = callerConfig.text;
       } else {
         throw new TenantTransactionError(
           'Invalid query: query text must be a string or QueryConfig object',
@@ -286,15 +380,23 @@ export async function withTenant<T>(
       // Assert that callback is not attempting transaction control commands
       assertNoTransactionControl(sqlText);
 
-      if (values !== undefined) {
-        return (
-          client.query as (
-            q: string | pg.QueryConfig<I>,
-            v: unknown[],
-          ) => Promise<pg.QueryResult<R>>
-        )(queryTextOrConfig as string | pg.QueryConfig<I>, values);
-      }
-      return client.query<R>(queryTextOrConfig as string | pg.QueryConfig<I>);
+      // Force extended query protocol so PostgreSQL strictly enforces single-statement execution (DB-30).
+      // Caller-supplied queryMode cannot override this.
+      const queryConfig = callerConfig
+        ? {
+            ...callerConfig,
+            queryMode: 'extended',
+            ...(values !== undefined ? { values } : {}),
+          }
+        : {
+            text: sqlText,
+            values,
+            queryMode: 'extended',
+          };
+
+      return (
+        client.query as (q: pg.QueryConfig<I> & { queryMode: string }) => Promise<pg.QueryResult<R>>
+      )(queryConfig as pg.QueryConfig<I> & { queryMode: string });
     },
     escapeIdentifier: (str: string) => client.escapeIdentifier(str),
     escapeLiteral: (str: string) => client.escapeLiteral(str),
@@ -304,6 +406,8 @@ export async function withTenant<T>(
   (tenantClient as unknown as { release: () => void }).release = () => {
     throw new TenantTransactionError('Callback must not invoke release() on withTenant client');
   };
+
+  let hasThrownError = false;
 
   try {
     // 4. Begin explicit PostgreSQL transaction
@@ -347,6 +451,7 @@ export async function withTenant<T>(
 
     return result;
   } catch (error: unknown) {
+    hasThrownError = true;
     if (insideTransaction) {
       try {
         await client.query('ROLLBACK');
@@ -368,9 +473,39 @@ export async function withTenant<T>(
     // Restore original release method
     client.release = originalRelease;
 
+    // Connection release cleanup & verification (DB-31 invariant: no reusable pooled connection may retain tenant identity)
+    let cleanupError: unknown;
+    if (!insideTransaction && !connectionUncertain) {
+      try {
+        // Discard session-level settings, temporary tables, prepared statements, etc.
+        await client.query('DISCARD ALL');
+
+        // Explicitly verify that app.current_org_id is empty/null
+        const checkResult = await client.query<{ cur_org: string | null }>(
+          "SELECT pg_catalog.current_setting('app.current_org_id', true) AS cur_org",
+        );
+        const remainingOrg = checkResult.rows[0]?.cur_org;
+        if (remainingOrg && remainingOrg.trim().length > 0) {
+          connectionUncertain = true;
+          cleanupError = new TenantTransactionError(
+            `Residual tenant context "${remainingOrg}" detected on pooled connection after transaction`,
+          );
+        }
+      } catch (err: unknown) {
+        connectionUncertain = true;
+        cleanupError = err;
+      }
+    }
+
     if (connectionUncertain || insideTransaction) {
-      // Invalidate connection to prevent uncertain state from being reused in the pool
+      // Invalidate connection to prevent uncertain or contaminated state from being reused in the pool
       originalRelease(true);
+      if (cleanupError && !hasThrownError) {
+        throw new TenantTransactionError(
+          'Failed to sanitize or verify pooled connection state after transaction',
+          { cause: cleanupError },
+        );
+      }
     } else {
       originalRelease();
     }

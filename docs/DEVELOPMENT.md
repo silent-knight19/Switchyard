@@ -345,7 +345,9 @@ export async function withTenant<T>(
 ```
 
 - **UUID Validation:** `orgId` is validated fail-closed upfront (`/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i`). Invalid tenant IDs throw `InvalidTenantIdError` without acquiring a pool client.
-- **Transaction Ownership & Tampering Prevention (DB-27):** The callback receives a restricted `TenantClient` interface rather than an unrestricted `PoolClient`. Direct transaction-control statements (`BEGIN`, `COMMIT`, `ROLLBACK`, `START TRANSACTION`, `END`, `ABORT`, `SAVEPOINT`, etc.) and multi-statement evasion attempts are intercepted and rejected with `TenantTransactionError`.
+- **Protocol-Enforced Single-Statement Execution & Lexical Guard (DB-27, DB-30):**
+  - In `tenantClient.query()`, `withTenant` unconditionally enforces PostgreSQL's extended query protocol (`queryMode: 'extended'`). Under extended query protocol, PostgreSQL natively rejects any multi-statement command string with SQLSTATE `42601` (`cannot insert multiple commands into a prepared statement`). Caller-supplied `queryMode` in `QueryConfig` cannot override this.
+  - In addition, leading comment/whitespace stripping (`stripLeadingCommentsAndWhitespace`, supporting nested block comments per PostgreSQL 16) and `standard_conforming_strings`-aware lexical inspection reject standalone and embedded transaction control commands (`BEGIN`, `COMMIT`, `ROLLBACK`, `START TRANSACTION`, `END`, `ABORT`, `SAVEPOINT`, `RELEASE`, `PREPARE TRANSACTION`) before dispatch.
 - **Confirmed COMMIT Verification (DB-26):** `withTenant` inspects PostgreSQL's command completion tag upon `COMMIT`. If PostgreSQL returns `ROLLBACK` (which occurs when `COMMIT` is executed on an aborted transaction block whose error was swallowed inside the callback), `withTenant` immediately throws `TenantTransactionError` and marks the transaction failed, guaranteeing that aborted transactions never silently report success.
 - **AsyncLocalStorage Isolation & Lifetime (DB-29):** Active tenant context is tracked in `AsyncLocalStorage`. Inactive context state prevents detached asynchronous continuations from executing queries through stale `TenantClient` references or mistaking finished transactions for active ones. `getActiveTenantContext()` exposes only `{ orgId }` (never the raw client). Nested active `withTenant` calls are rejected.
 - **Transaction-Local GUC:** Sets PostgreSQL application context `app.current_org_id` transaction-locally (`is_local = true`):
@@ -353,10 +355,11 @@ export async function withTenant<T>(
   SELECT pg_catalog.set_config('app.current_org_id', $1, true);
   ```
   Because `is_local = true`, the parameter automatically reverts when the transaction ends (commit or rollback).
-- **Connection Hygiene & Pool Invalidation:**
+- **Connection Hygiene, Pool Invalidation & Session Cleanup (DB-31):**
   - Client release is intercepted during the callback to prevent premature release.
-  - On standard completion, confirmed `COMMIT` is verified and the client is safely released to the pool.
-  - On confirmed rollback, the clean idle connection is returned to the pool.
+  - **Connection Release Invariant (DB-31):** No reusable pooled connection may retain tenant identity from a completed transaction. Outside an active transaction upon completion, `withTenant` issues `DISCARD ALL` to purge any session-level GUC overrides (such as `SET app.current_org_id = ...` or `set_config('app.current_org_id', ..., false)`), prepared statements, and temporary state.
+  - It then explicitly verifies `SELECT pg_catalog.current_setting('app.current_org_id', true) AS cur_org`. If residual context is detected or cleanup throws, the connection is marked uncertain and destroyed via `client.release(true)`.
+  - On confirmed rollback, the clean idle connection is returned to the pool after session cleanup.
   - On uncertain connection state (unhandled commit failure, failed rollback, or unconfirmed outcome), the connection is destroyed via `client.release(true)`.
   - **Residual Limitations:** Custom GUCs provide application context, not cryptographic tokens (§12.6). A process compromised by arbitrary code execution could manipulate memory or execute queries directly; defense-in-depth requires strict input parameterization and application sandbox isolation.
 
