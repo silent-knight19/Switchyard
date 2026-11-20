@@ -1,5 +1,5 @@
 -- 0008-financial-integrity.sql
--- Financial immutability, append-only adjustments, and monetary bounds (Architecture v1.2 §§5.1–5.3, 6.2–6.4, 7.1, 7.8–7.9, 8.5, 11.7–11.10, 12.1–12.4).
+-- Financial immutability, append-only adjustments, and monetary integrity (Architecture v1.2 §§5.1–5.3, 6.2–6.4, 7.1, 7.8–7.9, 8.5, 11.7–11.10, 12.1–12.4).
 --
 -- Hardens the financial schema established in 0007:
 --   1. Immutable UTC billing periods and identity fields on gateway_requests and provider_attempts.
@@ -7,7 +7,9 @@
 --   3. Immutable terminal base costs, status regressions, and identity reattribution on provider_attempts.
 --   4. Append-only enforcement on provider_cost_adjustments: blocks UPDATE, DELETE, and TRUNCATE.
 --   5. Verifies parent attempt is terminal (settled or interrupted) before cost adjustments can be inserted.
---   6. V1 monetary bounds ($1 billion / 10^15 microdollars, Architecture §5.2 #3).
+--   6. Monetary integrity: nonnegative bounds and BIGINT representability preserved from 0007;
+--      PostgreSQL as canonical financial ledger (§5.2 #6) preserves authoritative cost records
+--      including overspend (§5.2 #9) without artificial individual-attempt caps.
 --
 -- Security posture:
 --   * Functions created in app_private, owned by gateway_owner.
@@ -22,24 +24,7 @@ ALTER TABLE gateway_requests
   ADD CONSTRAINT chk_gateway_requests_billing_period
   CHECK (billing_period = to_char(admitted_at AT TIME ZONE 'UTC', 'YYYY-MM'));
 
--- 2. V1 Monetary bounds on provider_attempts (Architecture §5.2 #3)
--- Capped at 1,000,000,000,000,000 microdollars ($1 billion).
-ALTER TABLE provider_attempts
-  ADD CONSTRAINT chk_provider_attempts_monetary_bounds
-  CHECK (
-    estimated_cost_microdollars <= 1000000000000000 AND
-    (actual_cost_microdollars IS NULL OR actual_cost_microdollars <= 1000000000000000)
-  );
-
--- 3. V1 Monetary bounds on provider_cost_adjustments (Architecture §5.2 #3)
-ALTER TABLE provider_cost_adjustments
-  ADD CONSTRAINT chk_provider_cost_adjustments_bounds
-  CHECK (
-    previous_cost_microdollars <= 1000000000000000 AND
-    corrected_cost_microdollars <= 1000000000000000
-  );
-
--- 4. Trigger Function: enforce gateway_requests immutability
+-- 2. Trigger Function: enforce gateway_requests immutability
 CREATE OR REPLACE FUNCTION app_private.enforce_gateway_requests_immutability()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -106,7 +91,7 @@ CREATE TRIGGER trg_gateway_requests_immutability
   FOR EACH ROW
   EXECUTE FUNCTION app_private.enforce_gateway_requests_immutability();
 
--- 5. Trigger Function: enforce provider_attempts immutability and valid settlement transitions
+-- 3. Trigger Function: enforce provider_attempts immutability and valid settlement transitions
 CREATE OR REPLACE FUNCTION app_private.enforce_provider_attempts_immutability()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -208,7 +193,7 @@ CREATE TRIGGER trg_provider_attempts_immutability
   FOR EACH ROW
   EXECUTE FUNCTION app_private.enforce_provider_attempts_immutability();
 
--- 6. Trigger Function: enforce provider_cost_adjustments append-only on UPDATE and DELETE
+-- 4. Trigger Function: enforce provider_cost_adjustments append-only on UPDATE and DELETE
 CREATE OR REPLACE FUNCTION app_private.enforce_provider_cost_adjustments_immutability()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -230,7 +215,7 @@ CREATE TRIGGER trg_provider_cost_adjustments_no_update_delete
   FOR EACH ROW
   EXECUTE FUNCTION app_private.enforce_provider_cost_adjustments_immutability();
 
--- 7. Trigger Function: enforce provider_cost_adjustments append-only on TRUNCATE
+-- 5. Trigger Function: enforce provider_cost_adjustments append-only on TRUNCATE
 CREATE OR REPLACE FUNCTION app_private.enforce_provider_cost_adjustments_truncate()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -252,7 +237,7 @@ CREATE TRIGGER trg_provider_cost_adjustments_no_truncate
   FOR EACH STATEMENT
   EXECUTE FUNCTION app_private.enforce_provider_cost_adjustments_truncate();
 
--- 8. Trigger Function: verify parent attempt is terminal on adjustment INSERT
+-- 6. Trigger Function: verify parent attempt is terminal on adjustment INSERT
 CREATE OR REPLACE FUNCTION app_private.enforce_provider_cost_adjustments_insert()
 RETURNS trigger
 LANGUAGE plpgsql

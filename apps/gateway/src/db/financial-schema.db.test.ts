@@ -27,6 +27,7 @@ const VIRTUAL_KEY_A_ID = '66666666-6666-4666-8666-666666666667';
 const VIRTUAL_KEY_A2_ID = '66666666-6666-4666-8666-666666666668';
 const VIRTUAL_KEY_B_ID = '77777777-7777-4777-8777-777777777779';
 const GATEWAY_INSTANCE_ID = '88888888-8888-4888-8888-888888888888';
+const ADMITTED_NOV_2026 = '2026-11-15T12:00:00.000Z';
 
 type ColumnInfo = {
   column_name: string;
@@ -536,10 +537,10 @@ describe('SW-1.3.3 financial and observability schema: constraints, FKs, generat
       const { rowCount } = await pool.query(
         `INSERT INTO gateway_requests
            (request_id, org_id, virtual_key_id, gateway_instance_id, gateway_epoch, requested_model,
-            billing_period, status, cache_status, deadline_at)
+            billing_period, status, cache_status, admitted_at, deadline_at)
          VALUES
-           ($1, $2, $3, $4, 1, 'gpt-4o', '2026-11', 'in_progress', 'miss', clock_timestamp() + interval '30 seconds')`,
-        [REQUEST_ID, ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID],
+           ($1, $2, $3, $4, 1, 'gpt-4o', '2026-11', 'in_progress', 'miss', $5, $5::timestamptz + interval '30 seconds')`,
+        [REQUEST_ID, ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID, ADMITTED_NOV_2026],
       );
       expect(rowCount).toBe(1);
 
@@ -713,10 +714,10 @@ describe('SW-1.3.3 financial and observability schema: constraints, FKs, generat
       await pool.query(
         `INSERT INTO gateway_requests
            (request_id, org_id, virtual_key_id, gateway_instance_id, gateway_epoch, requested_model,
-            billing_period, status, cache_status, deadline_at)
+            billing_period, status, cache_status, admitted_at, deadline_at)
          VALUES
-           ($1, $2, $3, $4, 1, 'gpt-4o', '2026-11', 'completed', 'miss', clock_timestamp())`,
-        [reqZero, ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID],
+           ($1, $2, $3, $4, 1, 'gpt-4o', '2026-11', 'completed', 'miss', $5, $5::timestamptz + interval '30 seconds')`,
+        [reqZero, ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID, ADMITTED_NOV_2026],
       );
 
       const { rowCount } = await pool.query(
@@ -790,10 +791,10 @@ describe('SW-1.3.3 financial and observability schema: constraints, FKs, generat
       await pool.query(
         `INSERT INTO gateway_requests
            (request_id, org_id, virtual_key_id, gateway_instance_id, gateway_epoch, requested_model,
-            billing_period, status, cache_status, deadline_at)
+            billing_period, status, cache_status, admitted_at, deadline_at)
          VALUES
-           ($1, $2, $3, $4, 1, 'gpt-4o', '2026-11', 'in_progress', 'miss', clock_timestamp())`,
-        [reqKey2, ORG_A, VIRTUAL_KEY_A2_ID, GATEWAY_INSTANCE_ID],
+           ($1, $2, $3, $4, 1, 'gpt-4o', '2026-11', 'in_progress', 'miss', $5, $5::timestamptz + interval '30 seconds')`,
+        [reqKey2, ORG_A, VIRTUAL_KEY_A2_ID, GATEWAY_INSTANCE_ID, ADMITTED_NOV_2026],
       );
 
       // Attempt matching Org A and second virtual key
@@ -820,10 +821,10 @@ describe('SW-1.3.3 financial and observability schema: constraints, FKs, generat
         pool.query(
           `INSERT INTO gateway_requests
              (request_id, org_id, virtual_key_id, gateway_instance_id, gateway_epoch, requested_model,
-              billing_period, status, cache_status, deadline_at)
+              billing_period, status, cache_status, admitted_at, deadline_at)
            VALUES
-             ('11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa', $1, $2, $3, 1, 'gpt-4o', '2026-11', 'in_progress', 'miss', clock_timestamp())`,
-          [ORG_A, VIRTUAL_KEY_B_ID, GATEWAY_INSTANCE_ID], // Org A with Virtual Key of Org B
+             ('11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa', $1, $2, $3, 1, 'gpt-4o', '2026-11', 'in_progress', 'miss', $4, $4::timestamptz + interval '30 seconds')`,
+          [ORG_A, VIRTUAL_KEY_B_ID, GATEWAY_INSTANCE_ID, ADMITTED_NOV_2026], // Org A with Virtual Key of Org B
         ),
         '23503',
       );
@@ -880,10 +881,10 @@ describe('SW-1.3.3 financial and observability schema: constraints, FKs, generat
       await pool.query(
         `INSERT INTO gateway_requests
            (request_id, org_id, virtual_key_id, gateway_instance_id, gateway_epoch, requested_model,
-            billing_period, status, cache_status, deadline_at)
+            billing_period, status, cache_status, admitted_at, deadline_at)
          VALUES
-           ($1, $2, $3, $4, 1, 'gpt-4o', '2026-11', 'in_progress', 'miss', clock_timestamp())`,
-        [reqCross, ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID],
+           ($1, $2, $3, $4, 1, 'gpt-4o', '2026-11', 'in_progress', 'miss', $5, $5::timestamptz + interval '30 seconds')`,
+        [reqCross, ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID, ADMITTED_NOV_2026],
       );
 
       await expectSqlState(
@@ -1032,10 +1033,10 @@ describe('SW-1.3.3 financial and observability schema: constraints, FKs, generat
           pool.query(
             `INSERT INTO gateway_requests
                (request_id, org_id, virtual_key_id, gateway_instance_id, gateway_epoch, requested_model,
-                billing_period, status, cache_status, deadline_at)
+                billing_period, status, cache_status, admitted_at, deadline_at)
              VALUES
-               (gen_random_uuid(), $1, $2, $3, 1, 'gpt-4o', $4, 'in_progress', 'miss', clock_timestamp())`,
-            [ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID, badPeriod],
+               (gen_random_uuid(), $1, $2, $3, 1, 'gpt-4o', $4, 'in_progress', 'miss', $5, $5::timestamptz + interval '30 seconds')`,
+            [ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID, badPeriod, ADMITTED_NOV_2026],
           ),
           '23514',
         );
@@ -1047,10 +1048,10 @@ describe('SW-1.3.3 financial and observability schema: constraints, FKs, generat
         pool.query(
           `INSERT INTO gateway_requests
              (request_id, org_id, virtual_key_id, gateway_instance_id, gateway_epoch, requested_model,
-              billing_period, status, cache_status, deadline_at)
+              billing_period, status, cache_status, admitted_at, deadline_at)
            VALUES
-             (gen_random_uuid(), $1, $2, $3, 1, 'gpt-4o', '2026-11', 'pending', 'miss', clock_timestamp())`,
-          [ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID],
+             (gen_random_uuid(), $1, $2, $3, 1, 'gpt-4o', '2026-11', 'pending', 'miss', $4, $4::timestamptz + interval '30 seconds')`,
+          [ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID, ADMITTED_NOV_2026],
         ),
         '23514',
       );
@@ -1061,10 +1062,10 @@ describe('SW-1.3.3 financial and observability schema: constraints, FKs, generat
         pool.query(
           `INSERT INTO gateway_requests
              (request_id, org_id, virtual_key_id, gateway_instance_id, gateway_epoch, requested_model,
-              billing_period, status, cache_status, deadline_at)
+              billing_period, status, cache_status, admitted_at, deadline_at)
            VALUES
-             (gen_random_uuid(), $1, $2, $3, 1, 'gpt-4o', '2026-11', 'in_progress', 'hit', clock_timestamp())`,
-          [ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID],
+             (gen_random_uuid(), $1, $2, $3, 1, 'gpt-4o', '2026-11', 'in_progress', 'hit', $4, $4::timestamptz + interval '30 seconds')`,
+          [ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID, ADMITTED_NOV_2026],
         ),
         '23514',
       );
@@ -1076,10 +1077,10 @@ describe('SW-1.3.3 financial and observability schema: constraints, FKs, generat
         pool.query(
           `INSERT INTO gateway_requests
              (request_id, org_id, virtual_key_id, gateway_instance_id, gateway_epoch, requested_model,
-              billing_period, status, cache_status, deadline_at, attempt_count)
+              billing_period, status, cache_status, admitted_at, deadline_at, attempt_count)
            VALUES
-             (gen_random_uuid(), $1, $2, $3, 1, 'gpt-4o', '2026-11', 'in_progress', 'miss', clock_timestamp(), -1)`,
-          [ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID],
+             (gen_random_uuid(), $1, $2, $3, 1, 'gpt-4o', '2026-11', 'in_progress', 'miss', $4, $4::timestamptz + interval '30 seconds', -1)`,
+          [ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID, ADMITTED_NOV_2026],
         ),
         '23514',
       );
@@ -1089,10 +1090,10 @@ describe('SW-1.3.3 financial and observability schema: constraints, FKs, generat
         pool.query(
           `INSERT INTO gateway_requests
              (request_id, org_id, virtual_key_id, gateway_instance_id, gateway_epoch, requested_model,
-              billing_period, status, cache_status, deadline_at, ttft_ms)
+              billing_period, status, cache_status, admitted_at, deadline_at, ttft_ms)
            VALUES
-             (gen_random_uuid(), $1, $2, $3, 1, 'gpt-4o', '2026-11', 'in_progress', 'miss', clock_timestamp(), -1)`,
-          [ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID],
+             (gen_random_uuid(), $1, $2, $3, 1, 'gpt-4o', '2026-11', 'in_progress', 'miss', $4, $4::timestamptz + interval '30 seconds', -1)`,
+          [ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID, ADMITTED_NOV_2026],
         ),
         '23514',
       );
@@ -1102,10 +1103,10 @@ describe('SW-1.3.3 financial and observability schema: constraints, FKs, generat
         pool.query(
           `INSERT INTO gateway_requests
              (request_id, org_id, virtual_key_id, gateway_instance_id, gateway_epoch, requested_model,
-              billing_period, status, cache_status, deadline_at, http_status)
+              billing_period, status, cache_status, admitted_at, deadline_at, http_status)
            VALUES
-             (gen_random_uuid(), $1, $2, $3, 1, 'gpt-4o', '2026-11', 'in_progress', 'miss', clock_timestamp(), 99)`,
-          [ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID],
+             (gen_random_uuid(), $1, $2, $3, 1, 'gpt-4o', '2026-11', 'in_progress', 'miss', $4, $4::timestamptz + interval '30 seconds', 99)`,
+          [ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID, ADMITTED_NOV_2026],
         ),
         '23514',
       );
@@ -1283,10 +1284,10 @@ describe('SW-1.3.3 financial and observability schema: constraints, FKs, generat
       await pool.query(
         `INSERT INTO gateway_requests
            (request_id, org_id, virtual_key_id, gateway_instance_id, gateway_epoch, requested_model,
-            billing_period, status, cache_status, deadline_at)
+            billing_period, status, cache_status, admitted_at, deadline_at)
          VALUES
-           ($1, $2, $3, $4, 1, 'gpt-4o', '2026-11', 'completed', 'exact_hit', clock_timestamp())`,
-        [reqCascade, ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID],
+           ($1, $2, $3, $4, 1, 'gpt-4o', '2026-11', 'completed', 'exact_hit', $5, $5::timestamptz + interval '30 seconds')`,
+        [reqCascade, ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID, ADMITTED_NOV_2026],
       );
 
       await pool.query(
@@ -1364,10 +1365,10 @@ describe('SW-1.3.3 financial and observability schema: constraints, FKs, generat
           client.query(
             `INSERT INTO gateway_requests
                (request_id, org_id, virtual_key_id, gateway_instance_id, gateway_epoch, requested_model,
-                billing_period, status, cache_status, deadline_at)
+                billing_period, status, cache_status, admitted_at, deadline_at)
              VALUES
-               (gen_random_uuid(), $1, $2, $3, 1, 'gpt-4o', '2026-11', 'in_progress', 'miss', clock_timestamp())`,
-            [ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID],
+               (gen_random_uuid(), $1, $2, $3, 1, 'gpt-4o', '2026-11', 'in_progress', 'miss', $4, $4::timestamptz + interval '30 seconds')`,
+            [ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID, ADMITTED_NOV_2026],
           ),
           '42501',
         );

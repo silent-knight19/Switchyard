@@ -303,12 +303,18 @@ migration `0008-financial-integrity.sql` hardens the financial ledger:
 - **Append-Only Cost Adjustments:** `provider_cost_adjustments` rejects all `UPDATE`, `DELETE`, and
   `TRUNCATE` operations via database triggers. Inserting an adjustment targeting an active `reserved`
   attempt is rejected (`23514`); adjustments require a terminal attempt.
-- **Monetary Bounds:** Caps single-attempt estimated/actual costs and adjustment amounts at
-  `1,000,000,000,000,000` microdollars ($1 billion) per Architecture v1.2 §5.2 #3.
-- **Database vs Service Boundaries:** While the database guarantees row-level immutability, append-only
-  history, and parent-child period/attribution integrity, atomic cross-store adjustment orchestration
-  (locking organization/period, validating previous canonical cost across stores, and applying Redis
-  Lua deltas) is deferred to the financial service layer in Phase 2+.
+- **Monetary Integrity & Authoritative Accounting (DB-22):** Architecture v1.2 §5.2 #3 applies
+  the \$1 billion (`1,000,000,000,000,000` microdollars) bound to organization monthly budgets and Redis
+  intermediate counters. In PostgreSQL, individual attempts and adjustments are not subject to an artificial
+  \$1B cap; PostgreSQL is the canonical financial ledger (§5.2 #6) and must faithfully record actual costs
+  and overspend (§5.2 #9) representable in BIGINT (`0 <= cost <= 9,223,372,036,854,775,807`) while strictly
+  enforcing nonnegative bounds and integer-only arithmetic. Redis rejects or closes admission when
+  intermediate balances exceed safe bounds; PostgreSQL never discards legitimate authoritative billing evidence.
+- **Database vs Service Concurrency Boundaries (DB-24):** Database tests attest to PostgreSQL-level
+  row immutability, check constraints, append-only triggers, and migration advisory lock serialization.
+  Complete cross-store financial adjustment transaction serialization (locking organization/period scope,
+  verifying prior canonical cost across stores, and applying Redis Lua deltas) is deferred to the
+  financial service layer in Phase 2+.
 - **RLS Default-Deny Posture:** RLS remains enabled and forced with zero permissive policies; runtime
   roles hold zero table privileges until Subphase 1.4.
 

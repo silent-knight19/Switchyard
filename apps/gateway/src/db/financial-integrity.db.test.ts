@@ -20,9 +20,6 @@ const VIRTUAL_KEY_A_ID = '66666666-6666-4666-8666-666666666667';
 const VIRTUAL_KEY_B_ID = '77777777-7777-4777-8777-777777777779';
 const GATEWAY_INSTANCE_ID = '88888888-8888-4888-8888-888888888888';
 
-const V1_MONETARY_CAP = '1000000000000000'; // 10^15 microdollars ($1 billion)
-const ABOVE_V1_CAP = '1000000000000001';
-
 async function expectSqlState(promise: Promise<unknown>, expectedState: string): Promise<void> {
   try {
     await promise;
@@ -199,7 +196,7 @@ describe('SW-1.3.4 Financial Immutability, Append-Only Adjustments, and Monetary
       );
     });
 
-    it('verifies check constraints installed on financial tables', async () => {
+    it('verifies admission-time check constraint installed and universal monetary caps avoided (DB-22)', async () => {
       const { rows } = await pool.query<{
         conname: string;
         relname: string;
@@ -216,8 +213,9 @@ describe('SW-1.3.4 Financial Immutability, Append-Only Adjustments, and Monetary
 
       const found = new Map(rows.map((r) => [r.conname, r.relname]));
       expect(found.get('chk_gateway_requests_billing_period')).toBe('gateway_requests');
-      expect(found.get('chk_provider_attempts_monetary_bounds')).toBe('provider_attempts');
-      expect(found.get('chk_provider_cost_adjustments_bounds')).toBe('provider_cost_adjustments');
+      // DB-22: Universal 10^15 caps must NOT be applied to individual attempts or adjustments
+      expect(found.has('chk_provider_attempts_monetary_bounds')).toBe(false);
+      expect(found.has('chk_provider_cost_adjustments_bounds')).toBe(false);
     });
 
     it('verifies zero execute privileges granted to PUBLIC on trigger functions', async () => {
@@ -390,6 +388,116 @@ describe('SW-1.3.4 Financial Immutability, Append-Only Adjustments, and Monetary
         ),
         '23514',
       );
+    });
+
+    it('allows fixed December UTC admission with matching December billing period (DB-23)', async () => {
+      const reqId = 'a0000001-0000-4000-8000-00000000000d';
+      const admittedAt = '2026-12-15T10:00:00.000Z'; // December UTC
+
+      const { rowCount } = await pool.query(
+        `INSERT INTO gateway_requests
+           (request_id, org_id, virtual_key_id, gateway_instance_id, gateway_epoch, requested_model,
+            billing_period, status, cache_status, admitted_at, deadline_at)
+         VALUES
+           ($1, $2, $3, $4, 1, 'gpt-4o', '2026-12', 'in_progress', 'miss', $5, $5::timestamptz + interval '30s')`,
+        [reqId, ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID, admittedAt],
+      );
+      expect(rowCount).toBe(1);
+
+      const { rows } = await pool.query<{ billing_period: string }>(
+        'SELECT billing_period FROM gateway_requests WHERE request_id = $1',
+        [reqId],
+      );
+      expect(rows[0]?.billing_period).toBe('2026-12');
+    });
+
+    it('rejects insertion of gateway_requests where December UTC admission has November billing period (23514)', async () => {
+      const reqId = 'a0000001-0000-4000-8000-00000000000e';
+      const admittedAt = '2026-12-05T10:00:00.000Z'; // December UTC
+
+      await expectSqlState(
+        pool.query(
+          `INSERT INTO gateway_requests
+             (request_id, org_id, virtual_key_id, gateway_instance_id, gateway_epoch, requested_model,
+              billing_period, status, cache_status, admitted_at, deadline_at)
+           VALUES
+             ($1, $2, $3, $4, 1, 'gpt-4o', '2026-11', 'in_progress', 'miss', $5, $5::timestamptz + interval '30s')`,
+          [reqId, ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID, admittedAt],
+        ),
+        '23514',
+      );
+    });
+
+    it('enforces UTC billing period consistency across diverse session time zones (Asia/Kolkata, America/New_York) (DB-23)', async () => {
+      const client = await pool.connect();
+      try {
+        // 1. Session in Asia/Kolkata (+05:30)
+        await client.query("SET LOCAL TimeZone = 'Asia/Kolkata'");
+
+        // 2026-11-30 23:30:00 UTC is 2026-12-01 05:00:00 in Kolkata.
+        // But its UTC month is strictly November ('2026-11').
+        const reqKolkataOk = 'a0000001-0000-4000-8000-0000000000b1';
+        const admittedNovUtc = '2026-11-30T23:30:00.000Z';
+
+        const okResult = await client.query(
+          `INSERT INTO gateway_requests
+             (request_id, org_id, virtual_key_id, gateway_instance_id, gateway_epoch, requested_model,
+              billing_period, status, cache_status, admitted_at, deadline_at)
+           VALUES
+             ($1, $2, $3, $4, 1, 'gpt-4o', '2026-11', 'in_progress', 'miss', $5, $5::timestamptz + interval '30s')`,
+          [reqKolkataOk, ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID, admittedNovUtc],
+        );
+        expect(okResult.rowCount).toBe(1);
+
+        // Mismatched December period fails even though Kolkata local date is December 1
+        const reqKolkataFail = 'a0000001-0000-4000-8000-0000000000b2';
+        await expectSqlState(
+          client.query(
+            `INSERT INTO gateway_requests
+               (request_id, org_id, virtual_key_id, gateway_instance_id, gateway_epoch, requested_model,
+                billing_period, status, cache_status, admitted_at, deadline_at)
+             VALUES
+               ($1, $2, $3, $4, 1, 'gpt-4o', '2026-12', 'in_progress', 'miss', $5, $5::timestamptz + interval '30s')`,
+            [reqKolkataFail, ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID, admittedNovUtc],
+          ),
+          '23514',
+        );
+
+        // 2. Session in America/New_York (-05:00)
+        await client.query("SET LOCAL TimeZone = 'America/New_York'");
+
+        // 2026-12-01 02:00:00 UTC is 2026-11-30 21:00:00 in New York.
+        // But its UTC month is strictly December ('2026-12').
+        const reqNyOk = 'a0000001-0000-4000-8000-0000000000c1';
+        const admittedDecUtc = '2026-12-01T02:00:00.000Z';
+
+        const okNyResult = await client.query(
+          `INSERT INTO gateway_requests
+             (request_id, org_id, virtual_key_id, gateway_instance_id, gateway_epoch, requested_model,
+              billing_period, status, cache_status, admitted_at, deadline_at)
+           VALUES
+             ($1, $2, $3, $4, 1, 'gpt-4o', '2026-12', 'in_progress', 'miss', $5, $5::timestamptz + interval '30s')`,
+          [reqNyOk, ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID, admittedDecUtc],
+        );
+        expect(okNyResult.rowCount).toBe(1);
+
+        // Mismatched November period fails even though New York local date is November 30
+        const reqNyFail = 'a0000001-0000-4000-8000-0000000000c2';
+        await expectSqlState(
+          client.query(
+            `INSERT INTO gateway_requests
+               (request_id, org_id, virtual_key_id, gateway_instance_id, gateway_epoch, requested_model,
+                billing_period, status, cache_status, admitted_at, deadline_at)
+             VALUES
+               ($1, $2, $3, $4, 1, 'gpt-4o', '2026-11', 'in_progress', 'miss', $5, $5::timestamptz + interval '30s')`,
+            [reqNyFail, ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID, admittedDecUtc],
+          ),
+          '23514',
+        );
+      } finally {
+        await client.query('RESET TimeZone').catch(() => undefined);
+        client.release();
+      }
     });
 
     it('preserves November billing period for month-boundary request finalized in December', async () => {
@@ -1048,36 +1156,157 @@ describe('SW-1.3.4 Financial Immutability, Append-Only Adjustments, and Monetary
       );
     });
 
-    it('allows boundary value 10^15 ($1 billion) for estimated and actual costs', async () => {
-      const bAttempt = 'd0000002-0000-4000-8000-000000000002';
+    it('allows reserved attempt with valid estimate inside Redis reservation domain (DB-22 positive)', async () => {
+      const resAttempt = 'd0000002-0000-4000-8000-000000000002';
+      const { rowCount } = await pool.query(
+        `INSERT INTO provider_attempts
+           (attempt_id, request_id, org_id, virtual_key_id, attempt_number, gateway_instance_id,
+            gateway_epoch, billing_period, provider, model, status, estimated_cost_microdollars,
+            cost_status, admitted_at, hard_deadline_at)
+         VALUES
+           ($1, $2, $3, $4, 2, $5, 1, '2026-11', 'openai', 'gpt-4o', 'reserved', 5000,
+            'estimated', $6, $6::timestamptz + interval '60s')`,
+        [resAttempt, parentReqId, ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID, admittedAt],
+      );
+      expect(rowCount).toBe(1);
+
+      const { rows } = await pool.query<{ effective: string; status: string; cost_status: string }>(
+        'SELECT effective_cost_microdollars::text AS effective, status, cost_status FROM provider_attempts WHERE attempt_id = $1',
+        [resAttempt],
+      );
+      expect(rows[0]?.effective).toBe('5000');
+      expect(rows[0]?.status).toBe('reserved');
+      expect(rows[0]?.cost_status).toBe('estimated');
+    });
+
+    it('allows terminal confirmed attempt with actual cost of 10^15 + 1 (DB-22 positive: authoritative financial fact)', async () => {
+      const overAttempt = 'd0000002-0000-4000-8000-000000000003';
+      const actualAbove10_15 = '1000000000000001'; // 10^15 + 1 microdollars
+
+      const { rowCount } = await pool.query(
+        `INSERT INTO provider_attempts
+           (attempt_id, request_id, org_id, virtual_key_id, attempt_number, gateway_instance_id,
+            gateway_epoch, billing_period, provider, model, status, estimated_cost_microdollars,
+            actual_cost_microdollars, cost_status, admitted_at, hard_deadline_at, settled_at)
+         VALUES
+           ($1, $2, $3, $4, 3, $5, 1, '2026-11', 'openai', 'gpt-4o', 'settled', 10000,
+            $6, 'confirmed', $7, $7::timestamptz + interval '60s', clock_timestamp())`,
+        [
+          overAttempt,
+          parentReqId,
+          ORG_A,
+          VIRTUAL_KEY_A_ID,
+          GATEWAY_INSTANCE_ID,
+          actualAbove10_15,
+          admittedAt,
+        ],
+      );
+      expect(rowCount).toBe(1);
+
+      const { rows } = await pool.query<{ actual: string; effective: string }>(
+        `SELECT actual_cost_microdollars::text AS actual,
+                effective_cost_microdollars::text AS effective
+         FROM provider_attempts WHERE attempt_id = $1`,
+        [overAttempt],
+      );
+      expect(rows[0]?.actual).toBe(actualAbove10_15);
+      expect(rows[0]?.effective).toBe(actualAbove10_15);
+    });
+
+    it('allows adjustments changing canonical cost from below to above 10^15, and reducing it again (DB-22 positive)', async () => {
+      const scaleAttempt = 'd0000002-0000-4000-8000-000000000004';
+      const baseCost = '900000000000000'; // 9 * 10^14 (< 10^15)
+
       await pool.query(
         `INSERT INTO provider_attempts
            (attempt_id, request_id, org_id, virtual_key_id, attempt_number, gateway_instance_id,
             gateway_epoch, billing_period, provider, model, status, estimated_cost_microdollars,
             actual_cost_microdollars, cost_status, admitted_at, hard_deadline_at, settled_at)
          VALUES
-           ($1, $2, $3, $4, 2, $5, 1, '2026-11', 'openai', 'gpt-4o', 'settled', $6,
+           ($1, $2, $3, $4, 4, $5, 1, '2026-11', 'openai', 'gpt-4o', 'settled', 5000,
             $6, 'confirmed', $7, $7::timestamptz + interval '60s', clock_timestamp())`,
         [
-          bAttempt,
+          scaleAttempt,
           parentReqId,
           ORG_A,
           VIRTUAL_KEY_A_ID,
           GATEWAY_INSTANCE_ID,
-          V1_MONETARY_CAP,
+          baseCost,
           admittedAt,
         ],
       );
 
-      const { rows } = await pool.query<{ effective: string }>(
-        'SELECT effective_cost_microdollars::text AS effective FROM provider_attempts WHERE attempt_id = $1',
-        [bAttempt],
+      // Adjustment 1: raises canonical cost from 9*10^14 to 1.1*10^15 (> 10^15) with delta +2*10^14
+      const adjAbove = 'd0000003-0000-4000-8000-0000000000a1';
+      await pool.query(
+        `INSERT INTO provider_cost_adjustments
+           (adjustment_id, attempt_id, org_id, previous_cost_microdollars, corrected_cost_microdollars,
+            delta_microdollars, source, source_reference)
+         VALUES
+           ($1, $2, $3, 900000000000000, 1100000000000000, 200000000000000, 'provider_invoice', 'ref_up')`,
+        [adjAbove, scaleAttempt, ORG_A],
       );
-      expect(rows[0]?.effective).toBe(V1_MONETARY_CAP);
+
+      const { rows: r1 } = await pool.query<{ canonical: string }>(
+        `SELECT (pa.effective_cost_microdollars + COALESCE(SUM(pca.delta_microdollars), 0))::bigint::text AS canonical
+         FROM provider_attempts pa
+         LEFT JOIN provider_cost_adjustments pca ON pca.attempt_id = pa.attempt_id AND pca.org_id = pa.org_id
+         WHERE pa.attempt_id = $1
+         GROUP BY pa.attempt_id, pa.effective_cost_microdollars`,
+        [scaleAttempt],
+      );
+      expect(r1[0]?.canonical).toBe('1100000000000000');
+
+      // Adjustment 2: reduces canonical cost from 1.1*10^15 to 9.5*10^14 (< 10^15) with delta -1.5*10^14
+      const adjReduce = 'd0000003-0000-4000-8000-0000000000a2';
+      await pool.query(
+        `INSERT INTO provider_cost_adjustments
+           (adjustment_id, attempt_id, org_id, previous_cost_microdollars, corrected_cost_microdollars,
+            delta_microdollars, source, source_reference)
+         VALUES
+           ($1, $2, $3, 1100000000000000, 950000000000000, -150000000000000, 'provider_invoice', 'ref_down')`,
+        [adjReduce, scaleAttempt, ORG_A],
+      );
+
+      const { rows: r2 } = await pool.query<{ canonical: string }>(
+        `SELECT (pa.effective_cost_microdollars + COALESCE(SUM(pca.delta_microdollars), 0))::bigint::text AS canonical
+         FROM provider_attempts pa
+         LEFT JOIN provider_cost_adjustments pca ON pca.attempt_id = pa.attempt_id AND pca.org_id = pa.org_id
+         WHERE pa.attempt_id = $1
+         GROUP BY pa.attempt_id, pa.effective_cost_microdollars`,
+        [scaleAttempt],
+      );
+      expect(r2[0]?.canonical).toBe('950000000000000');
     });
 
-    it('rejects attempt costs above 10^15 (23514)', async () => {
-      const overAttempt = 'd0000002-0000-4000-8000-000000000003';
+    it('allows valid confirmed zero cost (DB-22 positive)', async () => {
+      const zeroAttempt = 'd0000002-0000-4000-8000-000000000005';
+      const { rowCount } = await pool.query(
+        `INSERT INTO provider_attempts
+           (attempt_id, request_id, org_id, virtual_key_id, attempt_number, gateway_instance_id,
+            gateway_epoch, billing_period, provider, model, status, estimated_cost_microdollars,
+            actual_cost_microdollars, cost_status, admitted_at, hard_deadline_at, settled_at)
+         VALUES
+           ($1, $2, $3, $4, 5, $5, 1, '2026-11', 'openai', 'gpt-4o', 'settled', 1000,
+            0, 'confirmed', $6, $6::timestamptz + interval '60s', clock_timestamp())`,
+        [zeroAttempt, parentReqId, ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID, admittedAt],
+      );
+      expect(rowCount).toBe(1);
+
+      const { rows } = await pool.query<{ actual: string; effective: string }>(
+        `SELECT actual_cost_microdollars::text AS actual,
+                effective_cost_microdollars::text AS effective
+         FROM provider_attempts WHERE attempt_id = $1`,
+        [zeroAttempt],
+      );
+      expect(rows[0]?.actual).toBe('0');
+      expect(rows[0]?.effective).toBe('0');
+    });
+
+    it('rejects negative estimated cost and negative actual cost on provider_attempts (23514) (DB-22 negative)', async () => {
+      const badAttempt = 'd0000002-0000-4000-8000-000000000006';
+
+      // Negative estimated cost
       await expectSqlState(
         pool.query(
           `INSERT INTO provider_attempts
@@ -1085,52 +1314,31 @@ describe('SW-1.3.4 Financial Immutability, Append-Only Adjustments, and Monetary
               gateway_epoch, billing_period, provider, model, status, estimated_cost_microdollars,
               cost_status, admitted_at, hard_deadline_at)
            VALUES
-             ($1, $2, $3, $4, 3, $5, 1, '2026-11', 'openai', 'gpt-4o', 'reserved', $6,
-              'estimated', $7, $7::timestamptz + interval '60s')`,
-          [
-            overAttempt,
-            parentReqId,
-            ORG_A,
-            VIRTUAL_KEY_A_ID,
-            GATEWAY_INSTANCE_ID,
-            ABOVE_V1_CAP,
-            admittedAt,
-          ],
+             ($1, $2, $3, $4, 6, $5, 1, '2026-11', 'openai', 'gpt-4o', 'reserved', -100,
+              'estimated', $6, $6::timestamptz + interval '60s')`,
+          [badAttempt, parentReqId, ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID, admittedAt],
+        ),
+        '23514',
+      );
+
+      // Negative actual cost
+      await expectSqlState(
+        pool.query(
+          `INSERT INTO provider_attempts
+             (attempt_id, request_id, org_id, virtual_key_id, attempt_number, gateway_instance_id,
+              gateway_epoch, billing_period, provider, model, status, estimated_cost_microdollars,
+              actual_cost_microdollars, cost_status, admitted_at, hard_deadline_at)
+           VALUES
+             ($1, $2, $3, $4, 6, $5, 1, '2026-11', 'openai', 'gpt-4o', 'settled', 1000,
+              -50, 'confirmed', $6, $6::timestamptz + interval '60s')`,
+          [badAttempt, parentReqId, ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID, admittedAt],
         ),
         '23514',
       );
     });
 
-    it('rejects adjustment costs above 10^15 (23514)', async () => {
-      const overAdj = 'd0000003-0000-4000-8000-000000000001';
-      await expectSqlState(
-        pool.query(
-          `INSERT INTO provider_cost_adjustments
-             (adjustment_id, attempt_id, org_id, previous_cost_microdollars, corrected_cost_microdollars,
-              delta_microdollars, source, source_reference)
-           VALUES
-             ($1, $2, $3, 10000, $4, $4::bigint - 10000, 'provider_invoice', 'ref_over')`,
-          [overAdj, attemptId, ORG_A, ABOVE_V1_CAP],
-        ),
-        '23514',
-      );
-    });
-
-    it('rejects negative costs and inconsistent deltas (23514)', async () => {
-      const badAdj = 'd0000003-0000-4000-8000-000000000002';
-
-      // Inconsistent delta: delta = 500 but corrected - previous = 12000 - 10000 = 2000
-      await expectSqlState(
-        pool.query(
-          `INSERT INTO provider_cost_adjustments
-             (adjustment_id, attempt_id, org_id, previous_cost_microdollars, corrected_cost_microdollars,
-              delta_microdollars, source, source_reference)
-           VALUES
-             ($1, $2, $3, 10000, 12000, 500, 'provider_invoice', 'ref_inconsistent')`,
-          [badAdj, attemptId, ORG_A],
-        ),
-        '23514',
-      );
+    it('rejects negative previous/corrected cost and inconsistent deltas in adjustments (23514) (DB-22 negative)', async () => {
+      const badAdj = 'd0000003-0000-4000-8000-0000000000b1';
 
       // Negative previous cost
       await expectSqlState(
@@ -1139,10 +1347,87 @@ describe('SW-1.3.4 Financial Immutability, Append-Only Adjustments, and Monetary
              (adjustment_id, attempt_id, org_id, previous_cost_microdollars, corrected_cost_microdollars,
               delta_microdollars, source, source_reference)
            VALUES
-             ($1, $2, $3, -100, 1000, 1100, 'provider_invoice', 'ref_neg')`,
+             ($1, $2, $3, -100, 1000, 1100, 'provider_invoice', 'ref_neg_prev')`,
           [badAdj, attemptId, ORG_A],
         ),
         '23514',
+      );
+
+      // Negative corrected cost
+      await expectSqlState(
+        pool.query(
+          `INSERT INTO provider_cost_adjustments
+             (adjustment_id, attempt_id, org_id, previous_cost_microdollars, corrected_cost_microdollars,
+              delta_microdollars, source, source_reference)
+           VALUES
+             ($1, $2, $3, 1000, -50, -1050, 'provider_invoice', 'ref_neg_corr')`,
+          [badAdj, attemptId, ORG_A],
+        ),
+        '23514',
+      );
+
+      // Inconsistent delta: delta = 500 but corrected - previous = 12000 - 10000 = 2000
+      await expectSqlState(
+        pool.query(
+          `INSERT INTO provider_cost_adjustments
+             (adjustment_id, attempt_id, org_id, previous_cost_microdollars, corrected_cost_microdollars,
+              delta_microdollars, source, source_reference)
+           VALUES
+             ($1, $2, $3, 10000, 12000, 500, 'provider_invoice', 'ref_bad_delta')`,
+          [badAdj, attemptId, ORG_A],
+        ),
+        '23514',
+      );
+    });
+
+    it('rejects BIGINT values beyond PostgreSQL representable range (22003) (DB-22 negative)', async () => {
+      const outOfRangeAttempt = 'd0000002-0000-4000-8000-000000000007';
+      // 9223372036854775808 is 2^63, which exceeds PostgreSQL BIGINT max (9223372036854775807)
+      await expectSqlState(
+        pool.query(
+          `INSERT INTO provider_attempts
+             (attempt_id, request_id, org_id, virtual_key_id, attempt_number, gateway_instance_id,
+              gateway_epoch, billing_period, provider, model, status, estimated_cost_microdollars,
+              cost_status, admitted_at, hard_deadline_at)
+           VALUES
+             ($1, $2, $3, $4, 7, $5, 1, '2026-11', 'openai', 'gpt-4o', 'reserved', 9223372036854775808,
+              'estimated', $6, $6::timestamptz + interval '60s')`,
+          [
+            outOfRangeAttempt,
+            parentReqId,
+            ORG_A,
+            VIRTUAL_KEY_A_ID,
+            GATEWAY_INSTANCE_ID,
+            admittedAt,
+          ],
+        ),
+        '22003',
+      );
+    });
+
+    it('rejects unsupported fractional monetary representation (22P02) (DB-22 negative)', async () => {
+      const fracAttempt = 'd0000002-0000-4000-8000-000000000008';
+      // Passing floating-point/fractional string to BIGINT fails with 22P02 invalid_text_representation
+      await expectSqlState(
+        pool.query(
+          `INSERT INTO provider_attempts
+             (attempt_id, request_id, org_id, virtual_key_id, attempt_number, gateway_instance_id,
+              gateway_epoch, billing_period, provider, model, status, estimated_cost_microdollars,
+              cost_status, admitted_at, hard_deadline_at)
+           VALUES
+             ($1, $2, $3, $4, 8, $5, 1, '2026-11', 'openai', 'gpt-4o', 'reserved', $6::bigint,
+              'estimated', $7, $7::timestamptz + interval '60s')`,
+          [
+            fracAttempt,
+            parentReqId,
+            ORG_A,
+            VIRTUAL_KEY_A_ID,
+            GATEWAY_INSTANCE_ID,
+            '1000.50',
+            admittedAt,
+          ],
+        ),
+        '22P02',
       );
     });
 
@@ -1192,10 +1477,10 @@ describe('SW-1.3.4 Financial Immutability, Append-Only Adjustments, and Monetary
   });
 
   // =========================================================================
-  // Section F: Concurrency, Recovery, and Upgrades
+  // Section F: Migration Concurrency, Rollback, and Upgrade Safety (DB-24)
   // =========================================================================
-  describe('F. Concurrency, Recovery, and Upgrades', () => {
-    it('serializes concurrent migration runners and prevents double application', async () => {
+  describe('F. Migration Concurrency, Rollback, and Upgrade Safety (DB-24)', () => {
+    it('serializes concurrent migration runners via PostgreSQL advisory locking (DB-24 migration concurrency)', async () => {
       const concDb = await createDatabase('mig-concurrency');
       const migrator1 = new pg.Pool({
         connectionString: roleConnectionString(
@@ -1279,7 +1564,7 @@ describe('SW-1.3.4 Financial Immutability, Append-Only Adjustments, and Monetary
       }
     });
 
-    it('upgrades a database from 0007 to 0008 preserving existing valid financial rows', async () => {
+    it('upgrades a database from 0007 to 0008 preserving existing valid financial rows (including costs > 10^15) (DB-22 upgrade regression)', async () => {
       const upgradeDb = await createDatabase('upgrade-0007-to-0008');
       const tempDir = path.join(process.cwd(), 'temp-upgrade-test-' + Date.now());
       fs.mkdirSync(tempDir, { recursive: true });
@@ -1312,7 +1597,9 @@ describe('SW-1.3.4 Financial Immutability, Append-Only Adjustments, and Monetary
         const upReqId = 'e0000001-0000-4000-8000-000000000001';
         const upAttemptSettled = 'e0000002-0000-4000-8000-000000000001';
         const upAttemptReserved = 'e0000002-0000-4000-8000-000000000002';
+        const upAttemptOver10_15 = 'e0000002-0000-4000-8000-000000000003';
         const upAdj = 'e0000003-0000-4000-8000-000000000001';
+        const actualOver10_15 = '1000000000000001'; // 10^15 + 1
         const admittedAt = '2026-11-20T12:00:00.000Z';
 
         try {
@@ -1363,6 +1650,26 @@ describe('SW-1.3.4 Financial Immutability, Append-Only Adjustments, and Monetary
             [upAttemptReserved, upReqId, ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID, admittedAt],
           );
 
+          // Seed a terminal attempt with actual cost > 10^15 under 0007 schema
+          await seeder.query(
+            `INSERT INTO provider_attempts
+               (attempt_id, request_id, org_id, virtual_key_id, attempt_number, gateway_instance_id,
+                gateway_epoch, billing_period, provider, model, status, estimated_cost_microdollars,
+                actual_cost_microdollars, cost_status, admitted_at, hard_deadline_at, settled_at)
+             VALUES
+               ($1, $2, $3, $4, 3, $5, 1, '2026-11', 'openai', 'gpt-4o', 'settled', 10000,
+                $6, 'confirmed', $7, $7::timestamptz + interval '60s', clock_timestamp())`,
+            [
+              upAttemptOver10_15,
+              upReqId,
+              ORG_A,
+              VIRTUAL_KEY_A_ID,
+              GATEWAY_INSTANCE_ID,
+              actualOver10_15,
+              admittedAt,
+            ],
+          );
+
           await seeder.query(
             `INSERT INTO provider_cost_adjustments
                (adjustment_id, attempt_id, org_id, previous_cost_microdollars, corrected_cost_microdollars,
@@ -1401,11 +1708,30 @@ describe('SW-1.3.4 Financial Immutability, Append-Only Adjustments, and Monetary
           expect(attRows[0]?.effective).toBe('4200');
           expect(attRows[0]?.status).toBe('settled');
 
+          // Verify attempt with actual cost > 10^15 is completely intact and matches canonical cost
+          const { rows: overRows } = await verifier.query<{ actual: string; effective: string }>(
+            `SELECT actual_cost_microdollars::text AS actual,
+                    effective_cost_microdollars::text AS effective
+             FROM provider_attempts WHERE attempt_id = $1`,
+            [upAttemptOver10_15],
+          );
+          expect(overRows[0]?.actual).toBe(actualOver10_15);
+          expect(overRows[0]?.effective).toBe(actualOver10_15);
+
           // Verify that 0008 immutability triggers now protect the pre-existing settled row
           await expectSqlState(
             verifier.query(
               'UPDATE provider_attempts SET actual_cost_microdollars = 9999 WHERE attempt_id = $1',
               [upAttemptSettled],
+            ),
+            '23514',
+          );
+
+          // Verify that 0008 immutability triggers protect the row with cost > 10^15
+          await expectSqlState(
+            verifier.query(
+              'UPDATE provider_attempts SET actual_cost_microdollars = 9999 WHERE attempt_id = $1',
+              [upAttemptOver10_15],
             ),
             '23514',
           );
