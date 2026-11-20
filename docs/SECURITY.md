@@ -180,7 +180,17 @@ To allow deployment role `gateway_migrator` to install executor-owned functions 
 | :--- | :---: | :--- | :--- |
 | **Batch A: Transaction Context (SW-1.4.1)** | ACCEPTED | PR #9 (merge commit `21ae53c5b28e4eaeda33ad2658c47297fe653e49`) | `tenant.ts`, `tenant.test.ts`, `tenant-rls.db.test.ts` (32 tests) |
 | **Batch A: Tenant RLS Policies (SW-1.4.2)** | ACCEPTED | PR #9, Migration `0009-tenant-rls-policies.sql` | 9 tenant tables FORCE RLS, unified permissive policies |
-| **Batch B: Auth Functions (SW-1.4.3)** | IMPLEMENTED | Migration `0010-privileged-bootstrap-functions.sql` | Owned by `gateway_auth_executor`, hardened `search_path`, 0 rows on invalid inputs, atomic bootstrap |
-| **Batch B: Maintenance Enumerator (SW-1.4.4)**| IMPLEMENTED | Migration `0010-privileged-bootstrap-functions.sql` | Owned by `gateway_ops_executor`, UUID-only return, bounded keyset pagination |
-| **Batch B: Executor Provisioning Decision** | APPROVED | Owner-approved Option 1 (`provision-roles.sql`) | `gateway_migrator` granted `INHERIT FALSE, SET TRUE, ADMIN FALSE` |
-| **Batch B: v1 Active Org Interpretation** | APPROVED | Owner-approved v1 decision | All existing rows in `public.organizations` enumerated via keyset pagination; no column added |
+| **Batch B: Auth Functions (SW-1.4.3)** | ACCEPTED | PR #10 (merge commit `4a85c7e913291e01e6d72a4b4367b37449d1ec6e`) | Owned by `gateway_auth_executor`, hardened `search_path`, 0 rows on invalid inputs, atomic bootstrap |
+| **Batch B: Maintenance Enumerator (SW-1.4.4)**| ACCEPTED | PR #10 (merge commit `4a85c7e913291e01e6d72a4b4367b37449d1ec6e`) | Owned by `gateway_ops_executor`, UUID-only return, bounded keyset pagination |
+| **Batch B: Executor Provisioning Decision** | ACCEPTED | Owner-approved Option 1 (`provision-roles.sql`) | `gateway_migrator` granted `INHERIT FALSE, SET TRUE, ADMIN FALSE` |
+| **Batch B: v1 Active Org Interpretation** | ACCEPTED | Owner-approved v1 decision | All existing rows in `public.organizations` enumerated via keyset pagination; no column added |
+
+---
+
+## 7. Subphase 1.5 Architecture Tracking & Verification
+
+| Requirement / Task | Status | Reference | Verified Evidence |
+| :--- | :---: | :--- | :--- |
+| **Batch A: Secure Authentication (SW-1.5.1)** | IMPLEMENTED | `src/auth/service.ts`, `src/auth/password.ts`, `src/auth/email.ts`, `src/auth/rate-limiter.ts` | 128-byte password cap, real Argon2id hashing (`m=19456, t=2, p=1`), dummy verify on unknown accounts, canonical email normalization, Redis IP/account rate limits |
+| **Batch A: Server-Side Web Sessions (SW-1.5.2)** | IMPLEMENTED | `src/auth/session.ts`, Migration `0011-session-tenant-lookup.sql`, ADR 0001 | 256-bit opaque secret (`__Host-session`), SHA-256 verifier persistence, atomic rotation, idle/absolute expiry, revocation, RLS cross-tenant isolation |
+| **Batch A: Pre-Tenant Session Lookup (ADR 0001)** | IMPLEMENTED | Migration `0011-session-tenant-lookup.sql` | `app_private.lookup_session_org_by_hash(BYTEA)` owned by `gateway_auth_executor`, UUID-only return, granted strictly to `gateway_app` |

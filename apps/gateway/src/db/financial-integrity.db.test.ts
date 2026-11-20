@@ -1555,9 +1555,9 @@ describe('SW-1.3.4 Financial Immutability, Append-Only Adjustments, and Monetary
           fs.writeFileSync(path.join(tempDir, `${file.name}.sql`), file.sql, 'utf8');
         }
 
-        // Add failing migration 0011 (subsequent to all authoritative migrations)
+        // Add failing migration 0012 (subsequent to all authoritative migrations)
         fs.writeFileSync(
-          path.join(tempDir, '0011-failing-migration.sql'),
+          path.join(tempDir, '0012-failing-migration.sql'),
           'SET ROLE gateway_owner; CREATE TABLE broken_table (id int); SYNTAX_ERROR_CRASH;',
           'utf8',
         );
@@ -1585,7 +1585,7 @@ describe('SW-1.3.4 Financial Immutability, Append-Only Adjustments, and Monetary
           expect(rows[0]?.exists).toBe(false);
 
           const { rows: ledger } = await verifier.query<{ version: string }>(
-            `SELECT version FROM ${MIGRATION_LEDGER_TABLE} WHERE version = '0011'`,
+            `SELECT version FROM ${MIGRATION_LEDGER_TABLE} WHERE version = '0012'`,
           );
           expect(ledger).toHaveLength(0);
         } finally {
@@ -1714,7 +1714,7 @@ describe('SW-1.3.4 Financial Immutability, Append-Only Adjustments, and Monetary
           await seeder.end();
         }
 
-        // Apply remaining migrations using authoritative migration directory (applies 0008, 0009, 0010)
+        // Apply remaining migrations using authoritative migration directory (applies 0008, 0009, 0010, 0011)
         const migrator2 = new pg.Pool({
           connectionString: roleConnectionString(
             upgradeDb.url,
@@ -1724,7 +1724,7 @@ describe('SW-1.3.4 Financial Immutability, Append-Only Adjustments, and Monetary
         });
         try {
           const secondRun = await runMigrations(migrator2);
-          expect(secondRun).toEqual(['0008', '0009', '0010']);
+          expect(secondRun).toEqual(['0008', '0009', '0010', '0011']);
         } finally {
           await migrator2.end();
         }

@@ -36,6 +36,7 @@ const MIGRATION_FILES = [
   '0008-financial-integrity.sql',
   '0009-tenant-rls-policies.sql',
   '0010-privileged-bootstrap-functions.sql',
+  '0011-session-tenant-lookup.sql',
 ];
 const ALL_VERSIONS = MIGRATION_FILES.map((fileName) => fileName.slice(0, 4));
 
@@ -257,10 +258,10 @@ describe('SW-1.3.1 migration runner: locking, integrity, bootstrap (real Postgre
     const database = await createDatabase('missing-file');
     await migrate(database);
 
-    const dir = copyMigrationsToTempDir(MIGRATION_FILES.filter((name) => !name.startsWith('0010')));
+    const dir = copyMigrationsToTempDir(MIGRATION_FILES.filter((name) => !name.startsWith('0011')));
     try {
       const error = await expectMigrationError(migrate(database, dir), 'MIGRATION_FILE_MISSING');
-      expect(error.message).toMatch(/0010/);
+      expect(error.message).toMatch(/0011/);
     } finally {
       removeTempDir(dir);
     }
@@ -509,7 +510,17 @@ describe('SW-1.3.1 migration runner: locking, integrity, bootstrap (real Postgre
     } finally {
       await pool.end();
     }
-    expect(applied).toEqual(['0003', '0004', '0005', '0006', '0007', '0008', '0009', '0010']);
+    expect(applied).toEqual([
+      '0003',
+      '0004',
+      '0005',
+      '0006',
+      '0007',
+      '0008',
+      '0009',
+      '0010',
+      '0011',
+    ]);
     expect(events).toContain('adopted:0001');
     expect(events).toContain('adopted:0002');
 

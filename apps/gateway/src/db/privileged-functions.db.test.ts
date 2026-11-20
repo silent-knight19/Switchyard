@@ -1554,9 +1554,9 @@ describe('SW-1.4.3 & SW-1.4.4 Privileged Functions Integration Suite (real Postg
               gateway_auth_executor, gateway_ops_executor;
           `);
 
-          // Re-running migrations applies 0010 cleanly!
-          const applied0010 = await runMigrations(migratorPool);
-          expect(applied0010).toEqual(['0010']);
+          // Re-running migrations applies remaining migrations cleanly!
+          const appliedRemaining = await runMigrations(migratorPool);
+          expect(appliedRemaining).toEqual(['0010', '0011']);
 
           // Re-running migrations again is a no-op
           const rerun = await runMigrations(migratorPool);
