@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import net from 'node:net';
 import type { Redis } from 'ioredis';
 import { AuthenticationError } from './types.js';
 
@@ -17,23 +18,44 @@ export const DEFAULT_LOGIN_RATE_LIMIT_POLICY: RateLimiterPolicy = {
 };
 
 /**
- * Validates and sanitizes a client IP string.
- * Strips port suffix if present and ensures non-empty string.
+ * Validates and strictly sanitizes a client IP string fail-closed.
+ * Rejects empty or malformed non-IP inputs without falling back to loopback.
+ * Strips port suffix if present and validates standard IPv4 or IPv6 format.
  */
 export function sanitizeClientIp(rawIp: unknown): string {
-  if (typeof rawIp !== 'string' || rawIp.trim().length === 0) {
-    return '127.0.0.1';
+  if (typeof rawIp !== 'string') {
+    throw new AuthenticationError('INVALID_INPUT', 'Client IP must be a string');
   }
 
   const trimmed = rawIp.trim();
-  // Strip IPv4 port if present (e.g. "192.168.1.1:12345")
-  const ipv4WithPort = /^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):\d+$/;
-  const match = ipv4WithPort.exec(trimmed);
-  if (match && match[1]) {
-    return match[1];
+  if (trimmed.length === 0) {
+    throw new AuthenticationError('INVALID_INPUT', 'Client IP must not be empty');
   }
 
-  return trimmed;
+  let candidate = trimmed;
+  // Strip IPv4 port if present (e.g. "192.168.1.1:12345")
+  const ipv4WithPort = /^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):\d+$/;
+  const match4 = ipv4WithPort.exec(trimmed);
+  if (match4 && match4[1]) {
+    candidate = match4[1];
+  } else if (trimmed.startsWith('[') && trimmed.includes(']:')) {
+    // Strip bracketed IPv6 port if present (e.g. "[::1]:12345" or "[2001:db8::1]:8080")
+    const ipv6WithPort = /^\[([a-fA-F0-9:]+)\]:\d+$/;
+    const match6 = ipv6WithPort.exec(trimmed);
+    if (match6 && match6[1]) {
+      candidate = match6[1];
+    }
+  }
+
+  // Validate strict IP syntax (net.isIP returns 4 for IPv4, 6 for IPv6, 0 for invalid)
+  if (net.isIP(candidate) === 0) {
+    throw new AuthenticationError(
+      'INVALID_INPUT',
+      `Client IP "${trimmed}" is not a valid IPv4 or IPv6 address`,
+    );
+  }
+
+  return candidate.toLowerCase();
 }
 
 /**

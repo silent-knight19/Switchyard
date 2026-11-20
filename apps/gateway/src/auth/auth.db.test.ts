@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
+import type { Redis } from 'ioredis';
 import pg from 'pg';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { runMigrations } from '../db/migrate.js';
 import {
   bootstrapDatabase,
@@ -12,6 +13,7 @@ import {
   type DisposableDatabase,
 } from '../db/test/disposable-pg.js';
 import { hashPassword, verifyPassword } from './password.js';
+import { LoginRateLimiter } from './rate-limiter.js';
 import { AuthenticationService } from './service.js';
 import { AuthenticationError, BootstrapError } from './types.js';
 
@@ -22,6 +24,8 @@ describe('SW-1.5.1: Authentication Service PostgreSQL 16 Integration Suite', () 
   let adminClient: pg.Client;
   let appPool: pg.Pool;
   let authService: AuthenticationService;
+  let rateLimiter: LoginRateLimiter;
+  let mockRedis: Redis;
 
   const ORG_A_ID = '11111111-1111-4111-8111-111111111111';
   const USER_A_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
@@ -70,10 +74,21 @@ describe('SW-1.5.1: Authentication Service PostgreSQL 16 Integration Suite', () 
       connectionString: roleConnectionString(db.url, 'gateway_app', passwords.gateway_app),
     });
 
+    mockRedis = {
+      eval: vi.fn().mockResolvedValue(1),
+    } as unknown as Redis;
+    rateLimiter = new LoginRateLimiter(mockRedis);
+
     authService = new AuthenticationService({
       pool: appPool,
+      rateLimiter,
     });
   }, 60000);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (mockRedis.eval as ReturnType<typeof vi.fn>).mockResolvedValue(1);
+  });
 
   afterAll(async () => {
     if (appPool) await appPool.end();
@@ -83,8 +98,21 @@ describe('SW-1.5.1: Authentication Service PostgreSQL 16 Integration Suite', () 
   }, 30000);
 
   describe('1. User Login & Password Verification', () => {
-    it('authenticates a user with correct credentials and returns sanitized principal', async () => {
+    it('service without rate limiter fails closed at construction (AUTH-01)', () => {
+      expect(
+        () =>
+          new AuthenticationService({
+            pool: appPool,
+          } as unknown as { pool: pg.Pool; rateLimiter: LoginRateLimiter }),
+      ).toThrow(AuthenticationError);
+    });
+
+    it('authenticates a user with correct credentials, calls rate limiter spy, and returns sanitized principal', async () => {
+      const spy = vi.spyOn(rateLimiter, 'assertNotRateLimited');
       const user = await authService.authenticate(ADMIN_EMAIL, ADMIN_PASSWORD, '127.0.0.1');
+
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(spy).toHaveBeenCalledWith('127.0.0.1', ADMIN_EMAIL);
 
       expect(user.id).toBe(USER_A_ID);
       expect(user.orgId).toBe(ORG_A_ID);
@@ -97,22 +125,30 @@ describe('SW-1.5.1: Authentication Service PostgreSQL 16 Integration Suite', () 
       expect(userRecord['passwordHash']).toBeUndefined();
     });
 
-    it('normalizes mixed-case and untrimmed email during authentication', async () => {
+    it('normalizes mixed-case and untrimmed email during authentication and invokes rate limiter with normalized value', async () => {
+      const spy = vi.spyOn(rateLimiter, 'assertNotRateLimited');
       const user = await authService.authenticate(
         '  Admin@Alpha.COM  ',
         ADMIN_PASSWORD,
         '127.0.0.1',
       );
 
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(spy).toHaveBeenCalledWith('127.0.0.1', ADMIN_EMAIL);
+
       expect(user.id).toBe(USER_A_ID);
       expect(user.orgId).toBe(ORG_A_ID);
       expect(user.emailNormalized).toBe(ADMIN_EMAIL);
     });
 
-    it('rejects an incorrect password with generic INVALID_CREDENTIALS error', async () => {
+    it('rejects an incorrect password with generic INVALID_CREDENTIALS error and proves rate limiter was executed', async () => {
+      const spy = vi.spyOn(rateLimiter, 'assertNotRateLimited');
       await expect(
         authService.authenticate(ADMIN_EMAIL, 'WrongPassword!2026', '127.0.0.1'),
       ).rejects.toThrow(AuthenticationError);
+
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(spy).toHaveBeenCalledWith('127.0.0.1', ADMIN_EMAIL);
 
       try {
         await authService.authenticate(ADMIN_EMAIL, 'WrongPassword!2026', '127.0.0.1');
@@ -124,10 +160,14 @@ describe('SW-1.5.1: Authentication Service PostgreSQL 16 Integration Suite', () 
       }
     });
 
-    it('rejects an unknown user email with generic INVALID_CREDENTIALS and executes dummy verify', async () => {
+    it('rejects an unknown user email with generic INVALID_CREDENTIALS and proves rate limiter was executed', async () => {
+      const spy = vi.spyOn(rateLimiter, 'assertNotRateLimited');
       await expect(
         authService.authenticate('nonexistent@example.com', ADMIN_PASSWORD, '127.0.0.1'),
       ).rejects.toThrow(AuthenticationError);
+
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(spy).toHaveBeenCalledWith('127.0.0.1', 'nonexistent@example.com');
 
       try {
         await authService.authenticate('nonexistent@example.com', ADMIN_PASSWORD, '127.0.0.1');
@@ -136,6 +176,46 @@ describe('SW-1.5.1: Authentication Service PostgreSQL 16 Integration Suite', () 
         const authErr = err as AuthenticationError;
         expect(authErr.reason).toBe('INVALID_CREDENTIALS');
         expect(authErr.message).toBe('Invalid email or password');
+      }
+    });
+
+    it('rate-limited attempt never queries PostgreSQL or runs Argon2', async () => {
+      const limitedLimiter = new LoginRateLimiter({
+        eval: vi.fn().mockResolvedValue(0), // 0 = rate limited
+      } as unknown as Redis);
+
+      const querySpy = vi.spyOn(appPool, 'query');
+      const limitedService = new AuthenticationService({
+        pool: appPool,
+        rateLimiter: limitedLimiter,
+      });
+
+      await expect(
+        limitedService.authenticate(ADMIN_EMAIL, ADMIN_PASSWORD, '127.0.0.1'),
+      ).rejects.toThrow(AuthenticationError);
+
+      expect(querySpy).not.toHaveBeenCalled();
+    });
+
+    it('redis failure returns SERVICE_UNAVAILABLE without authenticating', async () => {
+      const brokenLimiter = new LoginRateLimiter({
+        eval: vi.fn().mockRejectedValue(new Error('Redis connection dropped')),
+      } as unknown as Redis);
+
+      const brokenService = new AuthenticationService({
+        pool: appPool,
+        rateLimiter: brokenLimiter,
+      });
+
+      await expect(
+        brokenService.authenticate(ADMIN_EMAIL, ADMIN_PASSWORD, '127.0.0.1'),
+      ).rejects.toThrow(AuthenticationError);
+
+      try {
+        await brokenService.authenticate(ADMIN_EMAIL, ADMIN_PASSWORD, '127.0.0.1');
+      } catch (err) {
+        expect(err).toBeInstanceOf(AuthenticationError);
+        expect((err as AuthenticationError).reason).toBe('SERVICE_UNAVAILABLE');
       }
     });
 

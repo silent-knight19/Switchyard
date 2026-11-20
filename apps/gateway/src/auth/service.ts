@@ -20,16 +20,22 @@ import {
 
 export interface AuthenticationServiceOptions {
   pool: pg.Pool;
-  rateLimiter?: LoginRateLimiter;
+  rateLimiter: LoginRateLimiter;
   argon2Limiter?: Argon2ConcurrencyLimiter;
 }
 
 export class AuthenticationService {
   private readonly pool: pg.Pool;
-  private readonly rateLimiter: LoginRateLimiter | undefined;
+  private readonly rateLimiter: LoginRateLimiter;
   private readonly argon2Limiter: Argon2ConcurrencyLimiter;
 
   constructor(options: AuthenticationServiceOptions) {
+    if (!options || !options.rateLimiter) {
+      throw new AuthenticationError(
+        'CONFIGURATION_ERROR',
+        'LoginRateLimiter is a mandatory dependency for AuthenticationService',
+      );
+    }
     this.pool = options.pool;
     this.rateLimiter = options.rateLimiter;
     this.argon2Limiter = options.argon2Limiter ?? defaultArgon2Limiter;
@@ -40,7 +46,7 @@ export class AuthenticationService {
    *
    * Security sequence:
    * 1. Validate email and password representations fail-closed before any database or crypto operations.
-   * 2. Apply Redis-backed abuse/rate-limit checks before costly Argon2id hashing.
+   * 2. Apply mandatory Redis-backed abuse/rate-limit checks before costly database lookups or Argon2id hashing.
    * 3. Look up user via restricted privileged function app_private.lookup_user_for_login(p_email_normalized).
    * 4. For known accounts, verify supplied password against stored Argon2id verifier.
    * 5. For unknown accounts, execute a dummy Argon2id verification with OWASP baseline parameters to mitigate timing differences.
@@ -56,10 +62,8 @@ export class AuthenticationService {
     const normalizedEmail = normalizeEmail(rawEmail);
     const validPassword = validatePasswordInput(rawPassword);
 
-    // 2. Abuse / Rate limiting
-    if (this.rateLimiter) {
-      await this.rateLimiter.assertNotRateLimited(clientIp, normalizedEmail);
-    }
+    // 2. Abuse / Rate limiting (mandatory)
+    await this.rateLimiter.assertNotRateLimited(clientIp, normalizedEmail);
 
     // 3. Pre-tenant login lookup via privileged function
     let lookupResult: {

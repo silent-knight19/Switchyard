@@ -16,26 +16,44 @@ export const ABSOLUTE_EXPIRY_INTERVAL = "interval '7 days'";
 
 /**
  * Validates whether an opaque session secret string is structurally valid:
- * 32-byte random secret encoded as canonical 43-character base64url string.
+ * Exact canonical unpadded base64url representation of a 32-byte secret (AUTH-04).
+ * Rejects whitespace, non-base64url characters, padding, and noncanonical pad bits.
  */
 export function decodeSessionSecret(secret: unknown): Buffer {
   if (typeof secret !== 'string') {
     throw new SessionError('MISSING_SECRET', 'Session secret must be a string');
   }
 
-  const trimmed = secret.trim();
-  if (trimmed.length !== 43) {
+  // Exact length constraint: 32 bytes in unpadded base64url is exactly 43 characters (no trimming)
+  if (secret.length !== 43) {
     throw new SessionError(
       'MALFORMED_SECRET',
-      `Session secret length (${trimmed.length}) is invalid; expected 43 base64url characters`,
+      `Session secret length (${secret.length}) is invalid; expected exactly 43 base64url characters`,
     );
   }
 
-  const buf = Buffer.from(trimmed, 'base64url');
+  // Strict unpadded base64url alphabet (no whitespace, no +, no /, no =)
+  if (!/^[A-Za-z0-9_-]{43}$/.test(secret)) {
+    throw new SessionError(
+      'MALFORMED_SECRET',
+      'Session secret contains invalid characters; expected canonical unpadded base64url',
+    );
+  }
+
+  const buf = Buffer.from(secret, 'base64url');
   if (buf.length !== 32) {
     throw new SessionError(
       'MALFORMED_SECRET',
       `Decoded session secret length (${buf.length} bytes) is invalid; expected exactly 32 bytes`,
+    );
+  }
+
+  // Canonical round-trip verification:
+  // Catches noncanonical pad bits where distinct 43-character strings decode to identical 32-byte buffers
+  if (buf.toString('base64url') !== secret) {
+    throw new SessionError(
+      'MALFORMED_SECRET',
+      'Session secret contains noncanonical base64url encoding or invalid pad bits',
     );
   }
 
@@ -59,11 +77,44 @@ export class SessionService {
   constructor(options: SessionServiceOptions) {
     this.pool = options.pool;
     const isProd = options.cookieOptions?.isProduction ?? process.env['NODE_ENV'] === 'production';
-    this.isSecureCookie = options.cookieOptions?.secure ?? isProd;
-    // In production, enforce __Host- prefix requiring Secure, Path=/, and no Domain
-    this.cookieName =
-      options.cookieOptions?.cookieName ??
-      (this.isSecureCookie ? '__Host-session' : 'switchyard_session');
+
+    if (isProd) {
+      // AUTH-02: Production security requirements cannot be downgraded
+      if (options.cookieOptions?.secure === false) {
+        throw new SessionError(
+          'CONFIGURATION_ERROR',
+          'Insecure session cookies (secure: false) are strictly prohibited in production',
+        );
+      }
+      if (
+        options.cookieOptions?.cookieName !== undefined &&
+        options.cookieOptions.cookieName !== '__Host-session'
+      ) {
+        throw new SessionError(
+          'CONFIGURATION_ERROR',
+          `Production session cookies must use the "__Host-session" name; received "${options.cookieOptions.cookieName}"`,
+        );
+      }
+
+      this.isSecureCookie = true;
+      this.cookieName = '__Host-session';
+    } else {
+      // Development mode: explicitly support local development HTTP without weakening production
+      this.isSecureCookie = options.cookieOptions?.secure ?? false;
+
+      if (options.cookieOptions?.cookieName !== undefined) {
+        // Enforce __Host- cookie security invariant: __Host- prefix MUST be Secure
+        if (options.cookieOptions.cookieName.startsWith('__Host-') && !this.isSecureCookie) {
+          throw new SessionError(
+            'CONFIGURATION_ERROR',
+            'Cookies with "__Host-" prefix require secure=true',
+          );
+        }
+        this.cookieName = options.cookieOptions.cookieName;
+      } else {
+        this.cookieName = this.isSecureCookie ? '__Host-session' : 'switchyard_session';
+      }
+    }
   }
 
   public getCookieName(): string {
@@ -318,14 +369,20 @@ export class SessionService {
       }
 
       // Atomically renew last_seen_at and idle_expires_at (bounded by absolute_expires_at)
-      await client.query(
+      const { rows: renewedRows } = await client.query<{
+        last_seen_at: Date;
+        idle_expires_at: Date;
+      }>(
         `UPDATE public.web_sessions
         SET
           last_seen_at = clock_timestamp(),
           idle_expires_at = LEAST(clock_timestamp() + interval '2 hours', absolute_expires_at)
-        WHERE session_id_hash = $1;`,
+        WHERE session_id_hash = $1
+        RETURNING last_seen_at, idle_expires_at;`,
         [sessionIdHash],
       );
+
+      const renewed = renewedRows[0];
 
       const session: WebSession = {
         sessionIdHash: row.session_id_hash,
@@ -333,8 +390,8 @@ export class SessionService {
         orgId: row.org_id,
         csrfTokenHash: row.csrf_token_hash,
         createdAt: row.created_at,
-        lastSeenAt: row.last_seen_at,
-        idleExpiresAt: row.idle_expires_at,
+        lastSeenAt: renewed?.last_seen_at ?? row.last_seen_at,
+        idleExpiresAt: renewed?.idle_expires_at ?? row.idle_expires_at,
         absoluteExpiresAt: row.absolute_expires_at,
         revokedAt: row.revoked_at,
       };
@@ -408,8 +465,17 @@ export class SessionService {
       }
 
       const now = oldRow.db_now.getTime();
-      if (now >= oldRow.absolute_expires_at.getTime() || now >= oldRow.idle_expires_at.getTime()) {
-        throw new SessionError('SESSION_EXPIRED_IDLE', 'Cannot rotate an expired session');
+      const absExp = oldRow.absolute_expires_at.getTime();
+      const idleExp = oldRow.idle_expires_at.getTime();
+
+      if (now >= absExp) {
+        throw new SessionError(
+          'SESSION_EXPIRED_ABSOLUTE',
+          'Cannot rotate an absolute-expired session',
+        );
+      }
+      if (now >= idleExp) {
+        throw new SessionError('SESSION_EXPIRED_IDLE', 'Cannot rotate an idle-expired session');
       }
 
       // 2. Generate new session secret & CSRF token
@@ -422,6 +488,10 @@ export class SessionService {
       const newCsrfTokenHash = hashSecret(newCsrfBytes);
 
       // 3. Insert new session row
+      // CRITICAL INVARIANT (AUTH-03):
+      // new_idle_expires_at = LEAST(database_now + idle_interval, inherited_absolute_expires_at)
+      // Never extend absolute expiration during rotation.
+      // Never create a rotated session whose idle expiry exceeds absolute expiry.
       const insertRes = await client.query<{
         session_id_hash: Buffer;
         user_id: string;
@@ -444,7 +514,7 @@ export class SessionService {
         ) VALUES (
           $1, $2, $3, $4,
           clock_timestamp(),
-          clock_timestamp() + interval '2 hours',
+          LEAST(clock_timestamp() + interval '2 hours', $5::timestamptz),
           $5
         ) RETURNING
           session_id_hash,

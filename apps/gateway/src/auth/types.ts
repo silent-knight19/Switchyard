@@ -3,7 +3,11 @@
  */
 
 export type AuthFailureReason =
-  'INVALID_CREDENTIALS' | 'RATE_LIMITED' | 'SERVICE_UNAVAILABLE' | 'INVALID_INPUT';
+  | 'INVALID_CREDENTIALS'
+  | 'RATE_LIMITED'
+  | 'SERVICE_UNAVAILABLE'
+  | 'INVALID_INPUT'
+  | 'CONFIGURATION_ERROR';
 
 export class AuthenticationError extends Error {
   public readonly reason: AuthFailureReason;
@@ -23,7 +27,8 @@ export type SessionFailureReason =
   | 'SESSION_EXPIRED_IDLE'
   | 'SESSION_EXPIRED_ABSOLUTE'
   | 'TENANT_MISMATCH'
-  | 'DATABASE_ERROR';
+  | 'DATABASE_ERROR'
+  | 'CONFIGURATION_ERROR';
 
 export class SessionError extends Error {
   public readonly reason: SessionFailureReason;

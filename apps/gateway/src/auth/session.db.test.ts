@@ -224,6 +224,45 @@ describe('SW-1.5.2: Server-Side Web Sessions PostgreSQL 16 Integration Suite', (
       expect(validation.valid).toBe(false);
       expect(validation.reason).toBe('SESSION_EXPIRED_ABSOLUTE');
     });
+
+    it('returns committed renewed timestamps upon successful validation without exposing stale values (Section 8)', async () => {
+      const { secret, session } = await sessionService.createSession(ORG_A_ID, USER_A_ID);
+
+      // Artificially age the session's last_seen_at by 15 minutes
+      await adminClient.query(
+        `UPDATE web_sessions
+         SET
+           last_seen_at = clock_timestamp() - interval '15 minutes',
+           idle_expires_at = clock_timestamp() + interval '105 minutes'
+         WHERE session_id_hash = $1;`,
+        [session.sessionIdHash],
+      );
+
+      const beforeValidation = await adminClient.query<{ last_seen_at: Date }>(
+        'SELECT last_seen_at FROM web_sessions WHERE session_id_hash = $1',
+        [session.sessionIdHash],
+      );
+      const staleLastSeen = beforeValidation.rows[0]!.last_seen_at;
+
+      // Validate session: triggers atomic renewal
+      const validation = await sessionService.resolveAndValidateSession(secret);
+      expect(validation.valid).toBe(true);
+      expect(validation.session).toBeDefined();
+
+      const returnedSession = validation.session!;
+      // Returned lastSeenAt must be strictly greater than the aged timestamp before validation
+      expect(returnedSession.lastSeenAt.getTime()).toBeGreaterThan(staleLastSeen.getTime());
+
+      // Query committed row from database to verify exact match
+      const dbRow = await adminClient.query<{ last_seen_at: Date; idle_expires_at: Date }>(
+        'SELECT last_seen_at, idle_expires_at FROM web_sessions WHERE session_id_hash = $1',
+        [session.sessionIdHash],
+      );
+      expect(returnedSession.lastSeenAt.getTime()).toBe(dbRow.rows[0]!.last_seen_at.getTime());
+      expect(returnedSession.idleExpiresAt.getTime()).toBe(
+        dbRow.rows[0]!.idle_expires_at.getTime(),
+      );
+    });
   });
 
   describe('3. Session Revocation & Logout', () => {
@@ -289,6 +328,86 @@ describe('SW-1.5.2: Server-Side Web Sessions PostgreSQL 16 Integration Suite', (
       expect(newCheck.user?.id).toBe(USER_A_ID);
     });
 
+    it('rotation shortly before absolute expiry preserves absolute expiry and bounds idle expiry (AUTH-03)', async () => {
+      const { secret: oldSecret, session: oldSession } = await sessionService.createSession(
+        ORG_A_ID,
+        USER_A_ID,
+      );
+
+      // Set old session to expire absolutely in 10 minutes, and idle in 5 minutes
+      await adminClient.query(
+        `UPDATE web_sessions
+         SET
+           absolute_expires_at = clock_timestamp() + interval '10 minutes',
+           idle_expires_at = clock_timestamp() + interval '5 minutes'
+         WHERE session_id_hash = $1;`,
+        [oldSession.sessionIdHash],
+      );
+
+      const oldRow = await adminClient.query<{ absolute_expires_at: Date }>(
+        'SELECT absolute_expires_at FROM web_sessions WHERE session_id_hash = $1',
+        [oldSession.sessionIdHash],
+      );
+      const inheritedAbsoluteExpiry = oldRow.rows[0]!.absolute_expires_at;
+
+      // Rotate session: must preserve inherited absolute expiry and cap idle expiry to absolute expiry
+      const { newSecret, session: rotatedSession } = await sessionService.rotateSession(oldSecret);
+      expect(typeof newSecret).toBe('string');
+      expect(newSecret.length).toBe(43);
+
+      // Verify returned session attributes
+      expect(rotatedSession.absoluteExpiresAt.getTime()).toBe(inheritedAbsoluteExpiry.getTime());
+      // Idle expiry must not exceed absolute expiry: LEAST(now + 2 hours, absolute_expires_at)
+      expect(rotatedSession.idleExpiresAt.getTime()).toBeLessThanOrEqual(
+        rotatedSession.absoluteExpiresAt.getTime(),
+      );
+      expect(rotatedSession.idleExpiresAt.getTime()).toBe(
+        rotatedSession.absoluteExpiresAt.getTime(),
+      );
+
+      // Verify persistent database row
+      const newRow = await adminClient.query<{
+        absolute_expires_at: Date;
+        idle_expires_at: Date;
+      }>(
+        'SELECT absolute_expires_at, idle_expires_at FROM web_sessions WHERE session_id_hash = $1',
+        [rotatedSession.sessionIdHash],
+      );
+      expect(newRow.rows[0]!.absolute_expires_at.getTime()).toBe(inheritedAbsoluteExpiry.getTime());
+      expect(newRow.rows[0]!.idle_expires_at.getTime()).toBe(
+        newRow.rows[0]!.absolute_expires_at.getTime(),
+      );
+    });
+
+    it('rejects rotation of revoked or expired sessions', async () => {
+      // 1. Revoked session
+      const { secret: s1 } = await sessionService.createSession(ORG_A_ID, USER_A_ID);
+      await sessionService.revokeSession(s1);
+      await expect(sessionService.rotateSession(s1)).rejects.toThrow(SessionError);
+
+      // 2. Idle expired session
+      const { secret: s2, session: sess2 } = await sessionService.createSession(
+        ORG_A_ID,
+        USER_A_ID,
+      );
+      await adminClient.query(
+        `UPDATE web_sessions SET idle_expires_at = clock_timestamp() - interval '1 second' WHERE session_id_hash = $1`,
+        [sess2.sessionIdHash],
+      );
+      await expect(sessionService.rotateSession(s2)).rejects.toThrow(SessionError);
+
+      // 3. Absolute expired session
+      const { secret: s3, session: sess3 } = await sessionService.createSession(
+        ORG_A_ID,
+        USER_A_ID,
+      );
+      await adminClient.query(
+        `UPDATE web_sessions SET absolute_expires_at = clock_timestamp() - interval '1 second' WHERE session_id_hash = $1`,
+        [sess3.sessionIdHash],
+      );
+      await expect(sessionService.rotateSession(s3)).rejects.toThrow(SessionError);
+    });
+
     it('concurrency invariant: two concurrent rotations of the same old session cannot both succeed', async () => {
       const { secret: oldSecret } = await sessionService.createSession(ORG_A_ID, USER_A_ID);
 
@@ -310,21 +429,78 @@ describe('SW-1.5.2: Server-Side Web Sessions PostgreSQL 16 Integration Suite', (
       expect((err as SessionError).reason).toBe('SESSION_REVOKED');
     });
 
-    it('concurrency invariant: session revoked before validation point does not authenticate', async () => {
+    it('deterministic ordering 1: revoke commits first, subsequent validation fails (Section 8)', async () => {
       const { secret } = await sessionService.createSession(ORG_A_ID, USER_A_ID);
 
-      // Concurrent revoke and validate
-      const [revokeResult, validateResult] = await Promise.all([
-        sessionService.revokeSession(secret),
-        sessionService.resolveAndValidateSession(secret),
-      ]);
+      // Revocation commits first
+      const revoked = await sessionService.revokeSession(secret);
+      expect(revoked).toBe(true);
 
-      expect(revokeResult).toBe(true);
-      expect(typeof validateResult.valid).toBe('boolean');
-      // If revoke completed, validate must return false or if validate completed first it will subsequently be revoked
-      const subsequentCheck = await sessionService.resolveAndValidateSession(secret);
-      expect(subsequentCheck.valid).toBe(false);
-      expect(subsequentCheck.reason).toBe('SESSION_REVOKED');
+      // Validation executes after revocation committed: must fail
+      const validation = await sessionService.resolveAndValidateSession(secret);
+      expect(validation.valid).toBe(false);
+      expect(validation.reason).toBe('SESSION_REVOKED');
+    });
+
+    it('deterministic ordering 2: validation commits first, subsequent revoke succeeds and denies later attempts (Section 8)', async () => {
+      const { secret } = await sessionService.createSession(ORG_A_ID, USER_A_ID);
+
+      // Validation commits first
+      const validation1 = await sessionService.resolveAndValidateSession(secret);
+      expect(validation1.valid).toBe(true);
+
+      // Then revocation occurs
+      const revoked = await sessionService.revokeSession(secret);
+      expect(revoked).toBe(true);
+
+      // Subsequent validation must be denied
+      const validation2 = await sessionService.resolveAndValidateSession(secret);
+      expect(validation2.valid).toBe(false);
+      expect(validation2.reason).toBe('SESSION_REVOKED');
+    });
+
+    it('deterministic barrier: concurrent revoke blocks validation and forces SESSION_REVOKED (Section 8)', async () => {
+      const { secret, session } = await sessionService.createSession(ORG_A_ID, USER_A_ID);
+
+      // Worker 1 locks the row in a transaction
+      const client1 = await appPool.connect();
+      try {
+        await client1.query('BEGIN');
+        await client1.query('SET LOCAL rls.enable_tenant = on');
+        await client1.query("SELECT set_config('app.current_org_id', $1, true)", [ORG_A_ID]);
+        await client1.query('SELECT 1 FROM web_sessions WHERE session_id_hash = $1 FOR UPDATE', [
+          session.sessionIdHash,
+        ]);
+
+        // Worker 2 calls resolveAndValidateSession in background (blocks on FOR UPDATE)
+        let worker2Done = false;
+        let worker2Result: unknown = null;
+        const worker2Promise = sessionService.resolveAndValidateSession(secret).then((res) => {
+          worker2Done = true;
+          worker2Result = res;
+        });
+
+        // Small yield to allow Worker 2 to reach and block on row lock
+        await new Promise((r) => setTimeout(r, 50));
+        expect(worker2Done).toBe(false); // Proves Worker 2 is waiting on lock
+
+        // Worker 1 updates revoked_at and commits
+        await client1.query(
+          'UPDATE web_sessions SET revoked_at = clock_timestamp() WHERE session_id_hash = $1',
+          [session.sessionIdHash],
+        );
+        await client1.query('COMMIT');
+
+        // Worker 2 unblocks
+        await worker2Promise;
+        expect(worker2Done).toBe(true);
+        expect((worker2Result as { valid: boolean; reason: string }).valid).toBe(false);
+        expect((worker2Result as { valid: boolean; reason: string }).reason).toBe(
+          'SESSION_REVOKED',
+        );
+      } finally {
+        client1.release();
+      }
     });
   });
 
