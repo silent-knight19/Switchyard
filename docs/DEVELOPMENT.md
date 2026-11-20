@@ -217,7 +217,8 @@ apply tenant-table DDL.
 
 Migration set: `0001-roles` (idempotent no-op when bootstrap ran first), `0002-org-tables`
 (six core tables), `0003-rls-default-deny`, `0004-gateway-control-privileges`,
-`0005-virtual-key-integrity`, `0006-schema-privilege-hardening`. `0001`/`0002` are historical
+`0005-virtual-key-integrity`, `0006-schema-privilege-hardening`,
+`0007-financial-observability-tables` (gateway_requests, provider_attempts, adjustments, trace_payloads). `0001`/`0002` are historical
 and byte-frozen; corrections are forward-only migrations.
 
 #### 7.7.3 Integrity: checksums and fail-closed history
