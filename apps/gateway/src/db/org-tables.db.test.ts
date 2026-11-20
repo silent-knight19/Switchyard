@@ -129,7 +129,7 @@ describe('SW-1.3.2 tenant core tables: constraints, RLS posture, upgrade safety'
     } finally {
       await legacyClient.end();
     }
-    expect(await migrate(upgraded)).toEqual(['0003', '0004', '0005', '0006', '0007']);
+    expect(await migrate(upgraded)).toEqual(['0003', '0004', '0005', '0006', '0007', '0008']);
   });
 
   afterAll(async () => {

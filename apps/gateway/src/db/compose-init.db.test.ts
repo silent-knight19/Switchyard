@@ -164,11 +164,12 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15, DB-16 
     expect(migrateLogs).toContain('applied 0005');
     expect(migrateLogs).toContain('applied 0006');
     expect(migrateLogs).toContain('applied 0007');
+    expect(migrateLogs).toContain('applied 0008');
   });
 
-  it('records correct SHA-256 checksums in gateway_migrations for all seven migrations', async () => {
+  it('records correct SHA-256 checksums in gateway_migrations for all eight migrations', async () => {
     const expectedFiles = loadMigrationFiles();
-    expect(expectedFiles).toHaveLength(7);
+    expect(expectedFiles).toHaveLength(8);
 
     const client = new pg.Client({
       host: '127.0.0.1',
@@ -185,7 +186,7 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15, DB-16 
         checksum: string;
       }>('SELECT version, name, checksum FROM gateway_migrations ORDER BY version');
 
-      expect(rows).toHaveLength(7);
+      expect(rows).toHaveLength(8);
       for (let i = 0; i < expectedFiles.length; i += 1) {
         const expected = expectedFiles[i]!;
         const row = rows[i]!;
@@ -372,7 +373,7 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15, DB-16 
       const { rows } = await client.query<{ count: string }>(
         'SELECT count(*)::text as count FROM gateway_migrations',
       );
-      expect(rows[0]?.count).toBe('7');
+      expect(rows[0]?.count).toBe('8');
     } finally {
       await client.end();
     }

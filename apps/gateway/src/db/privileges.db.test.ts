@@ -348,7 +348,7 @@ describe('SW-1.3.1 role privileges under real authenticated sessions', () => {
     });
     try {
       const applied = await runMigrations(migrator);
-      expect(applied).toHaveLength(7);
+      expect(applied).toHaveLength(8);
     } finally {
       await migrator.end();
     }

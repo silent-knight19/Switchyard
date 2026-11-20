@@ -1309,7 +1309,8 @@ describe('SW-1.3.3 financial and observability schema: constraints, FKs, generat
     });
 
     it('uses idx_provider_cost_adjustments_attempt for canonical cost lookup (query plan evidence)', async () => {
-      // Seed adjustments to allow query planner to evaluate index scan
+      // Opportunistic DB-21 remediation: enforce index selection without Seq Scan ambiguity
+      await pool.query('SET LOCAL enable_seqscan = off');
       const { rows } = await pool.query<{ 'QUERY PLAN': string }>(
         `EXPLAIN (COSTS OFF)
          SELECT SUM(delta_microdollars)
@@ -1318,7 +1319,7 @@ describe('SW-1.3.3 financial and observability schema: constraints, FKs, generat
         [ATTEMPT_ID, ORG_A],
       );
       const planText = rows.map((r) => r['QUERY PLAN']).join('\n');
-      expect(planText).toMatch(/idx_provider_cost_adjustments_attempt|Bitmap Heap Scan|Index Scan/);
+      expect(planText).toContain('idx_provider_cost_adjustments_attempt');
     });
   });
 
@@ -1409,9 +1410,9 @@ describe('SW-1.3.3 financial and observability schema: constraints, FKs, generat
           await seeder.end();
         }
 
-        // Apply remaining migrations using authoritative directory (applies 0007)
+        // Apply remaining migrations using authoritative directory (applies 0007 and 0008)
         const secondRun = await migrate(upgradedDb);
-        expect(secondRun).toEqual(['0007']);
+        expect(secondRun).toEqual(['0007', '0008']);
 
         // Verify seeded data intact
         const verifier = new pg.Client({ connectionString: upgradedDb.url });
