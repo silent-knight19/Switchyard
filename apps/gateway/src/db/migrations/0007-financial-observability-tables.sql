@@ -40,6 +40,7 @@ CREATE TABLE gateway_requests (
   created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
   finalized_at TIMESTAMPTZ NULL,
   CONSTRAINT uq_gateway_requests_request_org UNIQUE (request_id, org_id),
+  CONSTRAINT uq_gateway_requests_attribution UNIQUE (request_id, org_id, virtual_key_id, billing_period),
   CONSTRAINT fk_gateway_requests_org FOREIGN KEY (org_id)
     REFERENCES organizations(id) ON DELETE RESTRICT,
   CONSTRAINT fk_gateway_requests_virtual_key FOREIGN KEY (virtual_key_id, org_id)
@@ -77,8 +78,12 @@ CREATE TABLE provider_attempts (
   created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
   CONSTRAINT uq_provider_attempts_request_attempt UNIQUE (request_id, attempt_number),
   CONSTRAINT uq_provider_attempts_attempt_org UNIQUE (attempt_id, org_id),
-  CONSTRAINT fk_provider_attempts_request FOREIGN KEY (request_id, org_id)
-    REFERENCES gateway_requests(request_id, org_id) ON DELETE RESTRICT,
+  CONSTRAINT chk_provider_attempts_cost_status CHECK (
+    (cost_status = 'estimated' AND actual_cost_microdollars IS NULL) OR
+    (cost_status = 'confirmed' AND actual_cost_microdollars IS NOT NULL)
+  ),
+  CONSTRAINT fk_provider_attempts_request FOREIGN KEY (request_id, org_id, virtual_key_id, billing_period)
+    REFERENCES gateway_requests(request_id, org_id, virtual_key_id, billing_period) ON DELETE RESTRICT,
   CONSTRAINT fk_provider_attempts_virtual_key FOREIGN KEY (virtual_key_id, org_id)
     REFERENCES virtual_keys(id, org_id) ON DELETE RESTRICT
 );
@@ -108,6 +113,9 @@ CREATE TABLE provider_cost_adjustments (
 CREATE UNIQUE INDEX uq_provider_cost_adjustments_source_ref
   ON provider_cost_adjustments (attempt_id, source, source_reference)
   WHERE source_reference IS NOT NULL;
+
+CREATE INDEX idx_provider_cost_adjustments_attempt
+  ON provider_cost_adjustments (attempt_id, org_id);
 
 CREATE TABLE trace_payloads (
   request_id UUID PRIMARY KEY,

@@ -24,6 +24,7 @@ const FINANCIAL_TABLES = [
 const ORG_A = '11111111-1111-4111-8111-111111111111';
 const ORG_B = '22222222-2222-4222-8222-222222222222';
 const VIRTUAL_KEY_A_ID = '66666666-6666-4666-8666-666666666667';
+const VIRTUAL_KEY_A2_ID = '66666666-6666-4666-8666-666666666668';
 const VIRTUAL_KEY_B_ID = '77777777-7777-4777-8777-777777777779';
 const GATEWAY_INSTANCE_ID = '88888888-8888-4888-8888-888888888888';
 
@@ -125,11 +126,14 @@ describe('SW-1.3.3 financial and observability schema: constraints, FKs, generat
          (id, org_id, name, key_prefix, key_hash, allowed_models, rpm_limit, tpm_limit, concurrent_stream_limit)
        VALUES
          ($1, $2, 'key-a', 'sk-a-', $3, ARRAY['gpt-4o'], 60, 10000, 5),
-         ($4, $5, 'key-b', 'sk-b-', $6, ARRAY['gpt-4o'], 60, 10000, 5)`,
+         ($4, $2, 'key-a2', 'sk-a2-', $5, ARRAY['gpt-4o'], 60, 10000, 5),
+         ($6, $7, 'key-b', 'sk-b-', $8, ARRAY['gpt-4o'], 60, 10000, 5)`,
       [
         VIRTUAL_KEY_A_ID,
         ORG_A,
         Buffer.from('hash_a'),
+        VIRTUAL_KEY_A2_ID,
+        Buffer.from('hash_a2'),
         VIRTUAL_KEY_B_ID,
         ORG_B,
         Buffer.from('hash_b'),
@@ -391,6 +395,94 @@ describe('SW-1.3.3 financial and observability schema: constraints, FKs, generat
       const traceRetention = byName.get('idx_trace_payloads_retention');
       expect(traceRetention, 'idx_trace_payloads_retention must exist').toBeDefined();
       expect(traceRetention?.indexdef).toContain('(expires_at)');
+
+      // 6. provider_cost_adjustments general attempt and org index
+      const adjAttempt = byName.get('idx_provider_cost_adjustments_attempt');
+      expect(adjAttempt, 'idx_provider_cost_adjustments_attempt must exist').toBeDefined();
+      expect(adjAttempt?.indexdef).toContain('(attempt_id, org_id)');
+    });
+
+    it('verifies catalog foreign key definitions, unique attribution, and check constraints (DB-17, DB-18, DB-19)', async () => {
+      // 1. Verify foreign key fk_provider_attempts_request references all 4 columns: (request_id, org_id, virtual_key_id, billing_period)
+      const { rows: fkRows } = await pool.query<{
+        conname: string;
+        child_table: string;
+        parent_table: string;
+        child_cols: string[];
+        parent_cols: string[];
+      }>(
+        `SELECT
+           c.conname,
+           cl.relname AS child_table,
+           cr.relname AS parent_table,
+           array_to_json(ARRAY(
+             SELECT a.attname
+             FROM unnest(c.conkey) k
+             JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k
+           )) AS child_cols,
+           array_to_json(ARRAY(
+             SELECT a.attname
+             FROM unnest(c.confkey) k
+             JOIN pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = k
+           )) AS parent_cols
+         FROM pg_constraint c
+         JOIN pg_class cl ON cl.oid = c.conrelid
+         JOIN pg_class cr ON cr.oid = c.confrelid
+         WHERE c.conname = 'fk_provider_attempts_request'`,
+      );
+
+      expect(fkRows).toHaveLength(1);
+      expect(fkRows[0]?.child_table).toBe('provider_attempts');
+      expect(fkRows[0]?.parent_table).toBe('gateway_requests');
+      expect(fkRows[0]?.child_cols).toEqual([
+        'request_id',
+        'org_id',
+        'virtual_key_id',
+        'billing_period',
+      ]);
+      expect(fkRows[0]?.parent_cols).toEqual([
+        'request_id',
+        'org_id',
+        'virtual_key_id',
+        'billing_period',
+      ]);
+
+      // 2. Verify unique attribution constraint on gateway_requests
+      const { rows: uqRows } = await pool.query<{
+        conname: string;
+        cols: string[];
+      }>(
+        `SELECT
+           c.conname,
+           array_to_json(ARRAY(
+             SELECT a.attname
+             FROM unnest(c.conkey) k
+             JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k
+           )) AS cols
+         FROM pg_constraint c
+         JOIN pg_class cl ON cl.oid = c.conrelid
+         WHERE cl.relname = 'gateway_requests' AND c.conname = 'uq_gateway_requests_attribution'`,
+      );
+
+      expect(uqRows).toHaveLength(1);
+      expect(uqRows[0]?.cols).toEqual(['request_id', 'org_id', 'virtual_key_id', 'billing_period']);
+
+      // 3. Verify check constraint on provider_attempts for cost_status consistency (DB-18)
+      const { rows: chkRows } = await pool.query<{
+        conname: string;
+        definition: string;
+      }>(
+        `SELECT c.conname, pg_get_constraintdef(c.oid) AS definition
+         FROM pg_constraint c
+         JOIN pg_class cl ON cl.oid = c.conrelid
+         WHERE cl.relname = 'provider_attempts' AND c.conname = 'chk_provider_attempts_cost_status'`,
+      );
+
+      expect(chkRows).toHaveLength(1);
+      expect(chkRows[0]?.definition).toContain("cost_status = 'estimated'::text");
+      expect(chkRows[0]?.definition).toContain('actual_cost_microdollars IS NULL');
+      expect(chkRows[0]?.definition).toContain("cost_status = 'confirmed'::text");
+      expect(chkRows[0]?.definition).toContain('actual_cost_microdollars IS NOT NULL');
     });
 
     it('enables and forces RLS on all four tables with zero permissive policies', async () => {
@@ -613,6 +705,110 @@ describe('SW-1.3.3 financial and observability schema: constraints, FKs, generat
       expect(rows[0]?.response_text).toBe('sample response');
       expect(rows[0]?.truncated).toBe(false);
     });
+
+    it('DB-18: confirmed zero cost succeeds when actual_cost_microdollars is explicitly zero', async () => {
+      const reqZero = '11111111-2222-4333-8444-555555555555';
+      const attZero = '66666666-7777-4888-8999-000000000000';
+
+      await pool.query(
+        `INSERT INTO gateway_requests
+           (request_id, org_id, virtual_key_id, gateway_instance_id, gateway_epoch, requested_model,
+            billing_period, status, cache_status, deadline_at)
+         VALUES
+           ($1, $2, $3, $4, 1, 'gpt-4o', '2026-11', 'completed', 'miss', clock_timestamp())`,
+        [reqZero, ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID],
+      );
+
+      const { rowCount } = await pool.query(
+        `INSERT INTO provider_attempts
+           (attempt_id, request_id, org_id, virtual_key_id, attempt_number, gateway_instance_id,
+            gateway_epoch, billing_period, provider, model, status, outcome, estimated_cost_microdollars,
+            actual_cost_microdollars, cost_status, hard_deadline_at)
+         VALUES
+           ($1, $2, $3, $4, 1, $5, 1, '2026-11', 'openai', 'gpt-4o', 'settled', 'completed', 5000,
+            0, 'confirmed', clock_timestamp() + interval '30 seconds')`,
+        [attZero, reqZero, ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID],
+      );
+      expect(rowCount).toBe(1);
+
+      const { rows } = await pool.query<{
+        actual: string;
+        effective: string;
+        cost_status: string;
+      }>(
+        `SELECT actual_cost_microdollars::text AS actual,
+                effective_cost_microdollars::text AS effective,
+                cost_status
+         FROM provider_attempts WHERE attempt_id = $1`,
+        [attZero],
+      );
+      expect(rows[0]?.actual).toBe('0');
+      expect(rows[0]?.effective).toBe('0');
+      expect(rows[0]?.cost_status).toBe('confirmed');
+    });
+
+    it('DB-17: month-boundary request preserves request billing period across month rollover', async () => {
+      const reqBoundary = 'aaaa1111-bbbb-4ccc-8ddd-eeeeffff0001';
+      const attBoundary = 'aaaa1111-bbbb-4ccc-8ddd-eeeeffff0002';
+
+      // Request admitted on the last second of November UTC
+      await pool.query(
+        `INSERT INTO gateway_requests
+           (request_id, org_id, virtual_key_id, gateway_instance_id, gateway_epoch, requested_model,
+            billing_period, status, cache_status, admitted_at, deadline_at)
+         VALUES
+           ($1, $2, $3, $4, 1, 'gpt-4o', '2026-11', 'in_progress', 'miss',
+            '2026-11-30 23:59:59.999+00'::timestamptz, '2026-12-01 00:00:30.000+00'::timestamptz)`,
+        [reqBoundary, ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID],
+      );
+
+      // Attempt admitted 5 seconds into December UTC must inherit the request's original '2026-11' period
+      const { rowCount } = await pool.query(
+        `INSERT INTO provider_attempts
+           (attempt_id, request_id, org_id, virtual_key_id, attempt_number, gateway_instance_id,
+            gateway_epoch, billing_period, provider, model, status, estimated_cost_microdollars,
+            cost_status, admitted_at, hard_deadline_at)
+         VALUES
+           ($1, $2, $3, $4, 1, $5, 1, '2026-11', 'openai', 'gpt-4o', 'reserved', 5000,
+            'estimated', '2026-12-01 00:00:05.000+00'::timestamptz, '2026-12-01 00:00:30.000+00'::timestamptz)`,
+        [attBoundary, reqBoundary, ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID],
+      );
+      expect(rowCount).toBe(1);
+
+      const { rows } = await pool.query<{ billing_period: string }>(
+        'SELECT billing_period FROM provider_attempts WHERE attempt_id = $1',
+        [attBoundary],
+      );
+      expect(rows[0]?.billing_period).toBe('2026-11');
+    });
+
+    it('DB-19: same-org matching virtual-key attribution succeeds', async () => {
+      const reqKey2 = 'aaaa2222-bbbb-4ccc-8ddd-eeeeffff0001';
+      const attKey2 = 'aaaa2222-bbbb-4ccc-8ddd-eeeeffff0002';
+
+      // Request using second virtual key of Org A
+      await pool.query(
+        `INSERT INTO gateway_requests
+           (request_id, org_id, virtual_key_id, gateway_instance_id, gateway_epoch, requested_model,
+            billing_period, status, cache_status, deadline_at)
+         VALUES
+           ($1, $2, $3, $4, 1, 'gpt-4o', '2026-11', 'in_progress', 'miss', clock_timestamp())`,
+        [reqKey2, ORG_A, VIRTUAL_KEY_A2_ID, GATEWAY_INSTANCE_ID],
+      );
+
+      // Attempt matching Org A and second virtual key
+      const { rowCount } = await pool.query(
+        `INSERT INTO provider_attempts
+           (attempt_id, request_id, org_id, virtual_key_id, attempt_number, gateway_instance_id,
+            gateway_epoch, billing_period, provider, model, status, estimated_cost_microdollars,
+            cost_status, hard_deadline_at)
+         VALUES
+           ($1, $2, $3, $4, 1, $5, 1, '2026-11', 'openai', 'gpt-4o', 'reserved', 3000,
+            'estimated', clock_timestamp() + interval '30 seconds')`,
+        [attKey2, reqKey2, ORG_A, VIRTUAL_KEY_A2_ID, GATEWAY_INSTANCE_ID],
+      );
+      expect(rowCount).toBe(1);
+    });
   });
 
   describe('Negative constraint & cross-tenant referential integrity tests (exact SQLSTATEs)', () => {
@@ -697,6 +893,104 @@ describe('SW-1.3.3 financial and observability schema: constraints, FKs, generat
            VALUES
              ($1, $2, clock_timestamp() + interval '7 days')`,
           [reqCross, ORG_B], // Org B referencing Request of Org A
+        ),
+        '23503',
+      );
+    });
+
+    // DB-17 tests: Parent-child billing-period inheritance
+    it('DB-17: rejects mismatched billing_period between attempt and request (23503)', async () => {
+      // REQUEST_ID was admitted with billing_period = '2026-11'. Specifying '2026-12' fails closed with 23503.
+      await expectSqlState(
+        pool.query(
+          `INSERT INTO provider_attempts
+             (attempt_id, request_id, org_id, virtual_key_id, attempt_number, gateway_instance_id,
+              gateway_epoch, billing_period, provider, model, status, estimated_cost_microdollars,
+              cost_status, hard_deadline_at)
+           VALUES
+             ('22222222-1111-4bbb-8bbb-bbbbbbbbbbbb', $1, $2, $3, 20, $4, 1, '2026-12', 'openai', 'gpt-4o', 'reserved', 1000,
+              'estimated', clock_timestamp())`,
+          [REQUEST_ID, ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID],
+        ),
+        '23503',
+      );
+    });
+
+    it('DB-17: month-boundary mismatch fails when attempt tries to advance period to next month (23503)', async () => {
+      const reqBoundaryFail = 'aaaa3333-bbbb-4ccc-8ddd-eeeeffff0001';
+      await pool.query(
+        `INSERT INTO gateway_requests
+           (request_id, org_id, virtual_key_id, gateway_instance_id, gateway_epoch, requested_model,
+            billing_period, status, cache_status, admitted_at, deadline_at)
+         VALUES
+           ($1, $2, $3, $4, 1, 'gpt-4o', '2026-11', 'in_progress', 'miss',
+            '2026-11-30 23:59:59.000+00'::timestamptz, '2026-12-01 00:00:30.000+00'::timestamptz)`,
+        [reqBoundaryFail, ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID],
+      );
+
+      // Attempt attempts to claim '2026-12' instead of inheriting request's '2026-11'
+      await expectSqlState(
+        pool.query(
+          `INSERT INTO provider_attempts
+             (attempt_id, request_id, org_id, virtual_key_id, attempt_number, gateway_instance_id,
+              gateway_epoch, billing_period, provider, model, status, estimated_cost_microdollars,
+              cost_status, admitted_at, hard_deadline_at)
+           VALUES
+             ('aaaa3333-bbbb-4ccc-8ddd-eeeeffff0002', $1, $2, $3, 1, $4, 1, '2026-12', 'openai', 'gpt-4o', 'reserved', 1000,
+              'estimated', '2026-12-01 00:00:05.000+00'::timestamptz, '2026-12-01 00:00:30.000+00'::timestamptz)`,
+          [reqBoundaryFail, ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID],
+        ),
+        '23503',
+      );
+    });
+
+    // DB-18 tests: Cost-status consistency
+    it('DB-18: rejects actual_cost_microdollars=NULL with cost_status="confirmed" (23514)', async () => {
+      await expectSqlState(
+        pool.query(
+          `INSERT INTO provider_attempts
+             (attempt_id, request_id, org_id, virtual_key_id, attempt_number, gateway_instance_id,
+              gateway_epoch, billing_period, provider, model, status, estimated_cost_microdollars,
+              actual_cost_microdollars, cost_status, hard_deadline_at)
+           VALUES
+             (gen_random_uuid(), $1, $2, $3, 21, $4, 1, '2026-11', 'openai', 'gpt-4o', 'reserved', 1000,
+              NULL, 'confirmed', clock_timestamp())`,
+          [REQUEST_ID, ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID],
+        ),
+        '23514',
+      );
+    });
+
+    it('DB-18: rejects non-NULL actual_cost_microdollars with cost_status="estimated" (23514)', async () => {
+      await expectSqlState(
+        pool.query(
+          `INSERT INTO provider_attempts
+             (attempt_id, request_id, org_id, virtual_key_id, attempt_number, gateway_instance_id,
+              gateway_epoch, billing_period, provider, model, status, estimated_cost_microdollars,
+              actual_cost_microdollars, cost_status, hard_deadline_at)
+           VALUES
+             (gen_random_uuid(), $1, $2, $3, 22, $4, 1, '2026-11', 'openai', 'gpt-4o', 'reserved', 1000,
+              500, 'estimated', clock_timestamp())`,
+          [REQUEST_ID, ORG_A, VIRTUAL_KEY_A_ID, GATEWAY_INSTANCE_ID],
+        ),
+        '23514',
+      );
+    });
+
+    // DB-19 tests: Virtual-key attribution
+    it('DB-19: rejects same-org wrong virtual_key_id in provider_attempts (23503)', async () => {
+      // REQUEST_ID was admitted with VIRTUAL_KEY_A_ID. Attempt uses VIRTUAL_KEY_A2_ID (both belong to ORG_A).
+      // Fails with 23503 because attempt must match parent request's virtual key.
+      await expectSqlState(
+        pool.query(
+          `INSERT INTO provider_attempts
+             (attempt_id, request_id, org_id, virtual_key_id, attempt_number, gateway_instance_id,
+              gateway_epoch, billing_period, provider, model, status, estimated_cost_microdollars,
+              cost_status, hard_deadline_at)
+           VALUES
+             ('22222222-3333-4bbb-8bbb-bbbbbbbbbbbb', $1, $2, $3, 23, $4, 1, '2026-11', 'openai', 'gpt-4o', 'reserved', 1000,
+              'estimated', clock_timestamp())`,
+          [REQUEST_ID, ORG_A, VIRTUAL_KEY_A2_ID, GATEWAY_INSTANCE_ID],
         ),
         '23503',
       );
@@ -1012,6 +1306,19 @@ describe('SW-1.3.3 financial and observability schema: constraints, FKs, generat
         [reqCascade],
       );
       expect(traceCheck[0]?.count).toBe(0);
+    });
+
+    it('uses idx_provider_cost_adjustments_attempt for canonical cost lookup (query plan evidence)', async () => {
+      // Seed adjustments to allow query planner to evaluate index scan
+      const { rows } = await pool.query<{ 'QUERY PLAN': string }>(
+        `EXPLAIN (COSTS OFF)
+         SELECT SUM(delta_microdollars)
+         FROM provider_cost_adjustments
+         WHERE attempt_id = $1 AND org_id = $2`,
+        [ATTEMPT_ID, ORG_A],
+      );
+      const planText = rows.map((r) => r['QUERY PLAN']).join('\n');
+      expect(planText).toMatch(/idx_provider_cost_adjustments_attempt|Bitmap Heap Scan|Index Scan/);
     });
   });
 
