@@ -217,11 +217,14 @@ BEGIN
       USING ERRCODE = '22023';
   END IF;
 
-  -- DB-37: Validate Argon2id PHC verifier representation. Reject plaintext, non-Argon2 algorithms, and malformed structures.
+  -- DB-39: Validate complete Argon2id PHC password verifier representation.
+  -- Format: $argon2id$v=19$<params>$<salt>$<derived_hash>
+  -- Enforces supported algorithm (argon2id), supported version (v=19), all three required positive integer parameters
+  -- (m, t, p in any order without duplicates or missing fields), and non-empty separate salt and derived-hash tokens.
   IF p_admin_password_hash IS NULL
      OR p_admin_password_hash = ''
      OR pg_catalog.length(p_admin_password_hash) > 255
-     OR p_admin_password_hash !~ '^\$argon2id\$v=\d+\$[a-z0-9,=]+\$[A-Za-z0-9+/=_-]+(\$[A-Za-z0-9+/=_-]+)*$' THEN
+     OR p_admin_password_hash !~ '^\$argon2id\$v=19\$(?:m=[1-9][0-9]*,t=[1-9][0-9]*,p=[1-9][0-9]*|m=[1-9][0-9]*,p=[1-9][0-9]*,t=[1-9][0-9]*|t=[1-9][0-9]*,m=[1-9][0-9]*,p=[1-9][0-9]*|t=[1-9][0-9]*,p=[1-9][0-9]*,m=[1-9][0-9]*|p=[1-9][0-9]*,m=[1-9][0-9]*,t=[1-9][0-9]*|p=[1-9][0-9]*,t=[1-9][0-9]*,m=[1-9][0-9]*)\$[A-Za-z0-9+/=_-]+\$[A-Za-z0-9+/=_-]+$' THEN
     RAISE EXCEPTION 'Invalid admin password hash: must be a valid Argon2id verifier representation'
       USING ERRCODE = '22023';
   END IF;

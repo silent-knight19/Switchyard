@@ -64,6 +64,12 @@ describe('SW-1.4.3 & SW-1.4.4 Privileged Functions Integration Suite (real Postg
   const rawRevokedSecret = 'revoked-virtual-key-secret-32byte';
   const revokedKeyHash = sha256(rawRevokedSecret);
 
+  // Complete, known-good Argon2id PHC verifier fixtures (DB-39)
+  const VALID_ARGON2ID_VERIFIER =
+    '$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$9s/8SoWjpMIuoGun45BhAzSdhaQx+/KExluUdnoMr90';
+  const OWASP_ARGON2ID_VERIFIER =
+    '$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$9s/8SoWjpMIuoGun45BhAzSdhaQx+/KExluUdnoMr90';
+
   async function connectAs(role: LoginRole): Promise<pg.Client> {
     const client = new pg.Client({
       connectionString: roleConnectionString(database.url, role, passwords[role]),
@@ -117,8 +123,8 @@ describe('SW-1.4.3 & SW-1.4.4 Privileged Functions Integration Suite (real Postg
     await adminClient.query(`
       INSERT INTO users (id, org_id, email_normalized, password_hash, role)
       VALUES
-        ('${userAId}', '${orgAId}', 'admin@alpha.com', '$argon2id$v=19$m=65536,t=3,p=4$fakehashA', 'admin'),
-        ('${userBId}', '${orgBId}', 'member@beta.com', '$argon2id$v=19$m=65536,t=3,p=4$fakehashB', 'member');
+        ('${userAId}', '${orgAId}', 'admin@alpha.com', '${VALID_ARGON2ID_VERIFIER}', 'admin'),
+        ('${userBId}', '${orgBId}', 'member@beta.com', '${OWASP_ARGON2ID_VERIFIER}', 'member');
     `);
 
     await adminClient.query(
@@ -422,7 +428,7 @@ describe('SW-1.4.3 & SW-1.4.4 Privileged Functions Integration Suite (real Postg
       expect(user.id).toBe(userAId);
       expect(user.org_id).toBe(orgAId);
       expect(user.role).toBe('admin');
-      expect(user.password_hash).toBe('$argon2id$v=19$m=65536,t=3,p=4$fakehashA');
+      expect(user.password_hash).toBe(VALID_ARGON2ID_VERIFIER);
     });
 
     it('returns empty result set for unknown email', async () => {
@@ -529,7 +535,7 @@ describe('SW-1.4.3 & SW-1.4.4 Privileged Functions Integration Suite (real Postg
           Buffer.from('auth-tag-16bytes'),
           newAdminId,
           'founder@bootstrap.com',
-          '$argon2id$v=19$m=65536,t=3,p=4$newAdminHash',
+          VALID_ARGON2ID_VERIFIER,
         ],
       );
 
@@ -566,7 +572,7 @@ describe('SW-1.4.3 & SW-1.4.4 Privileged Functions Integration Suite (real Postg
             Buffer.from('tag'),
             freshAdminId,
             'unique.email@test.com',
-            '$argon2id$v=19$m=65536,t=3,p=4$someHash',
+            VALID_ARGON2ID_VERIFIER,
           ],
         ),
         '23505',
@@ -600,7 +606,7 @@ describe('SW-1.4.3 & SW-1.4.4 Privileged Functions Integration Suite (real Postg
             Buffer.from('tag'),
             freshAdminId,
             'founder@bootstrap.com', // duplicate email!
-            '$argon2id$v=19$m=65536,t=3,p=4$someHash',
+            VALID_ARGON2ID_VERIFIER,
           ],
         ),
         '23505',
@@ -615,22 +621,28 @@ describe('SW-1.4.3 & SW-1.4.4 Privileged Functions Integration Suite (real Postg
 
     it('rejects NULL org_id or admin_user_id with SQLSTATE 22004', async () => {
       await expectSqlState(
-        appClient.query(`
+        appClient.query(
+          `
           SELECT * FROM app_private.create_organization_with_admin(
             NULL, 'Org', 1000, 1, '\\x01'::bytea, '\\x02'::bytea, '\\x03'::bytea,
-            '99999999-9999-9999-9999-999999999999', 'a@b.com', '$argon2id$v=19$m=65536,t=3,p=4$someHash'
+            '99999999-9999-9999-9999-999999999999', 'a@b.com', $1
           )
-        `),
+        `,
+          [VALID_ARGON2ID_VERIFIER],
+        ),
         '22004',
       );
 
       await expectSqlState(
-        appClient.query(`
+        appClient.query(
+          `
           SELECT * FROM app_private.create_organization_with_admin(
             '99999999-9999-9999-9999-999999999999', 'Org', 1000, 1, '\\x01'::bytea, '\\x02'::bytea, '\\x03'::bytea,
-            NULL, 'a@b.com', '$argon2id$v=19$m=65536,t=3,p=4$someHash'
+            NULL, 'a@b.com', $1
           )
-        `),
+        `,
+          [VALID_ARGON2ID_VERIFIER],
+        ),
         '22004',
       );
     });
@@ -638,7 +650,7 @@ describe('SW-1.4.3 & SW-1.4.4 Privileged Functions Integration Suite (real Postg
     it('rejects invalid parameters with SQLSTATE 22023', async () => {
       const validOrg = '99999999-9999-9999-9999-999999999991';
       const validAdmin = '99999999-9999-9999-9999-999999999992';
-      const validHash = '$argon2id$v=19$m=65536,t=3,p=4$testHash';
+      const validHash = VALID_ARGON2ID_VERIFIER;
 
       // Empty name
       await expectSqlState(
@@ -742,7 +754,7 @@ describe('SW-1.4.3 & SW-1.4.4 Privileged Functions Integration Suite (real Postg
     it('enforces canonical normalized email contract on bootstrap (DB-36)', async () => {
       const baseOrg = '99999999-9999-9999-9999-9999999999a0';
       const baseAdmin = '99999999-9999-9999-9999-9999999999a1';
-      const validHash = '$argon2id$v=19$m=65536,t=3,p=4$someHash';
+      const validHash = VALID_ARGON2ID_VERIFIER;
 
       // 1. Mixed-case admin email rejected with 22023
       await expectSqlState(
@@ -862,90 +874,238 @@ describe('SW-1.4.3 & SW-1.4.4 Privileged Functions Integration Suite (real Postg
       expect(countRes.rows[0]?.count).toBe(1);
     });
 
-    it('enforces Argon2id verifier representation contract on bootstrap (DB-37)', async () => {
-      const baseOrg = '99999999-9999-9999-9999-9999999999b0';
-      const baseAdmin = '99999999-9999-9999-9999-9999999999b1';
-
-      // 1. Plaintext passwords rejected with 22023
-      for (const plaintext of ['hunter2', 'Password123!', 'plaintext', 'pass']) {
+    it('enforces complete Argon2id password verifier representation contract on bootstrap (DB-39)', async () => {
+      // Helper to test invalid verifiers and verify rollback / zero persistent state
+      const assertInvalidVerifier = async (malformedVerifier: string, label: string) => {
+        const testOrgId = crypto.randomUUID();
+        const testAdminId = crypto.randomUUID();
         await expectSqlState(
           appClient.query(
             `
             SELECT * FROM app_private.create_organization_with_admin(
-              $1, 'Org Plaintext', 1000, 1, '\\x01'::bytea, '\\x02'::bytea, '\\x03'::bytea,
-              $2, 'admin.plaintext@test.com', $3
+              $1, 'Invalid Verifier Org', 1000, 1, '\\x01'::bytea, '\\x02'::bytea, '\\x03'::bytea,
+              $2, 'admin.invalid@test.com', $3
             )
           `,
-            [baseOrg, baseAdmin, plaintext],
+            [testOrgId, testAdminId, malformedVerifier],
           ),
           '22023',
         );
-      }
 
-      // 2. Non-Argon2 algorithms rejected with 22023
-      const bcryptHash = '$2a$12$R9h/cIPz0gi.URNNXRkh2OPST9/PgBkqquzi.Ss7KIUgO2t0jWMUW';
-      await expectSqlState(
-        appClient.query(
-          `
-          SELECT * FROM app_private.create_organization_with_admin(
-            $1, 'Org Bcrypt', 1000, 1, '\\x01'::bytea, '\\x02'::bytea, '\\x03'::bytea,
-            $2, 'admin.bcrypt@test.com', $3
-          )
-        `,
-          [baseOrg, baseAdmin, bcryptHash],
-        ),
-        '22023',
+        // Persistent-state: neither organization nor admin user must be created
+        const orgCheck = await adminClient.query('SELECT id FROM organizations WHERE id = $1', [
+          testOrgId,
+        ]);
+        expect(orgCheck.rows, `Expected no organization row for ${label}`).toHaveLength(0);
+        const userCheck = await adminClient.query('SELECT id FROM users WHERE id = $1', [
+          testAdminId,
+        ]);
+        expect(userCheck.rows, `Expected no user row for ${label}`).toHaveLength(0);
+      };
+
+      // 1. Missing derived-hash component (The exact DB-39 confirmed defect)
+      await assertInvalidVerifier(
+        '$argon2id$v=19$m=65536,t=3,p=4$onlysalt',
+        'missing derived-hash component',
       );
 
-      // 3. Malformed Argon2 strings rejected with 22023
-      for (const malformed of [
-        '$argon2id$',
-        '$argon2id$v=19$',
-        '$argon2id$v=19$m=65536',
-        '$argon2id$v=19$m=65536,t=3,p=4',
-      ]) {
-        await expectSqlState(
-          appClient.query(
-            `
-            SELECT * FROM app_private.create_organization_with_admin(
-              $1, 'Org Malformed', 1000, 1, '\\x01'::bytea, '\\x02'::bytea, '\\x03'::bytea,
-              $2, 'admin.malformed@test.com', $3
-            )
-          `,
-            [baseOrg, baseAdmin, malformed],
-          ),
-          '22023',
-        );
+      // 2. Missing salt component
+      await assertInvalidVerifier('$argon2id$v=19$m=65536,t=3,p=4$', 'missing salt component');
+
+      // 3. Empty salt
+      await assertInvalidVerifier(
+        '$argon2id$v=19$m=65536,t=3,p=4$$9s/8SoWjpMIuoGun45BhAzSdhaQx+/KExluUdnoMr90',
+        'empty salt',
+      );
+
+      // 4. Empty derived hash
+      await assertInvalidVerifier(
+        '$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$',
+        'empty derived hash',
+      );
+
+      // 5. Missing required parameters
+      await assertInvalidVerifier(
+        '$argon2id$v=19$m=65536,t=3$c29tZXNhbHQ$9s/8SoWjpMIuoGun45BhAzSdhaQx+/KExluUdnoMr90',
+        'missing parameter p',
+      );
+      await assertInvalidVerifier(
+        '$argon2id$v=19$t=3,p=4$c29tZXNhbHQ$9s/8SoWjpMIuoGun45BhAzSdhaQx+/KExluUdnoMr90',
+        'missing parameter m',
+      );
+      await assertInvalidVerifier(
+        '$argon2id$v=19$m=65536,p=4$c29tZXNhbHQ$9s/8SoWjpMIuoGun45BhAzSdhaQx+/KExluUdnoMr90',
+        'missing parameter t',
+      );
+
+      // 6. Duplicate parameter names
+      await assertInvalidVerifier(
+        '$argon2id$v=19$m=65536,t=3,m=65536$c29tZXNhbHQ$9s/8SoWjpMIuoGun45BhAzSdhaQx+/KExluUdnoMr90',
+        'duplicate parameter m',
+      );
+      await assertInvalidVerifier(
+        '$argon2id$v=19$m=65536,t=3,p=4,p=4$c29tZXNhbHQ$9s/8SoWjpMIuoGun45BhAzSdhaQx+/KExluUdnoMr90',
+        'duplicate parameter p',
+      );
+
+      // 7. Non-numeric or zero values for required positive parameters
+      await assertInvalidVerifier(
+        '$argon2id$v=19$m=0,t=3,p=4$c29tZXNhbHQ$9s/8SoWjpMIuoGun45BhAzSdhaQx+/KExluUdnoMr90',
+        'zero memory parameter',
+      );
+      await assertInvalidVerifier(
+        '$argon2id$v=19$m=65536,t=0,p=4$c29tZXNhbHQ$9s/8SoWjpMIuoGun45BhAzSdhaQx+/KExluUdnoMr90',
+        'zero iteration parameter',
+      );
+      await assertInvalidVerifier(
+        '$argon2id$v=19$m=65536,t=3,p=0$c29tZXNhbHQ$9s/8SoWjpMIuoGun45BhAzSdhaQx+/KExluUdnoMr90',
+        'zero parallelism parameter',
+      );
+      await assertInvalidVerifier(
+        '$argon2id$v=19$m=abc,t=3,p=4$c29tZXNhbHQ$9s/8SoWjpMIuoGun45BhAzSdhaQx+/KExluUdnoMr90',
+        'non-numeric memory parameter',
+      );
+      await assertInvalidVerifier(
+        '$argon2id$v=19$m=-65536,t=3,p=4$c29tZXNhbHQ$9s/8SoWjpMIuoGun45BhAzSdhaQx+/KExluUdnoMr90',
+        'negative memory parameter',
+      );
+
+      // 8. Unsupported version values
+      await assertInvalidVerifier(
+        '$argon2id$v=13$m=65536,t=3,p=4$c29tZXNhbHQ$9s/8SoWjpMIuoGun45BhAzSdhaQx+/KExluUdnoMr90',
+        'unsupported version v=13',
+      );
+      await assertInvalidVerifier(
+        '$argon2id$v=0$m=65536,t=3,p=4$c29tZXNhbHQ$9s/8SoWjpMIuoGun45BhAzSdhaQx+/KExluUdnoMr90',
+        'unsupported version v=0',
+      );
+      await assertInvalidVerifier(
+        '$argon2id$v=20$m=65536,t=3,p=4$c29tZXNhbHQ$9s/8SoWjpMIuoGun45BhAzSdhaQx+/KExluUdnoMr90',
+        'unsupported version v=20',
+      );
+
+      // 9. Unexpected extra components
+      await assertInvalidVerifier(
+        '$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$9s/8SoWjpMIuoGun45BhAzSdhaQx+/KExluUdnoMr90$extra',
+        'unexpected extra field',
+      );
+
+      // 10. Invalid encoding characters
+      await assertInvalidVerifier(
+        '$argon2id$v=19$m=65536,t=3,p=4$invalid!@#salt$9s/8SoWjpMIuoGun45BhAzSdhaQx+/KExluUdnoMr90',
+        'invalid character in salt',
+      );
+      await assertInvalidVerifier(
+        '$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$invalid!@#hash',
+        'invalid character in derived hash',
+      );
+
+      // 11. Plaintext passwords
+      for (const plaintext of ['hunter2', 'Password123!', 'plaintext', 'pass']) {
+        await assertInvalidVerifier(plaintext, `plaintext password ${plaintext}`);
       }
 
-      // 4. Legitimate OWASP-baseline Argon2id verifier accepted
-      const owaspOrgId = '99999999-9999-9999-9999-9999999999b2';
-      const owaspAdminId = '99999999-9999-9999-9999-9999999999b3';
-      const owaspHash = '$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$somehash123';
-      const owaspEmail = 'owasp.admin@bootstrap.com';
+      // 12. Non-Argon2 algorithms (Bcrypt / MD5)
+      await assertInvalidVerifier(
+        '$2a$12$R9h/cIPz0gi.URNNXRkh2OPST9/PgBkqquzi.Ss7KIUgO2t0jWMUW',
+        'bcrypt algorithm',
+      );
+      await assertInvalidVerifier('$1$md5salt$md5hash', 'md5 algorithm');
 
-      const res = await appClient.query<{ org_id: string; admin_user_id: string }>(
+      // 13. Valid verifier 1: Complete, known-good Argon2id PHC verifier
+      const validOrgId = '99999999-9999-9999-9999-9999999999b4';
+      const validAdminId = '99999999-9999-9999-9999-9999999999b5';
+      const validEmail = 'complete.admin@bootstrap.com';
+
+      const resValid = await appClient.query<{ org_id: string; admin_user_id: string }>(
+        `
+        SELECT * FROM app_private.create_organization_with_admin(
+          $1, 'Complete Verifier Org', 1000, 1, '\\x01'::bytea, '\\x02'::bytea, '\\x03'::bytea,
+          $2, $3, $4
+        )
+      `,
+        [validOrgId, validAdminId, validEmail, VALID_ARGON2ID_VERIFIER],
+      );
+      expect(resValid.rows).toHaveLength(1);
+      expect(resValid.rows[0]?.org_id).toBe(validOrgId);
+      expect(resValid.rows[0]?.admin_user_id).toBe(validAdminId);
+
+      // Verify return fields remain strictly ['org_id', 'admin_user_id']
+      expect(resValid.fields.map((f) => f.name)).toEqual(['org_id', 'admin_user_id']);
+
+      // Verify persistent state in organizations
+      const checkOrg = await adminClient.query('SELECT id, name FROM organizations WHERE id = $1', [
+        validOrgId,
+      ]);
+      expect(checkOrg.rows).toHaveLength(1);
+      expect(checkOrg.rows[0]?.name).toBe('Complete Verifier Org');
+
+      // Verify persistent state in users: role equals 'admin' and password_hash stored unchanged
+      const checkUser = await adminClient.query(
+        'SELECT id, org_id, role, password_hash FROM users WHERE id = $1',
+        [validAdminId],
+      );
+      expect(checkUser.rows).toHaveLength(1);
+      expect(checkUser.rows[0]?.org_id).toBe(validOrgId);
+      expect(checkUser.rows[0]?.role).toBe('admin');
+      expect(checkUser.rows[0]?.password_hash).toBe(VALID_ARGON2ID_VERIFIER);
+
+      // Verify user is immediately resolvable by lookup_user_for_login
+      const lookupUser = await appClient.query<{
+        id: string;
+        org_id: string;
+        role: string;
+        password_hash: string;
+      }>('SELECT * FROM app_private.lookup_user_for_login($1)', [validEmail]);
+      expect(lookupUser.rows).toHaveLength(1);
+      expect(lookupUser.rows[0]?.id).toBe(validAdminId);
+      expect(lookupUser.rows[0]?.org_id).toBe(validOrgId);
+      expect(lookupUser.rows[0]?.role).toBe('admin');
+      expect(lookupUser.rows[0]?.password_hash).toBe(VALID_ARGON2ID_VERIFIER);
+
+      // 14. Valid verifier 2: OWASP-recommended baseline verifier
+      const owaspOrgId = '99999999-9999-9999-9999-9999999999b6';
+      const owaspAdminId = '99999999-9999-9999-9999-9999999999b7';
+      const owaspEmail = 'owasp.baseline@bootstrap.com';
+
+      const resOwasp = await appClient.query<{ org_id: string; admin_user_id: string }>(
         `
         SELECT * FROM app_private.create_organization_with_admin(
           $1, 'OWASP Org', 1000, 1, '\\x01'::bytea, '\\x02'::bytea, '\\x03'::bytea,
           $2, $3, $4
         )
       `,
-        [owaspOrgId, owaspAdminId, owaspEmail, owaspHash],
+        [owaspOrgId, owaspAdminId, owaspEmail, OWASP_ARGON2ID_VERIFIER],
       );
-      expect(res.rows).toHaveLength(1);
-      expect(res.rows[0]?.org_id).toBe(owaspOrgId);
-      expect(res.rows[0]?.admin_user_id).toBe(owaspAdminId);
+      expect(resOwasp.rows).toHaveLength(1);
 
-      // Verify that create_organization_with_admin returns ONLY org_id and admin_user_id (no hash leaked)
-      const fieldNames = res.fields.map((f) => f.name);
-      expect(fieldNames).toEqual(['org_id', 'admin_user_id']);
-
-      // Verify persistent state: password_hash stored accurately without alteration
-      const checkHash = await adminClient.query('SELECT password_hash FROM users WHERE id = $1', [
+      const checkOwasp = await adminClient.query('SELECT password_hash FROM users WHERE id = $1', [
         owaspAdminId,
       ]);
-      expect(checkHash.rows[0]?.password_hash).toBe(owaspHash);
+      expect(checkOwasp.rows[0]?.password_hash).toBe(OWASP_ARGON2ID_VERIFIER);
+
+      // 15. Valid verifier 3: Permuted parameter ordering (t, m, p) accepted without overconstraining
+      const permOrgId = '99999999-9999-9999-9999-9999999999b8';
+      const permAdminId = '99999999-9999-9999-9999-9999999999b9';
+      const permVerifier =
+        '$argon2id$v=19$t=2,m=19456,p=1$c29tZXNhbHQ$9s/8SoWjpMIuoGun45BhAzSdhaQx+/KExluUdnoMr90';
+      const permEmail = 'permuted.params@bootstrap.com';
+
+      const resPerm = await appClient.query<{ org_id: string; admin_user_id: string }>(
+        `
+        SELECT * FROM app_private.create_organization_with_admin(
+          $1, 'Permuted Org', 1000, 1, '\\x01'::bytea, '\\x02'::bytea, '\\x03'::bytea,
+          $2, $3, $4
+        )
+      `,
+        [permOrgId, permAdminId, permEmail, permVerifier],
+      );
+      expect(resPerm.rows).toHaveLength(1);
+
+      const checkPerm = await adminClient.query('SELECT password_hash FROM users WHERE id = $1', [
+        permAdminId,
+      ]);
+      expect(checkPerm.rows[0]?.password_hash).toBe(permVerifier);
     });
   });
 
@@ -1080,12 +1240,15 @@ describe('SW-1.4.3 & SW-1.4.4 Privileged Functions Integration Suite (real Postg
 
       // Negative: create_organization_with_admin denied with 42501
       await expectSqlState(
-        workerClient.query(`
+        workerClient.query(
+          `
           SELECT * FROM app_private.create_organization_with_admin(
             'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'Org', 1000, 1, '\\x01'::bytea, '\\x02'::bytea, '\\x03'::bytea,
-            'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'a@b.com', 'h'
+            'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'a@b.com', $1
           )
-        `),
+        `,
+          [VALID_ARGON2ID_VERIFIER],
+        ),
         '42501',
       );
     });
@@ -1104,12 +1267,15 @@ describe('SW-1.4.3 & SW-1.4.4 Privileged Functions Integration Suite (real Postg
         '42501',
       );
       await expectSqlState(
-        startupClient.query(`
+        startupClient.query(
+          `
           SELECT * FROM app_private.create_organization_with_admin(
             'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'Org', 1000, 1, '\\x01'::bytea, '\\x02'::bytea, '\\x03'::bytea,
-            'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'a@b.com', 'h'
+            'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'a@b.com', $1
           )
-        `),
+        `,
+          [VALID_ARGON2ID_VERIFIER],
+        ),
         '42501',
       );
       await expectSqlState(
@@ -1152,12 +1318,15 @@ describe('SW-1.4.3 & SW-1.4.4 Privileged Functions Integration Suite (real Postg
           '42501',
         );
         await expectSqlState(
-          publicClient.query(`
+          publicClient.query(
+            `
             SELECT * FROM app_private.create_organization_with_admin(
               'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'Org', 1000, 1, '\\x01'::bytea, '\\x02'::bytea, '\\x03'::bytea,
-              'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'a@b.com', 'h'
+              'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'a@b.com', $1
             )
-          `),
+          `,
+            [VALID_ARGON2ID_VERIFIER],
+          ),
           '42501',
         );
         await expectSqlState(
@@ -1246,7 +1415,7 @@ describe('SW-1.4.3 & SW-1.4.4 Privileged Functions Integration Suite (real Postg
 
       expect(rows).toHaveLength(1);
       expect(rows[0]?.id).toBe(userAId);
-      expect(rows[0]?.password_hash).toBe('$argon2id$v=19$m=65536,t=3,p=4$fakehashA');
+      expect(rows[0]?.password_hash).toBe(VALID_ARGON2ID_VERIFIER);
 
       await appClient.query('DROP TABLE IF EXISTS pg_temp.users');
       await appClient.query('RESET search_path');
