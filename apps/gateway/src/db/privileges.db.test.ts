@@ -152,22 +152,57 @@ describe('SW-1.3.1 role privileges under real authenticated sessions', () => {
     await expectSqlState(worker.query('UPDATE gateway_control SET gateway_epoch = 3'), '42501');
   });
 
-  it('runtime roles cannot read or write tenant tables (Batch A default deny)', async () => {
+  it('enforces least-privilege table grants across runtime roles (Subphase 1.4 matrix)', async () => {
     const app = await connectAs('gateway_app');
     const worker = await connectAs('gateway_worker');
     const startup = await connectAs('gateway_startup');
 
-    for (const client of [app, worker, startup]) {
-      await expectSqlState(client.query('SELECT * FROM organizations'), '42501');
-      await expectSqlState(client.query('SELECT * FROM users'), '42501');
-      await expectSqlState(client.query('SELECT * FROM provider_keys'), '42501');
-      await expectSqlState(client.query('SELECT * FROM virtual_keys'), '42501');
-      await expectSqlState(client.query('SELECT * FROM web_sessions'), '42501');
-      await expectSqlState(client.query('SELECT * FROM gateway_requests'), '42501');
-      await expectSqlState(client.query('SELECT * FROM provider_attempts'), '42501');
-      await expectSqlState(client.query('SELECT * FROM provider_cost_adjustments'), '42501');
-      await expectSqlState(client.query('SELECT * FROM trace_payloads'), '42501');
+    // 1. gateway_startup holds ZERO tenant-table privileges
+    const tenantTables = [
+      'organizations',
+      'users',
+      'web_sessions',
+      'provider_keys',
+      'virtual_keys',
+      'gateway_requests',
+      'provider_attempts',
+      'provider_cost_adjustments',
+      'trace_payloads',
+    ];
+    for (const table of tenantTables) {
+      await expectSqlState(startup.query(`SELECT * FROM ${table}`), '42501');
     }
+
+    // 2. gateway_worker has ZERO privileges on users and web_sessions (§12.1)
+    await expectSqlState(worker.query('SELECT * FROM users'), '42501');
+    await expectSqlState(worker.query('SELECT * FROM web_sessions'), '42501');
+
+    // 3. gateway_worker is strictly denied provider/organization encryption secrets (§12.1, §19.4)
+    await expectSqlState(worker.query('SELECT wrapped_dek FROM organizations'), '42501');
+    await expectSqlState(worker.query('SELECT dek_iv FROM organizations'), '42501');
+    await expectSqlState(worker.query('SELECT dek_auth_tag FROM organizations'), '42501');
+    await expectSqlState(worker.query('SELECT ciphertext FROM provider_keys'), '42501');
+    await expectSqlState(worker.query('SELECT iv FROM provider_keys'), '42501');
+    await expectSqlState(worker.query('SELECT auth_tag FROM provider_keys'), '42501');
+
+    // 4. Financial tables are protected against direct DELETE for both app and worker
+    for (const client of [app, worker]) {
+      await expectSqlState(client.query('DELETE FROM gateway_requests'), '42501');
+      await expectSqlState(client.query('DELETE FROM provider_attempts'), '42501');
+      await expectSqlState(client.query('DELETE FROM provider_cost_adjustments'), '42501');
+      await expectSqlState(
+        client.query('UPDATE provider_cost_adjustments SET delta_microdollars = 0'),
+        '42501',
+      );
+    }
+
+    // 5. Without tenant context, permitted SELECTs return zero rows due to RLS
+    const { rows: appOrgs } = await app.query('SELECT * FROM organizations');
+    expect(appOrgs).toHaveLength(0);
+    const { rows: appUsers } = await app.query('SELECT * FROM users');
+    expect(appUsers).toHaveLength(0);
+    const { rows: workerVirtualKeys } = await worker.query('SELECT * FROM virtual_keys');
+    expect(workerVirtualKeys).toHaveLength(0);
   });
 
   it('runtime roles cannot read or modify migration metadata', async () => {
@@ -298,7 +333,9 @@ describe('SW-1.3.1 role privileges under real authenticated sessions', () => {
          FROM information_schema.table_privileges
          WHERE table_schema = 'public'
            AND table_name IN ('organizations', 'users', 'web_sessions', 'provider_keys',
-                              'virtual_keys', 'gateway_control', 'gateway_migrations')
+                              'virtual_keys', 'gateway_control', 'gateway_migrations',
+                              'gateway_requests', 'provider_attempts', 'provider_cost_adjustments',
+                              'trace_payloads')
            AND grantee = 'PUBLIC'`,
       );
       expect(publicTableGrants[0]?.count).toBe(0);
@@ -326,7 +363,7 @@ describe('SW-1.3.1 role privileges under real authenticated sessions', () => {
     }
 
     const app = await connectAs('gateway_app');
-    const privilegeError = await expectSqlState(app.query('SELECT * FROM users'), '42501');
+    const privilegeError = await expectSqlState(app.query('DELETE FROM gateway_requests'), '42501');
     expect(errorMessage(privilegeError)).toMatch(/permission denied/i);
   });
 
@@ -348,7 +385,7 @@ describe('SW-1.3.1 role privileges under real authenticated sessions', () => {
     });
     try {
       const applied = await runMigrations(migrator);
-      expect(applied).toHaveLength(8);
+      expect(applied).toHaveLength(9);
     } finally {
       await migrator.end();
     }

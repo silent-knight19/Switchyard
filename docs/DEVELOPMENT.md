@@ -318,7 +318,48 @@ migration `0008-financial-integrity.sql` hardens the financial ledger:
 - **RLS Default-Deny Posture:** RLS remains enabled and forced with zero permissive policies; runtime
   roles hold zero table privileges until Subphase 1.4.
 
-#### 7.7.8 Known limitations (Phase 2)
+#### 7.7.8 Transaction-Scoped Tenant Context & RLS Policies (SW-1.4.1 & SW-1.4.2)
+
+Established on top of accepted prerequisite Subphase 1.3 (`1b13bbe464fbfa2ec9bd3b361ab36ecfae12096a`),
+Subphase 1.4 Batch A delivers transaction-scoped tenant isolation and least-privilege PostgreSQL role grants.
+
+##### 1. `withTenant(pool, orgId, callback)` Contract
+
+Defined in `apps/gateway/src/db/tenant.ts`, `withTenant` executes tenant-scoped operations within a dedicated database transaction:
+
+```typescript
+export async function withTenant<T>(
+  pool: Pool,
+  orgId: string,
+  callback: (client: PoolClient) => Promise<T>
+): Promise<T>;
+```
+
+- **UUID Validation:** `orgId` is validated fail-closed upfront (`/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i`). Invalid tenant IDs throw `InvalidTenantIdError` without acquiring a pool client.
+- **AsyncLocalStorage Isolation & Nesting Prevention:** Active tenant context is tracked in `AsyncLocalStorage`. Nested invocations of `withTenant` throw `TenantTransactionError` to prevent context collision, transaction hijacking, and accidental commit boundaries.
+- **Transaction-Local GUC:** Sets PostgreSQL application context `app.current_org_id` transaction-locally (`is_local = true`):
+  ```sql
+  SELECT pg_catalog.set_config('app.current_org_id', $1, true);
+  ```
+  Because `is_local = true`, the parameter automatically reverts when the transaction ends (commit or rollback).
+- **Connection Hygiene & Pool Invalidation:**
+  - Client release is intercepted during the callback to prevent premature release.
+  - On standard completion, `COMMIT` is executed and the client is safely released to the pool.
+  - On callback error, `ROLLBACK` is issued. If rollback fails or if an error occurs during commit/rollback, the connection state is uncertain: `withTenant` marks the client broken by calling `client.release(true)`, forcing the pool to destroy the physical connection and preventing session-scope context bleed.
+
+##### 2. Migration `0009-tenant-rls-policies.sql` & Unified Policy Architecture
+
+Migration `0009-tenant-rls-policies.sql` establishes:
+
+- **Row-Level Security Posture:** Asserts `ENABLE ROW LEVEL SECURITY` and `FORCE ROW LEVEL SECURITY` across all 9 tenant-owned tables (`organizations`, `users`, `web_sessions`, `provider_keys`, `virtual_keys`, `gateway_requests`, `provider_attempts`, `provider_cost_adjustments`, `trace_payloads`). `FORCE RLS` ensures policies apply even to table owner `gateway_owner`.
+- **Unified Permissive Policies (DB-04 Guard):** Exactly one permissive policy per table (`FOR ALL TO PUBLIC USING (...) WITH CHECK (...)`). This permanently avoids the PostgreSQL vulnerability where multiple permissive policies are evaluated with logical `OR`. If `app.current_org_id` is unset or empty, the predicate evaluates to `NULL` (falsy), denying all access by default.
+- **Least-Privilege Role Grants:**
+  - `gateway_app`: Tenant-scoped CRUD on data/control plane tables; denied `DELETE` on financial ledger tables; denied `UPDATE`/`DELETE` on append-only adjustments.
+  - `gateway_worker`: Non-secret metadata on organizations/provider keys; insert/update on attempts, adjustments, traces; secret columns (`wrapped_dek`, `ciphertext`, IVs, auth tags) and user/session tables strictly revoked/denied.
+  - `gateway_startup` & `PUBLIC`: Zero table grants on all tenant tables.
+  - Runtime roles possess no `BYPASSRLS` attribute and cannot alter RLS policies.
+
+#### 7.7.9 Known limitations (Phase 2)
 
 - `gateway_startup` may update `gateway_epoch` but not `updated_at`; the §12.1 column grant is
   literal, so epoch bumps leave `updated_at` stale. A trigger or a widened grant is a Phase 2
@@ -327,7 +368,7 @@ migration `0008-financial-integrity.sql` hardens the financial ledger:
   exclusive transaction advisory lock. Column grants cannot enforce lock ordering; that
   admission-protocol invariant is a Phase 2 implementation concern.
 
-#### 7.7.9 Database integration tests
+#### 7.7.10 Database integration tests
 
 ```bash
 pnpm --filter @switchyard/gateway test:db   # or: pnpm test:db from the repo root
