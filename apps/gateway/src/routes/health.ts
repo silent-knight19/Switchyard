@@ -10,6 +10,8 @@ export interface HealthRouteOptions {
   lifecycle: LifecycleCoordinator;
 }
 
+const READINESS_TIMEOUT_MS = 2500;
+
 export async function registerHealthRoutes(
   app: AppInstance,
   options: HealthRouteOptions,
@@ -31,11 +33,33 @@ export async function registerHealthRoutes(
       });
     }
 
-    const [pgResult, redisResult] = await Promise.all([
-      postgres.checkReadiness(),
-      redis.checkReadiness(),
-    ]);
+    let timer: NodeJS.Timeout | null = null;
+    const timeoutPromise = new Promise<{ timeout: true }>((resolve) => {
+      timer = setTimeout(() => resolve({ timeout: true }), READINESS_TIMEOUT_MS);
+    });
 
+    const checkPromise = Promise.all([
+      postgres.checkReadiness(2000),
+      redis.checkReadiness(2000),
+    ]).then(([pgResult, redisResult]) => ({ timeout: false as const, pgResult, redisResult }));
+
+    let result:
+      | { timeout: true }
+      | { timeout: false; pgResult: { ok: boolean }; redisResult: { ok: boolean } };
+    try {
+      result = await Promise.race([checkPromise, timeoutPromise]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+
+    if (result.timeout) {
+      return reply.status(503).send({
+        status: 'unavailable',
+        reason: 'timeout',
+      });
+    }
+
+    const { pgResult, redisResult } = result;
     const isReady = pgResult.ok && redisResult.ok;
 
     if (!isReady) {

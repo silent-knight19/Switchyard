@@ -80,12 +80,22 @@ export const rawEnvSchema = z
         (val) => {
           try {
             const url = new URL(val);
-            return url.protocol === 'http:' || url.protocol === 'https:';
+            if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+              return false;
+            }
+            // Reject embedded credentials in URLs (e.g. http://user:pass@host)
+            if (url.username || url.password) {
+              return false;
+            }
+            return true;
           } catch {
             return false;
           }
         },
-        { message: 'Malformed endpoint URL: expected valid http:// or https:// URL' },
+        {
+          message:
+            'Malformed endpoint URL: expected valid http:// or https:// URL without embedded credentials',
+        },
       )
       .optional(),
   })
@@ -101,6 +111,15 @@ export const rawEnvSchema = z
 
     // Invariants for production profile
     if (data.NODE_ENV === 'production') {
+      // Invariant (R6): Production upstream origin restrictions
+      if (data.UPSTREAM_ENDPOINT_URL !== undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['UPSTREAM_ENDPOINT_URL'],
+          message:
+            'Custom upstream endpoint URL overrides are prohibited in production profile pending provider allowlist specification',
+        });
+      }
       if (!data.COOKIE_SECURE) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,

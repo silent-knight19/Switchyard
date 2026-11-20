@@ -22,24 +22,26 @@ export async function buildApp(options: BuildAppOptions): Promise<AppInstance> {
     disableRequestLogging: true,
   });
 
-  // Safe Request Lifecycle Logging (D4)
+  // Safe Request Lifecycle Logging (D4, R2): Never log raw query strings
   app.addHook('onRequest', async (req) => {
+    const safePath = req.url.split('?')[0] ?? '';
     logger.info(
       {
         requestId: req.id,
         method: req.method,
-        url: req.url,
+        url: safePath,
       },
       'Incoming request',
     );
   });
 
   app.addHook('onResponse', async (req, reply) => {
+    const safePath = req.url.split('?')[0] ?? '';
     logger.info(
       {
         requestId: req.id,
         method: req.method,
-        url: req.url,
+        url: safePath,
         statusCode: reply.statusCode,
         responseTimeMs: reply.elapsedTime,
       },

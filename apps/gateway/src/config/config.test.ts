@@ -91,7 +91,7 @@ describe('SW-1.2.2 Central Zod Configuration', () => {
     expect(() => loadConfig(numericBoolEnv)).toThrowError(ConfigValidationError);
   });
 
-  it('7. rejects malformed endpoint URL', () => {
+  it('7. rejects malformed endpoint URL and embedded credentials (R6)', () => {
     const malformedUrlEnv = {
       ...VALID_DEV_ENV,
       UPSTREAM_ENDPOINT_URL: 'not a valid url',
@@ -103,9 +103,31 @@ describe('SW-1.2.2 Central Zod Configuration', () => {
       UPSTREAM_ENDPOINT_URL: 'ftp://example.com/bad',
     };
     expect(() => loadConfig(badProtocolEnv)).toThrowError(ConfigValidationError);
+
+    // Negative test: Embedded credentials in URL must be rejected
+    const embeddedCredsEnv = {
+      ...VALID_DEV_ENV,
+      UPSTREAM_ENDPOINT_URL: 'http://user:secretpassword@127.0.0.1:4010',
+    };
+    expect(() => loadConfig(embeddedCredsEnv)).toThrowError(ConfigValidationError);
   });
 
-  it('8. rejects insecure production cookie (COOKIE_SECURE=false)', () => {
+  it('8. rejects custom upstream endpoint overrides in production (R6)', () => {
+    const customProdUpstream = {
+      ...VALID_PROD_ENV,
+      UPSTREAM_ENDPOINT_URL: 'https://api.openai.com',
+    };
+    expect(() => loadConfig(customProdUpstream)).toThrowError(ConfigValidationError);
+    try {
+      loadConfig(customProdUpstream);
+    } catch (e) {
+      const err = e as ConfigValidationError;
+      expect(err.issues.some((i) => i.field === 'UPSTREAM_ENDPOINT_URL')).toBe(true);
+      expect(err.message).toContain('prohibited in production profile');
+    }
+  });
+
+  it('9. rejects insecure production cookie (COOKIE_SECURE=false)', () => {
     const insecureProd = { ...VALID_PROD_ENV, COOKIE_SECURE: 'false' };
     expect(() => loadConfig(insecureProd)).toThrowError(ConfigValidationError);
     try {
@@ -116,7 +138,7 @@ describe('SW-1.2.2 Central Zod Configuration', () => {
     }
   });
 
-  it('9. rejects disabled TLS verification in production', () => {
+  it('10. rejects disabled TLS verification in production', () => {
     const noTlsProd = { ...VALID_PROD_ENV, TLS_VERIFY: 'false' };
     expect(() => loadConfig(noTlsProd)).toThrowError(ConfigValidationError);
 
@@ -127,17 +149,17 @@ describe('SW-1.2.2 Central Zod Configuration', () => {
     expect(() => loadConfig(nodeTlsRejectProd)).toThrowError(ConfigValidationError);
   });
 
-  it('10. rejects production mock provider enabled', () => {
+  it('11. rejects production mock provider enabled', () => {
     const mockProd = { ...VALID_PROD_ENV, MOCK_PROVIDER_ENABLED: 'true' };
     expect(() => loadConfig(mockProd)).toThrowError(ConfigValidationError);
   });
 
-  it('11. rejects production demo seeding enabled', () => {
+  it('12. rejects production demo seeding enabled', () => {
     const demoProd = { ...VALID_PROD_ENV, DEMO_SEEDING_ENABLED: 'true' };
     expect(() => loadConfig(demoProd)).toThrowError(ConfigValidationError);
   });
 
-  it('12. rejects unsafe Redis policy (not noeviction)', () => {
+  it('13. rejects unsafe Redis policy (not noeviction)', () => {
     const unsafeRedisDev = {
       ...VALID_DEV_ENV,
       REDIS_MAXMEMORY_POLICY: 'allkeys-lru',
@@ -151,7 +173,7 @@ describe('SW-1.2.2 Central Zod Configuration', () => {
     expect(() => loadConfig(volatileLru)).toThrowError(ConfigValidationError);
   });
 
-  it('13. rejects default development credentials in production', () => {
+  it('14. rejects default development credentials in production', () => {
     const devPassPostgresInProd = {
       ...VALID_PROD_ENV,
       POSTGRES_PASSWORD: 'switchyard_dev_password',
@@ -165,7 +187,7 @@ describe('SW-1.2.2 Central Zod Configuration', () => {
     expect(() => loadConfig(devPassRedisInProd)).toThrowError(ConfigValidationError);
   });
 
-  it('14. rejects unknown security bypass flags', () => {
+  it('15. rejects unknown security bypass flags', () => {
     const bypassEnv = { ...VALID_DEV_ENV, BYPASS_AUTH: 'true' };
     expect(() => loadConfig(bypassEnv)).toThrowError(ConfigValidationError);
 
@@ -173,11 +195,14 @@ describe('SW-1.2.2 Central Zod Configuration', () => {
     expect(() => loadConfig(rlsBypassEnv)).toThrowError(ConfigValidationError);
   });
 
-  it('15. ensures no secret values appear in validation errors or message strings', () => {
-    const secretValue = 'super_secret_raw_leaked_password_999';
+  it('16. ensures injected synthetic secrets never appear in validation errors (R1, R7)', () => {
+    const syntheticDbPass = 'synthetic_ultra_secret_db_pass_999';
+    const syntheticRedisPass = 'synthetic_ultra_secret_redis_pass_888';
+
     const invalidWithSecret = {
       ...VALID_PROD_ENV,
-      POSTGRES_PASSWORD: 'password', // default password triggers issue
+      POSTGRES_PASSWORD: 'password', // Triggers default credential issue
+      REDIS_PASSWORD: 'admin', // Triggers default credential issue
       COOKIE_SECURE: 'false',
     };
 
@@ -186,17 +211,16 @@ describe('SW-1.2.2 Central Zod Configuration', () => {
       expect.fail('Expected loadConfig to throw');
     } catch (e) {
       const err = e as ConfigValidationError;
-      expect(err.message).not.toContain(secretValue);
-      expect(err.message).not.toContain('super_secret');
-      // Issues should not contain sensitive passwords
+      expect(err.message).not.toContain(syntheticDbPass);
+      expect(err.message).not.toContain(syntheticRedisPass);
       for (const issue of err.issues) {
-        expect(issue.message).not.toContain('password');
-        expect(issue.message).not.toContain(secretValue);
+        expect(issue.message).not.toContain(syntheticDbPass);
+        expect(issue.message).not.toContain(syntheticRedisPass);
       }
     }
   });
 
-  it('16. ensures no fail-open mode exists and FAIL_OPEN is rejected', () => {
+  it('17. ensures no fail-open mode exists and FAIL_OPEN is rejected', () => {
     const failOpenEnv = { ...VALID_DEV_ENV, FAIL_OPEN: 'true' };
     expect(() => loadConfig(failOpenEnv)).toThrowError(ConfigValidationError);
     try {

@@ -1,5 +1,5 @@
 /**
- * Architecture v1.2 §14.3 Normative Redaction Paths.
+ * Architecture v1.2 §14.3 Normative Redaction Paths & Data Privacy.
  * Pino uses these wildcards to recursively redact known sensitive keys in structured logs.
  */
 export const REDACTION_PATHS: string[] = [
@@ -7,106 +7,175 @@ export const REDACTION_PATHS: string[] = [
   'req.headers.authorization',
   'headers.authorization',
   'authorization',
-  'req.headers["authorization"]',
-  'headers["authorization"]',
   'req.headers.cookie',
   'headers.cookie',
   'cookie',
-  'req.headers["cookie"]',
-  'headers["cookie"]',
   'req.headers["set-cookie"]',
   'headers["set-cookie"]',
   'set-cookie',
 
-  // Authentication & Session
-  '*.password',
-  'password',
-  '*.passwordHash',
-  'passwordHash',
-  '*.sessionToken',
-  'sessionToken',
-  '*.session_token',
-  'session_token',
-  '*.csrfToken',
-  'csrfToken',
-  '*.csrf_token',
-  'csrf_token',
-  '*.token',
-  'token',
-  '*.secret',
-  'secret',
-
-  // API Keys (Virtual and Provider)
-  '*.virtualKey',
-  'virtualKey',
-  '*.virtual_key',
-  'virtual_key',
-  '*.apiKey',
-  'apiKey',
-  '*.api_key',
-  'api_key',
-  '*.providerKey',
-  'providerKey',
-  '*.provider_key',
-  'provider_key',
-  '*.providerApiKey',
-  'providerApiKey',
-
-  // Encryption Keys
-  '*.kek',
-  'kek',
-  '*.dek',
-  'dek',
-  '*.masterKey',
-  'masterKey',
-  '*.master_key',
-  'master_key',
-
-  // Database & Cache Credentials
-  '*.dbPassword',
-  'dbPassword',
-  '*.redisPassword',
-  'redisPassword',
-  '*.POSTGRES_PASSWORD',
-  'POSTGRES_PASSWORD',
-  '*.REDIS_PASSWORD',
-  'REDIS_PASSWORD',
-  '*.REDIS_APP_PASSWORD',
-  'REDIS_APP_PASSWORD',
-
-  // Prompts, Responses, and Bodies (Defensive Privacy by Default)
-  '*.prompt',
-  'prompt',
-  '*.prompts',
-  'prompts',
-  '*.response',
-  'response',
-  '*.responses',
-  'responses',
-  '*.body',
-  'body',
-  'req.body',
-  '*.payload',
-  'payload',
+  // Wildcard patterns across all logging levels
+  '*.*password*',
+  '*password*',
+  '*.*token*',
+  '*token*',
+  '*.*secret*',
+  '*secret*',
+  '*.*key*',
+  '*key*',
+  '*.*prompt*',
+  '*prompt*',
+  '*.*response*',
+  '*response*',
+  '*.*completion*',
+  '*completion*',
+  '*.*payload*',
+  '*payload*',
+  '*.*body*',
+  '*body*',
 ];
 
 export const CENSOR_VALUE = '[REDACTED]';
+export const MAX_REDACT_DEPTH = 8;
 
-const SENSITIVE_KEY_REGEX =
-  /^(authorization|cookie|set-cookie|password|passwordhash|sessiontoken|session_token|csrftoken|csrf_token|token|secret|virtualkey|virtual_key|apikey|api_key|providerkey|provider_key|providerapikey|kek|dek|masterkey|master_key|dbpassword|redispassword|prompt|prompts|response|responses|payload)$/i;
+const SENSITIVE_KEY_ROOTS = [
+  'authorization',
+  'cookie',
+  'setcookie',
+  'password',
+  'passwd',
+  'pwd',
+  'passwordhash',
+  'sessiontoken',
+  'sessionid',
+  'session',
+  'csrftoken',
+  'csrf',
+  'token',
+  'accesstoken',
+  'idtoken',
+  'authtoken',
+  'refreshtoken',
+  'secret',
+  'clientsecret',
+  'sharedsecret',
+  'virtualkey',
+  'virtualapikey',
+  'apikey',
+  'providerkey',
+  'providerapikey',
+  'kek',
+  'dek',
+  'masterkey',
+  'dbpassword',
+  'postgrespassword',
+  'redispassword',
+  'redisapppassword',
+  'privatekey',
+  'secretkey',
+  'signature',
+  'sig',
+  'prompt',
+  'prompts',
+  'response',
+  'responses',
+  'completion',
+  'completions',
+  'payload',
+  'body',
+];
+
+/**
+ * Checks whether an object key is sensitive regardless of casing (camelCase, snake_case, PascalCase, UPPERCASE).
+ */
+export function isSensitiveKey(key: string): boolean {
+  const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (!normalized) return false;
+
+  for (const root of SENSITIVE_KEY_ROOTS) {
+    if (normalized === root) return true;
+  }
+
+  // Suffix checks for composite credential names (e.g., myAppPassword, customApiKey, userSessionToken)
+  if (
+    normalized.endsWith('password') ||
+    normalized.endsWith('secret') ||
+    normalized.endsWith('token') ||
+    normalized.endsWith('apikey') ||
+    normalized.endsWith('kek') ||
+    normalized.endsWith('dek') ||
+    normalized.endsWith('prompt') ||
+    normalized.endsWith('completion')
+  ) {
+    return true;
+  }
+
+  // Key-type checks
+  if (
+    normalized.endsWith('key') &&
+    (normalized.includes('virtual') ||
+      normalized.includes('provider') ||
+      normalized.includes('master') ||
+      normalized.includes('private') ||
+      normalized.includes('secret') ||
+      normalized.includes('api'))
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Sanitizes sensitive substrings from arbitrary string values (connection URLs, bearer tokens, query params, etc.).
+ */
+export function sanitizeString(val: string): string {
+  if (typeof val !== 'string' || val.length === 0) return val;
+
+  let sanitized = val;
+
+  // 1. Connection URLs with embedded credentials (e.g. postgres://user:pass@host or redis://... or rediss://...)
+  sanitized = sanitized.replace(
+    /(postgres(?:ql)?|redis(?:s)?):\/\/([^:]+):([^@]+)@/gi,
+    '$1://[REDACTED]:[REDACTED]@',
+  );
+
+  // 2. Authorization Bearer tokens
+  sanitized = sanitized.replace(/Bearer\s+[A-Za-z0-9_.~+\/=-]+/gi, 'Bearer [REDACTED]');
+
+  // 3. Virtual and provider keys
+  sanitized = sanitized.replace(/sk_live_[A-Za-z0-9_-]+/gi, 'sk_live_[REDACTED]');
+  sanitized = sanitized.replace(/sk-ant-[A-Za-z0-9_-]+/gi, 'sk-ant-[REDACTED]');
+  sanitized = sanitized.replace(/sk-[A-Za-z0-9_-]{20,}/gi, 'sk-[REDACTED]');
+
+  // 4. Query string or key-value credential parameters
+  sanitized = sanitized.replace(
+    /([?&]|\b)(api_?key|token|secret|password|passwd|pwd|virtual_?key|provider_?key)=([^&\s]+)/gi,
+    '$1$2=[REDACTED]',
+  );
+
+  return sanitized;
+}
 
 /**
  * Deep recursive object sanitizer for structured log payloads.
- * Acts as an additional defensive boundary ensuring nested secrets at any depth are censored.
+ * Bounded by MAX_REDACT_DEPTH and cyclic detection to prevent resource exhaustion.
  */
 export function deepRedact(obj: unknown, depth = 0, seen = new WeakSet<object>()): unknown {
   if (typeof obj !== 'object' || obj === null) {
+    if (typeof obj === 'string') {
+      return sanitizeString(obj);
+    }
     return obj;
   }
 
   // Preserve Error instances so safeErrorSerializer can process them with full error metadata
   if (obj instanceof Error) {
     return obj;
+  }
+
+  if (depth > MAX_REDACT_DEPTH) {
+    return '[DEPTH_LIMIT_EXCEEDED]';
   }
 
   if (seen.has(obj)) {
@@ -120,10 +189,12 @@ export function deepRedact(obj: unknown, depth = 0, seen = new WeakSet<object>()
 
   const result: Record<string, unknown> = {};
   for (const [key, val] of Object.entries(obj)) {
-    if (SENSITIVE_KEY_REGEX.test(key)) {
+    if (isSensitiveKey(key)) {
       result[key] = CENSOR_VALUE;
     } else if (typeof val === 'object' && val !== null) {
       result[key] = deepRedact(val, depth + 1, seen);
+    } else if (typeof val === 'string') {
+      result[key] = sanitizeString(val);
     } else {
       result[key] = val;
     }

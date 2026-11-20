@@ -117,7 +117,7 @@ describe('SW-1.2.3 Structured Logging and Redaction', () => {
     expect(logs[0]?.REDIS_PASSWORD).toBe(CENSOR_VALUE);
   });
 
-  it('8. redacts nested secret objects', () => {
+  it('8. redacts nested secret objects across arbitrary depth (R2)', () => {
     const { stream, getLogs, getRawOutput } = createLogCapture();
     const logger = createLogger({ stream });
 
@@ -216,5 +216,130 @@ describe('SW-1.2.3 Structured Logging and Redaction', () => {
     const loggedErr = logs[0]?.err as Record<string, unknown>;
     expect(loggedErr?.type).toBe('ZodError');
     expect(loggedErr?.issues).toBeDefined();
+  });
+
+  it('13. strips sensitive query string parameters from request URL logs (R2, R7)', () => {
+    const { stream, getLogs, getRawOutput } = createLogCapture();
+    const logger = createLogger({ stream });
+
+    const secretQueryKey = 'synthetic_secret_query_api_key_777';
+    logger.info(
+      {
+        req: {
+          id: 'req-1',
+          method: 'GET',
+          url: `/v1/chat/completions?api_key=${secretQueryKey}&model=mock-gpt`,
+          headers: { host: 'localhost' },
+        },
+      },
+      'Request incoming',
+    );
+
+    expect(getRawOutput()).not.toContain(secretQueryKey);
+    const logs = getLogs();
+    const req = logs[0]?.req as Record<string, unknown>;
+    expect(req?.url).toBe('/v1/chat/completions');
+  });
+
+  it('14. filters unallowlisted request headers by default in safeReqSerializer (R2)', () => {
+    const { stream, getLogs, getRawOutput } = createLogCapture();
+    const logger = createLogger({ stream });
+
+    const secretHeaderToken = 'secret_bearer_token_in_custom_header_999';
+    logger.info(
+      {
+        req: {
+          id: 'req-2',
+          method: 'POST',
+          url: '/health/ready',
+          headers: {
+            host: '127.0.0.1:3000',
+            'x-custom-secret-key': secretHeaderToken,
+            authorization: 'Bearer secret_auth_token_888',
+          },
+        },
+      },
+      'Checking headers',
+    );
+
+    expect(getRawOutput()).not.toContain(secretHeaderToken);
+    expect(getRawOutput()).not.toContain('secret_auth_token_888');
+    const logs = getLogs();
+    const req = logs[0]?.req as Record<string, unknown>;
+    const headers = req?.headers as Record<string, unknown>;
+    expect(headers?.host).toBe('127.0.0.1:3000');
+    expect(headers?.['x-custom-secret-key']).toBeUndefined();
+    expect(headers?.authorization).toBeUndefined();
+  });
+
+  it('15. covers uppercase, snake_case, and camelCase credential names (R2)', () => {
+    const { stream, getLogs, getRawOutput } = createLogCapture();
+    const logger = createLogger({ stream });
+
+    const secretVal = 'confidential_credential_pattern';
+    logger.info(
+      {
+        POSTGRES_PASSWORD: secretVal,
+        postgres_password: secretVal,
+        postgresPassword: secretVal,
+        REDIS_APP_PASSWORD: secretVal,
+        redis_app_password: secretVal,
+        redisAppPassword: secretVal,
+        ApiKey: secretVal,
+        api_key: secretVal,
+        API_KEY: secretVal,
+      },
+      'Testing case variations',
+    );
+
+    expect(getRawOutput()).not.toContain(secretVal);
+    const logs = getLogs();
+    const entry = logs[0] as Record<string, unknown>;
+    expect(entry.POSTGRES_PASSWORD).toBe(CENSOR_VALUE);
+    expect(entry.postgres_password).toBe(CENSOR_VALUE);
+    expect(entry.postgresPassword).toBe(CENSOR_VALUE);
+    expect(entry.REDIS_APP_PASSWORD).toBe(CENSOR_VALUE);
+    expect(entry.redis_app_password).toBe(CENSOR_VALUE);
+    expect(entry.redisAppPassword).toBe(CENSOR_VALUE);
+    expect(entry.ApiKey).toBe(CENSOR_VALUE);
+    expect(entry.api_key).toBe(CENSOR_VALUE);
+    expect(entry.API_KEY).toBe(CENSOR_VALUE);
+  });
+
+  it('16. sanitizes raw connection strings and credentials embedded in Error messages (R1, R7)', () => {
+    const { stream, getLogs, getRawOutput } = createLogCapture();
+    const logger = createLogger({ stream });
+
+    const secretPassword = 'raw_untrusted_database_password_4321';
+    const connectionError = new Error(
+      `connect ECONNREFUSED postgresql://switchyard:${secretPassword}@127.0.0.1:5432/switchyard_db`,
+    );
+
+    logger.error({ err: connectionError }, 'Database connection failed');
+
+    expect(getRawOutput()).not.toContain(secretPassword);
+    const logs = getLogs();
+    const loggedErr = logs[0]?.err as Record<string, unknown>;
+    expect(loggedErr?.message).toContain('postgresql://[REDACTED]:[REDACTED]@127.0.0.1:5432');
+    expect(loggedErr?.stack).not.toContain(secretPassword);
+  });
+
+  it('17. bounds deep nested object traversal to prevent resource exhaustion (R2)', () => {
+    const { stream, getLogs } = createLogCapture();
+    const logger = createLogger({ stream });
+
+    let deepObj: Record<string, unknown> = { val: 'leaf' };
+    for (let i = 0; i < 12; i++) {
+      deepObj = { nested: deepObj };
+    }
+
+    expect(() => {
+      logger.info({ deepObj }, 'Deep nested logging');
+    }).not.toThrow();
+
+    const logs = getLogs();
+    expect(logs.length).toBe(1);
+    const raw = JSON.stringify(logs[0]);
+    expect(raw).toContain('[DEPTH_LIMIT_EXCEEDED]');
   });
 });

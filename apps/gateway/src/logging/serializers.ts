@@ -1,7 +1,17 @@
 import { ZodError } from 'zod';
+import { sanitizeString } from './redaction.js';
 
 const MAX_MESSAGE_LENGTH = 1024;
 const MAX_ERROR_DEPTH = 3;
+
+const ALLOWED_REQ_HEADERS = new Set([
+  'host',
+  'user-agent',
+  'content-type',
+  'content-length',
+  'accept',
+  'x-request-id',
+]);
 
 export interface SerializedError {
   type: string;
@@ -23,7 +33,7 @@ export function truncateMessage(msg: string, maxLength = MAX_MESSAGE_LENGTH): st
 
 /**
  * Sanitizes and bounds error serialization.
- * Never serializes raw DB credentials, unbounded cause chains, cyclic references, or raw validation inputs.
+ * Never serializes raw DB credentials, connection strings, unbounded cause chains, cyclic references, or raw validation inputs.
  */
 export function safeErrorSerializer(
   err: unknown,
@@ -33,7 +43,7 @@ export function safeErrorSerializer(
   if (typeof err !== 'object' || err === null) {
     return {
       type: typeof err,
-      message: truncateMessage(String(err)),
+      message: sanitizeString(truncateMessage(String(err))),
     };
   }
 
@@ -49,7 +59,9 @@ export function safeErrorSerializer(
   const type = typeof errorObj['name'] === 'string' ? errorObj['name'] : 'Error';
   const rawMessage =
     typeof errorObj['message'] === 'string' ? errorObj['message'] : 'Unknown error';
-  const message = truncateMessage(rawMessage);
+
+  // Sanitize message: strip connection URLs, bearer tokens, passwords, query credentials
+  const message = truncateMessage(sanitizeString(rawMessage));
 
   const serialized: SerializedError = {
     type,
@@ -68,8 +80,9 @@ export function safeErrorSerializer(
   }
 
   if (typeof errorObj['stack'] === 'string') {
-    // Bound stack trace to top 10 frames and truncate oversized messages in stack
-    const lines = errorObj['stack'].split('\n').slice(0, 10);
+    // Sanitize stack trace: never leak credentials or tokens embedded in stack traces
+    const sanitizedStack = sanitizeString(errorObj['stack']);
+    const lines = sanitizedStack.split('\n').slice(0, 10);
     if (lines[0]) {
       lines[0] = truncateMessage(lines[0], MAX_MESSAGE_LENGTH);
     }
@@ -80,7 +93,7 @@ export function safeErrorSerializer(
   if (err instanceof ZodError) {
     serialized.issues = err.issues.map((i) => ({
       path: i.path.join('.'),
-      message: i.message,
+      message: sanitizeString(i.message),
     }));
   }
 
@@ -92,28 +105,38 @@ export function safeErrorSerializer(
   return serialized;
 }
 
+/**
+ * Serializes HTTP request metadata safely.
+ * Strips query strings from URLs and filters headers against an explicit safe allowlist.
+ */
 export function safeReqSerializer(req: unknown): Record<string, unknown> {
   if (typeof req !== 'object' || req === null) return {};
   const r = req as Record<string, unknown>;
 
-  const headers =
-    typeof r['headers'] === 'object' && r['headers'] !== null
-      ? { ...(r['headers'] as Record<string, unknown>) }
-      : {};
+  const rawUrl = typeof r['url'] === 'string' ? r['url'] : '';
+  const safePath = rawUrl.split('?')[0] ?? '';
 
-  // Delete sensitive headers from req serializer directly
-  delete headers['authorization'];
-  delete headers['cookie'];
-  delete headers['set-cookie'];
+  const safeHeaders: Record<string, unknown> = {};
+  if (typeof r['headers'] === 'object' && r['headers'] !== null) {
+    for (const [key, val] of Object.entries(r['headers'])) {
+      const lowerKey = key.toLowerCase();
+      if (ALLOWED_REQ_HEADERS.has(lowerKey)) {
+        safeHeaders[lowerKey] = typeof val === 'string' ? sanitizeString(val) : val;
+      }
+    }
+  }
 
   return {
     id: r['id'],
     method: r['method'],
-    url: r['url'],
-    headers,
+    url: safePath,
+    headers: safeHeaders,
   };
 }
 
+/**
+ * Serializes HTTP response metadata safely.
+ */
 export function safeResSerializer(res: unknown): Record<string, unknown> {
   if (typeof res !== 'object' || res === null) return {};
   const r = res as Record<string, unknown>;
