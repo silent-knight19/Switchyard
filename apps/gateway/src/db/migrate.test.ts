@@ -49,6 +49,27 @@ const ROLE_NAMES = [
   'gateway_ops_executor',
 ] as const;
 
+// Roles that must not create tables or own tables (§12.1). gateway_owner is the tenant-table
+// owner by design, and gateway_migrator is the deployment role (its ability to SET ROLE into
+// gateway_owner is granted by bootstrap, see DEVELOPMENT.md §7.7); both are excluded from the
+// DDL/ownership assertions — see SW-1.3.2.
+const DDL_DENIED_ROLES = [
+  'gateway_app',
+  'gateway_startup',
+  'gateway_worker',
+  'gateway_auth_executor',
+  'gateway_ops_executor',
+] as const;
+
+const NON_OWNER_ROLES = [
+  'gateway_migrator',
+  'gateway_startup',
+  'gateway_app',
+  'gateway_worker',
+  'gateway_auth_executor',
+  'gateway_ops_executor',
+] as const;
+
 const EXECUTOR_NAMES = new Set(['gateway_auth_executor', 'gateway_ops_executor']);
 
 function createSwitchyardPool(): pg.Pool {
@@ -145,13 +166,12 @@ describe('SW-1.3.1 migration process and role security (real PostgreSQL)', () =>
     );
     expect(memberships).toHaveLength(0);
 
+    const roleList = NON_OWNER_ROLES.map((roleName) => `'${roleName}'`).join(', ');
     const { rows: owned } = await pool.query<{ relname: string; tableowner: string }>(
       `SELECT c.relname AS relname, r.rolname AS tableowner
        FROM pg_class c
        JOIN pg_roles r ON r.oid = c.relowner
-       WHERE c.relkind = 'r'
-         AND r.rolname IN ('gateway_owner', 'gateway_migrator', 'gateway_startup', 'gateway_app',
-                           'gateway_worker', 'gateway_auth_executor', 'gateway_ops_executor')`,
+       WHERE c.relkind = 'r' AND r.rolname IN (${roleList})`,
     );
     expect(owned).toHaveLength(0);
   });
@@ -160,7 +180,7 @@ describe('SW-1.3.1 migration process and role security (real PostgreSQL)', () =>
     if (!pool) return;
     const client = await pool.connect();
     try {
-      for (const roleName of ROLE_NAMES) {
+      for (const roleName of DDL_DENIED_ROLES) {
         await client.query(`SET ROLE ${roleName}`);
         const { rows } = await client.query<{ current_user: string }>('SELECT current_user');
         expect(rows[0]?.current_user).toBe(roleName);

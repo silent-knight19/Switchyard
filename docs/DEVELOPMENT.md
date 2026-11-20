@@ -176,7 +176,7 @@ docker compose stop
 - **Process Credential Masking & Docker Inspection Boundary:** Redis credentials are provided to `redis-server` via standard input stream and to `redis-cli` via `REDISCLI_AUTH`, avoiding password visibility in process table listings (`ps aux`) and suppressing CLI warning banners. However, environment variables remain visible via `docker inspect <container>`; therefore, this mechanism is strictly intended for local development. Production deployments must not rely on environment variables for sensitive secrets and must utilize external secret management with separate least-privilege database roles as defined in Architecture v1.2 §19.
 - **Development Credentials:** The default credentials (`switchyard_dev_password`, `switchyard_app_password`) are strictly intended for local development.
 
-### 7.7 Database Migrations and Roles (SW-1.3.1)
+### 7.7 Database Migrations and Roles (SW-1.3.1, SW-1.3.2)
 
 The migration process applies versioned SQL migrations from `apps/gateway/src/db/migrations/` (`NNNN-name.sql`) into the `gateway_migrations` ledger table, in version order, each in its own transaction (`apps/gateway/src/db/migrate.ts`).
 
@@ -187,9 +187,19 @@ The migration process applies versioned SQL migrations from `apps/gateway/src/db
   ```
 
 - Local development runs migrations as the database superuser (`switchyard`); reruns are idempotent (no new ledger rows).
+- After applying `0001-roles` locally, grant the tenant-table owner schema creation once (the migration `0002-org-tables` creates tenant tables via `SET ROLE gateway_owner`):
+
+  ```bash
+  docker exec switchyard-postgres psql -U switchyard -d switchyard -c "GRANT CREATE ON SCHEMA public TO gateway_owner;"
+  pnpm --filter @switchyard/gateway migrate
+  ```
+
+  The `organizations`, `gateway_control`, `users`, `web_sessions`, `provider_keys`, and `virtual_keys` tables created by `0002-org-tables` are owned by `gateway_owner` with RLS ENABLE + FORCE per Architecture v1.2 §12.3.
 - Real PostgreSQL migration and role-security tests: `pnpm --filter @switchyard/gateway test:integration` (real PG at `127.0.0.1:5432`; requires the local Compose stack from SW-1.2.1).
-- Production bootstrap (one time, run as the `switchyard` superuser before the first production `migrate`):
-  1. `CREATE ROLE gateway_migrator LOGIN NOSUPERUSER NOBYPASSRLS;`
-  2. Run `pnpm --filter @switchyard/gateway migrate` as `gateway_migrator` with `POSTGRES_USER=gateway_migrator POSTGRES_PASSWORD=<secret>` (per `§19.2`, production credentials are separate from development ones).
+- Production bootstrap (one time, in order; production credentials are separate from development ones per `§19.2`):
+  1. As the `switchyard` superuser: `CREATE ROLE gateway_migrator LOGIN NOSUPERUSER NOBYPASSRLS;`
+  2. Run `pnpm --filter @switchyard/gateway migrate` as `gateway_migrator` with `POSTGRES_USER=gateway_migrator POSTGRES_PASSWORD=<secret>` — applies `0001-roles`.
+  3. As the superuser: `GRANT CREATE ON SCHEMA public TO gateway_owner;` and `GRANT gateway_owner TO gateway_migrator;`
+  4. Run `pnpm --filter @switchyard/gateway migrate` as `gateway_migrator` again — applies `0002-org-tables`.
 
 The role matrix created by `0001-roles.sql` (Architecture v1.2 §12.1): `gateway_owner` (tenant-table owner; NOLOGIN), `gateway_migrator` (deployment-only; LOGIN, NOSUPERUSER, NOBYPASSRLS), `gateway_startup` (LOGIN, NOSUPERUSER, NOBYPASSRLS), `gateway_app` (LOGIN, NOSUPERUSER, NOBYPASSRLS), `gateway_worker` (LOGIN, NOSUPERUSER, NOBYPASSRLS), `gateway_auth_executor` (NOLOGIN, BYPASSRLS; owns restricted authentication/bootstrap functions only), `gateway_ops_executor` (NOLOGIN, BYPASSRLS; owns the restricted maintenance enumerator only).
