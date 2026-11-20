@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import type pg from 'pg';
+import { getConfig, type GatewayConfig } from '../config/index.js';
 import { type TenantClient, withTenant } from '../db/tenant.js';
 import {
   type AuthenticatedUser,
@@ -66,6 +67,8 @@ export function hashSecret(secretBytes: Buffer): Buffer {
 
 export interface SessionServiceOptions {
   pool: pg.Pool;
+  config?: GatewayConfig;
+  environment?: 'development' | 'test' | 'production';
   cookieOptions?: SessionCookieOptions;
 }
 
@@ -76,10 +79,42 @@ export class SessionService {
 
   constructor(options: SessionServiceOptions) {
     this.pool = options.pool;
-    const isProd = options.cookieOptions?.isProduction ?? process.env['NODE_ENV'] === 'production';
 
-    if (isProd) {
-      // AUTH-02: Production security requirements cannot be downgraded
+    // Resolve authoritative trusted runtime environment (AUTH-07)
+    // Priority:
+    // 1. Explicit validated GatewayConfig passed in options
+    // 2. Explicit environment passed in options
+    // 3. Loaded GatewayConfig singleton (if initialized)
+    // 4. Ambient process.env['NODE_ENV']
+    const trustedEnv: 'development' | 'test' | 'production' = (() => {
+      if (options.config?.NODE_ENV) {
+        return options.config.NODE_ENV;
+      }
+      if (options.environment) {
+        return options.environment;
+      }
+      try {
+        const cfg = getConfig();
+        if (cfg?.NODE_ENV) {
+          return cfg.NODE_ENV;
+        }
+      } catch {
+        // Fall back to process.env if getConfig() is uninitialized or invalid in bare test context
+      }
+      const env = process.env['NODE_ENV'];
+      if (env === 'production') return 'production';
+      if (env === 'test') return 'test';
+      return 'development';
+    })();
+
+    if (trustedEnv === 'production') {
+      // Production security requirements cannot be downgraded (AUTH-02, AUTH-07)
+      if (options.cookieOptions?.isProduction === false) {
+        throw new SessionError(
+          'CONFIGURATION_ERROR',
+          'Production environment cannot be overridden with isProduction: false',
+        );
+      }
       if (options.cookieOptions?.secure === false) {
         throw new SessionError(
           'CONFIGURATION_ERROR',
@@ -99,20 +134,44 @@ export class SessionService {
       this.isSecureCookie = true;
       this.cookieName = '__Host-session';
     } else {
-      // Development mode: explicitly support local development HTTP without weakening production
-      this.isSecureCookie = options.cookieOptions?.secure ?? false;
-
-      if (options.cookieOptions?.cookieName !== undefined) {
-        // Enforce __Host- cookie security invariant: __Host- prefix MUST be Secure
-        if (options.cookieOptions.cookieName.startsWith('__Host-') && !this.isSecureCookie) {
+      // Non-production environment (development / test)
+      if (options.cookieOptions?.isProduction === true) {
+        // Explicit request to run with production cookie rules in dev/test
+        if (options.cookieOptions?.secure === false) {
           throw new SessionError(
             'CONFIGURATION_ERROR',
-            'Cookies with "__Host-" prefix require secure=true',
+            'Insecure session cookies (secure: false) are strictly prohibited when isProduction: true',
           );
         }
-        this.cookieName = options.cookieOptions.cookieName;
+        if (
+          options.cookieOptions?.cookieName !== undefined &&
+          options.cookieOptions.cookieName !== '__Host-session'
+        ) {
+          throw new SessionError(
+            'CONFIGURATION_ERROR',
+            `Production session cookies must use the "__Host-session" name; received "${options.cookieOptions.cookieName}"`,
+          );
+        }
+
+        this.isSecureCookie = true;
+        this.cookieName = '__Host-session';
       } else {
-        this.cookieName = this.isSecureCookie ? '__Host-session' : 'switchyard_session';
+        // Development / test behavior: explicitly support local development HTTP without weakening production
+        this.isSecureCookie =
+          options.cookieOptions?.secure ?? options.config?.COOKIE_SECURE ?? false;
+
+        if (options.cookieOptions?.cookieName !== undefined) {
+          // Enforce __Host- cookie security invariant: __Host- prefix MUST be Secure
+          if (options.cookieOptions.cookieName.startsWith('__Host-') && !this.isSecureCookie) {
+            throw new SessionError(
+              'CONFIGURATION_ERROR',
+              'Cookies with "__Host-" prefix require secure=true',
+            );
+          }
+          this.cookieName = options.cookieOptions.cookieName;
+        } else {
+          this.cookieName = this.isSecureCookie ? '__Host-session' : 'switchyard_session';
+        }
       }
     }
   }

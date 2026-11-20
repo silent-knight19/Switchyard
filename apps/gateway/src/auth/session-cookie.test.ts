@@ -87,39 +87,96 @@ describe('SW-1.5.2: Session Cookie & Secret Encoding', () => {
     });
   });
 
-  describe('SessionService Cookie Formatting & Parsing (AUTH-02)', () => {
+  describe('SessionService Cookie Security & Regression Matrix (AUTH-02, AUTH-07)', () => {
     const dummyPool = {} as unknown as pg.Pool;
 
-    it('production defaults produce secure cookie with __Host- prefix and required security flags', () => {
-      const service = new SessionService({
-        pool: dummyPool,
-        cookieOptions: { isProduction: true },
-      });
-
+    function assertSecureHostCookie(service: SessionService) {
       expect(service.getCookieName()).toBe('__Host-session');
 
-      const cookieStr = service.createSessionCookie('my-opaque-session-secret-12345');
-      expect(cookieStr).toContain('__Host-session=my-opaque-session-secret-12345');
-      expect(cookieStr).toContain('Path=/');
-      expect(cookieStr).toContain('HttpOnly');
-      expect(cookieStr).toContain('SameSite=Lax');
-      expect(cookieStr).toContain('Secure');
-      expect(cookieStr).not.toContain('Domain=');
+      // Verify cookie creation
+      const sessionCookie = service.createSessionCookie('valid-opaque-secret-43-chars-example-123');
+      expect(
+        sessionCookie.startsWith('__Host-session=valid-opaque-secret-43-chars-example-123'),
+      ).toBe(true);
+      expect(sessionCookie).toContain('Path=/');
+      expect(sessionCookie).toContain('HttpOnly');
+      expect(sessionCookie).toContain('SameSite=Lax');
+      expect(sessionCookie).toContain('Secure');
+      expect(sessionCookie).not.toContain('Domain=');
+
+      // Verify cookie clearing
+      const clearCookie = service.createClearSessionCookie();
+      expect(clearCookie.startsWith('__Host-session=')).toBe(true);
+      expect(clearCookie).toContain('Path=/');
+      expect(clearCookie).toContain('HttpOnly');
+      expect(clearCookie).toContain('SameSite=Lax');
+      expect(clearCookie).toContain('Secure');
+      expect(clearCookie).toContain('Max-Age=0');
+      expect(clearCookie).toContain('Expires=Thu, 01 Jan 1970 00:00:00 GMT');
+      expect(clearCookie).not.toContain('Domain=');
+    }
+
+    function assertApprovedDevCookie(service: SessionService) {
+      expect(service.getCookieName()).toBe('switchyard_session');
+
+      // Verify cookie creation
+      const sessionCookie = service.createSessionCookie('dev-secret-43-chars-example-1234567890');
+      expect(
+        sessionCookie.startsWith('switchyard_session=dev-secret-43-chars-example-1234567890'),
+      ).toBe(true);
+      expect(sessionCookie).toContain('Path=/');
+      expect(sessionCookie).toContain('HttpOnly');
+      expect(sessionCookie).toContain('SameSite=Lax');
+      expect(sessionCookie).not.toContain('Secure');
+      expect(sessionCookie).not.toContain('Domain=');
+
+      // Verify cookie clearing
+      const clearCookie = service.createClearSessionCookie();
+      expect(clearCookie.startsWith('switchyard_session=')).toBe(true);
+      expect(clearCookie).toContain('Path=/');
+      expect(clearCookie).toContain('HttpOnly');
+      expect(clearCookie).toContain('SameSite=Lax');
+      expect(clearCookie).not.toContain('Secure');
+      expect(clearCookie).toContain('Max-Age=0');
+      expect(clearCookie).toContain('Expires=Thu, 01 Jan 1970 00:00:00 GMT');
+      expect(clearCookie).not.toContain('Domain=');
+    }
+
+    // --- Regression Matrix Row 1: Production | None -> Secure "__Host-session" ---
+    it('Matrix Row 1: Production + None options produces secure __Host-session cookie', () => {
+      const service = new SessionService({
+        pool: dummyPool,
+        environment: 'production',
+      });
+      assertSecureHostCookie(service);
     });
 
-    it('fails closed when production configuration attempts secure=false (AUTH-02 downgrade prevention)', () => {
+    // --- Regression Matrix Row 2: Production | "secure: true" -> Secure "__Host-session" ---
+    it('Matrix Row 2: Production + { secure: true } produces secure __Host-session cookie', () => {
+      const service = new SessionService({
+        pool: dummyPool,
+        environment: 'production',
+        cookieOptions: { secure: true },
+      });
+      assertSecureHostCookie(service);
+    });
+
+    // --- Regression Matrix Row 3: Production | "secure: false" -> Rejected ---
+    it('Matrix Row 3: Production + { secure: false } is rejected with CONFIGURATION_ERROR', () => {
       expect(
         () =>
           new SessionService({
             pool: dummyPool,
-            cookieOptions: { isProduction: true, secure: false },
+            environment: 'production',
+            cookieOptions: { secure: false },
           }),
       ).toThrow(SessionError);
 
       try {
         new SessionService({
           pool: dummyPool,
-          cookieOptions: { isProduction: true, secure: false },
+          environment: 'production',
+          cookieOptions: { secure: false },
         });
       } catch (err) {
         expect(err).toBeInstanceOf(SessionError);
@@ -128,19 +185,71 @@ describe('SW-1.5.2: Session Cookie & Secret Encoding', () => {
       }
     });
 
-    it('fails closed when production configuration attempts an arbitrary cookie name', () => {
+    // --- Regression Matrix Row 4: Production | "isProduction: false" -> Rejected ---
+    it('Matrix Row 4: Production + { isProduction: false } is rejected with CONFIGURATION_ERROR (AUTH-07 bypass prevented)', () => {
       expect(
         () =>
           new SessionService({
             pool: dummyPool,
-            cookieOptions: { isProduction: true, cookieName: 'arbitrary_insecure_name' },
+            environment: 'production',
+            cookieOptions: { isProduction: false },
           }),
       ).toThrow(SessionError);
 
       try {
         new SessionService({
           pool: dummyPool,
-          cookieOptions: { isProduction: true, cookieName: 'arbitrary_insecure_name' },
+          environment: 'production',
+          cookieOptions: { isProduction: false },
+        });
+      } catch (err) {
+        expect(err).toBeInstanceOf(SessionError);
+        expect((err as SessionError).reason).toBe('CONFIGURATION_ERROR');
+        expect((err as SessionError).message).toContain(
+          'Production environment cannot be overridden with isProduction: false',
+        );
+      }
+    });
+
+    // --- Regression Matrix Row 5: Production | "isProduction: false, secure: false" -> Rejected ---
+    it('Matrix Row 5: Production + { isProduction: false, secure: false } is rejected with CONFIGURATION_ERROR (AUTH-07)', () => {
+      expect(
+        () =>
+          new SessionService({
+            pool: dummyPool,
+            environment: 'production',
+            cookieOptions: { isProduction: false, secure: false },
+          }),
+      ).toThrow(SessionError);
+
+      try {
+        new SessionService({
+          pool: dummyPool,
+          environment: 'production',
+          cookieOptions: { isProduction: false, secure: false },
+        });
+      } catch (err) {
+        expect(err).toBeInstanceOf(SessionError);
+        expect((err as SessionError).reason).toBe('CONFIGURATION_ERROR');
+      }
+    });
+
+    // --- Regression Matrix Row 6: Production | Custom cookie name -> Rejected ---
+    it('Matrix Row 6: Production + custom cookieName is rejected with CONFIGURATION_ERROR', () => {
+      expect(
+        () =>
+          new SessionService({
+            pool: dummyPool,
+            environment: 'production',
+            cookieOptions: { cookieName: 'custom_cookie' },
+          }),
+      ).toThrow(SessionError);
+
+      try {
+        new SessionService({
+          pool: dummyPool,
+          environment: 'production',
+          cookieOptions: { cookieName: 'custom_cookie' },
         });
       } catch (err) {
         expect(err).toBeInstanceOf(SessionError);
@@ -149,34 +258,116 @@ describe('SW-1.5.2: Session Cookie & Secret Encoding', () => {
       }
     });
 
-    it('development produces the explicitly documented development cookie', () => {
+    // --- Regression Matrix Row 7: Development | Explicit HTTP-loopback configuration -> Approved development cookie ---
+    it('Matrix Row 7: Development + explicit HTTP-loopback configuration produces approved development cookie', () => {
       const service = new SessionService({
         pool: dummyPool,
-        cookieOptions: { isProduction: false, secure: false },
+        environment: 'development',
+        cookieOptions: { secure: false },
       });
-
-      expect(service.getCookieName()).toBe('switchyard_session');
-
-      const cookieStr = service.createSessionCookie('my-dev-secret');
-      expect(cookieStr).toContain('switchyard_session=my-dev-secret');
-      expect(cookieStr).toContain('Path=/');
-      expect(cookieStr).toContain('HttpOnly');
-      expect(cookieStr).toContain('SameSite=Lax');
-      expect(cookieStr).not.toContain('Secure');
+      assertApprovedDevCookie(service);
     });
 
-    it('development settings cannot affect a production instance', () => {
-      const prodService = new SessionService({
+    // --- Regression Matrix Row 8: Development | Secure cookie configuration -> Secure cookie ---
+    it('Matrix Row 8: Development + secure cookie configuration produces secure cookie', () => {
+      const service = new SessionService({
         pool: dummyPool,
-        cookieOptions: { isProduction: true },
+        environment: 'development',
+        cookieOptions: { secure: true },
       });
-      const devService = new SessionService({
+      assertSecureHostCookie(service);
+    });
+
+    // --- Regression Matrix Row 9: Test | Explicit test configuration -> Isolated test behavior ---
+    it('Matrix Row 9: Test + explicit test configuration produces isolated test behavior', () => {
+      const service = new SessionService({
         pool: dummyPool,
-        cookieOptions: { isProduction: false },
+        environment: 'test',
+        cookieOptions: { cookieName: 'custom_test_session', secure: false },
       });
 
-      expect(prodService.getCookieName()).toBe('__Host-session');
-      expect(devService.getCookieName()).toBe('switchyard_session');
+      expect(service.getCookieName()).toBe('custom_test_session');
+      const created = service.createSessionCookie('test-token');
+      expect(created.startsWith('custom_test_session=test-token')).toBe(true);
+      expect(created).toContain('Path=/');
+      expect(created).toContain('HttpOnly');
+      expect(created).toContain('SameSite=Lax');
+      expect(created).not.toContain('Secure');
+
+      const cleared = service.createClearSessionCookie();
+      expect(cleared.startsWith('custom_test_session=')).toBe(true);
+      expect(cleared).toContain('Max-Age=0');
+      expect(cleared).not.toContain('Secure');
+    });
+
+    // --- Ambient Environment Protection & GatewayConfig Contract Tests ---
+    it('ambient process.env[NODE_ENV]=production cannot be downgraded through constructor options (AUTH-07)', () => {
+      const originalEnv = process.env['NODE_ENV'];
+      try {
+        process.env['NODE_ENV'] = 'production';
+
+        // Attempting to downgrade via cookieOptions in production process.env fails closed
+        expect(
+          () =>
+            new SessionService({
+              pool: dummyPool,
+              cookieOptions: { isProduction: false, secure: false },
+            }),
+        ).toThrow(SessionError);
+
+        // Attempting custom cookie name fails closed
+        expect(
+          () =>
+            new SessionService({
+              pool: dummyPool,
+              cookieOptions: { cookieName: 'insecure_app_cookie' },
+            }),
+        ).toThrow(SessionError);
+
+        // Unadorned construction in production ambient env defaults to secure __Host-session
+        const defaultProdService = new SessionService({ pool: dummyPool });
+        assertSecureHostCookie(defaultProdService);
+      } finally {
+        process.env['NODE_ENV'] = originalEnv;
+      }
+    });
+
+    it('validated GatewayConfig for production cannot be downgraded by caller options', () => {
+      const prodGatewayConfig = {
+        NODE_ENV: 'production',
+        PORT: 3000,
+        HOST: '127.0.0.1',
+        POSTGRES_HOST: '127.0.0.1',
+        POSTGRES_PORT: 5432,
+        POSTGRES_DB: 'switchyard',
+        POSTGRES_USER: 'gateway_app',
+        POSTGRES_PASSWORD: 'real_production_password',
+        REDIS_HOST: '127.0.0.1',
+        REDIS_PORT: 6379,
+        REDIS_USER: 'switchyard_app',
+        REDIS_PASSWORD: 'real_production_password',
+        REDIS_MAXMEMORY_POLICY: 'noeviction',
+        REDIS_TLS: false,
+        COOKIE_SECURE: true,
+        TLS_VERIFY: true,
+        MOCK_PROVIDER_ENABLED: false,
+        DEMO_SEEDING_ENABLED: false,
+      } as const;
+
+      expect(
+        () =>
+          new SessionService({
+            pool: dummyPool,
+            config: prodGatewayConfig,
+            cookieOptions: { isProduction: false, secure: false },
+          }),
+      ).toThrow(SessionError);
+
+      const validService = new SessionService({
+        pool: dummyPool,
+        config: prodGatewayConfig,
+      });
+      assertSecureHostCookie(validService);
     });
 
     it('development fails closed if __Host- prefix is used with secure: false', () => {
@@ -184,7 +375,8 @@ describe('SW-1.5.2: Session Cookie & Secret Encoding', () => {
         () =>
           new SessionService({
             pool: dummyPool,
-            cookieOptions: { isProduction: false, cookieName: '__Host-dev', secure: false },
+            environment: 'development',
+            cookieOptions: { cookieName: '__Host-dev', secure: false },
           }),
       ).toThrow(SessionError);
     });
@@ -192,7 +384,7 @@ describe('SW-1.5.2: Session Cookie & Secret Encoding', () => {
     it('session cookie and clear-cookie use consistent names and required attributes', () => {
       const service = new SessionService({
         pool: dummyPool,
-        cookieOptions: { isProduction: true },
+        environment: 'production',
       });
 
       const sessionCookie = service.createSessionCookie('secret_token');

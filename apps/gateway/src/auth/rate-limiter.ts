@@ -59,17 +59,19 @@ export function sanitizeClientIp(rawIp: unknown): string {
 }
 
 /**
- * Produces an irreversible, bounded key token for an account identifier using SHA-256.
+ * Produces a bounded pseudonymous deterministic key token for an account identifier using SHA-256.
  * Guarantees that raw emails never persist in Redis keys or error messages.
+ * Note: Unsalted SHA-256 hashes are deterministic identifiers and carry residual
+ * dictionary-guessing limitations for known candidate email addresses.
  */
 export function hashAccountIdentifier(canonicalEmail: string): string {
   return crypto.createHash('sha256').update(canonicalEmail.toLowerCase().trim()).digest('hex');
 }
 
 /**
- * Lua script for atomic sliding/fixed window counter with TTL.
+ * Lua script for atomic fixed-window counter with TTL.
  * ARGV[1]: windowSeconds, ARGV[2]: maxLimit
- * Returns: { allowed: 1 | 0, current: count }
+ * Returns: 1 if allowed, 0 if limit exceeded
  */
 const RATE_LIMIT_LUA = `
 local count = redis.call('INCR', KEYS[1])

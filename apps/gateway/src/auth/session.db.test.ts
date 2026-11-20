@@ -28,6 +28,50 @@ describe('SW-1.5.2: Server-Side Web Sessions PostgreSQL 16 Integration Suite', (
   const USER_A_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
   const USER_B_ID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 
+  /**
+   * Positively establishes via PostgreSQL lock manager that a transaction
+   * has entered a blocked waiting state on an ungranted lock (AUTH-08).
+   */
+  async function waitForBlockedLock(
+    admin: pg.Client,
+    timeoutMs = 5000,
+  ): Promise<{ pid: number; locktype: string; mode: string; waitEventType: string }> {
+    const startTime = Date.now();
+    while (Date.now() - startTime < timeoutMs) {
+      const res = await admin.query<{
+        pid: number;
+        locktype: string;
+        mode: string;
+        wait_event_type: string;
+        wait_event: string;
+      }>(
+        `SELECT
+          l.pid,
+          l.locktype,
+          l.mode,
+          a.wait_event_type,
+          a.wait_event
+        FROM pg_locks l
+        JOIN pg_stat_activity a ON a.pid = l.pid
+        WHERE NOT l.granted
+          AND a.pid != pg_backend_pid()
+        LIMIT 1;`,
+      );
+      if (res.rows.length > 0 && res.rows[0]) {
+        return {
+          pid: res.rows[0].pid,
+          locktype: res.rows[0].locktype,
+          mode: res.rows[0].mode,
+          waitEventType: res.rows[0].wait_event_type,
+        };
+      }
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    throw new Error(
+      `Timeout after ${timeoutMs}ms waiting for PostgreSQL transaction to reach lock wait state`,
+    );
+  }
+
   beforeAll(async () => {
     cluster = await startDisposableCluster();
     db = await createDisposableDatabase(cluster, 'session_service_test');
@@ -429,41 +473,13 @@ describe('SW-1.5.2: Server-Side Web Sessions PostgreSQL 16 Integration Suite', (
       expect((err as SessionError).reason).toBe('SESSION_REVOKED');
     });
 
-    it('deterministic ordering 1: revoke commits first, subsequent validation fails (Section 8)', async () => {
-      const { secret } = await sessionService.createSession(ORG_A_ID, USER_A_ID);
-
-      // Revocation commits first
-      const revoked = await sessionService.revokeSession(secret);
-      expect(revoked).toBe(true);
-
-      // Validation executes after revocation committed: must fail
-      const validation = await sessionService.resolveAndValidateSession(secret);
-      expect(validation.valid).toBe(false);
-      expect(validation.reason).toBe('SESSION_REVOKED');
-    });
-
-    it('deterministic ordering 2: validation commits first, subsequent revoke succeeds and denies later attempts (Section 8)', async () => {
-      const { secret } = await sessionService.createSession(ORG_A_ID, USER_A_ID);
-
-      // Validation commits first
-      const validation1 = await sessionService.resolveAndValidateSession(secret);
-      expect(validation1.valid).toBe(true);
-
-      // Then revocation occurs
-      const revoked = await sessionService.revokeSession(secret);
-      expect(revoked).toBe(true);
-
-      // Subsequent validation must be denied
-      const validation2 = await sessionService.resolveAndValidateSession(secret);
-      expect(validation2.valid).toBe(false);
-      expect(validation2.reason).toBe('SESSION_REVOKED');
-    });
-
-    it('deterministic barrier: concurrent revoke blocks validation and forces SESSION_REVOKED (Section 8)', async () => {
+    it('deterministic Ordering A — Revocation first: controlled lock establishes wait state, revocation commits, validation fails with SESSION_REVOKED (AUTH-08)', async () => {
+      // 1. Create session
       const { secret, session } = await sessionService.createSession(ORG_A_ID, USER_A_ID);
 
-      // Worker 1 locks the row in a transaction
+      // 2. Acquire a controlled database lock
       const client1 = await appPool.connect();
+      let committed = false;
       try {
         await client1.query('BEGIN');
         await client1.query('SET LOCAL rls.enable_tenant = on');
@@ -472,35 +488,57 @@ describe('SW-1.5.2: Server-Side Web Sessions PostgreSQL 16 Integration Suite', (
           session.sessionIdHash,
         ]);
 
-        // Worker 2 calls resolveAndValidateSession in background (blocks on FOR UPDATE)
-        let worker2Done = false;
-        let worker2Result: unknown = null;
-        const worker2Promise = sessionService.resolveAndValidateSession(secret).then((res) => {
-          worker2Done = true;
-          worker2Result = res;
-        });
+        // 3. Start validation (blocks on FOR UPDATE of ws)
+        const validationPromise = sessionService.resolveAndValidateSession(secret);
 
-        // Small yield to allow Worker 2 to reach and block on row lock
-        await new Promise((r) => setTimeout(r, 50));
-        expect(worker2Done).toBe(false); // Proves Worker 2 is waiting on lock
+        // 4. Positively establish that the validation transaction has reached the intended waiting point
+        // Uses PostgreSQL internal lock manager evidence (pg_locks + pg_stat_activity)
+        const waitEvidence = await waitForBlockedLock(adminClient);
+        expect(waitEvidence.waitEventType).toBe('Lock');
+        expect(waitEvidence.pid).toBeDefined();
 
-        // Worker 1 updates revoked_at and commits
+        // 5. Revoke session and commit transaction
         await client1.query(
           'UPDATE web_sessions SET revoked_at = clock_timestamp() WHERE session_id_hash = $1',
           [session.sessionIdHash],
         );
         await client1.query('COMMIT');
+        committed = true;
 
-        // Worker 2 unblocks
-        await worker2Promise;
-        expect(worker2Done).toBe(true);
-        expect((worker2Result as { valid: boolean; reason: string }).valid).toBe(false);
-        expect((worker2Result as { valid: boolean; reason: string }).reason).toBe(
-          'SESSION_REVOKED',
-        );
+        // 6 & 7. Blocked validation releases and fails closed with SESSION_REVOKED
+        const validationResult = await validationPromise;
+        expect(validationResult.valid).toBe(false);
+        expect(validationResult.reason).toBe('SESSION_REVOKED');
       } finally {
+        if (!committed) {
+          try {
+            await client1.query('ROLLBACK');
+          } catch {
+            // ignore rollback error on test failure
+          }
+        }
         client1.release();
       }
+    });
+
+    it('deterministic Ordering B — Validation first: validation completes and commits before revocation, subsequent validation fails (AUTH-08)', async () => {
+      // 1. Create session
+      const { secret } = await sessionService.createSession(ORG_A_ID, USER_A_ID);
+
+      // 2. Permit validation to complete and commit
+      const validation1 = await sessionService.resolveAndValidateSession(secret);
+      expect(validation1.valid).toBe(true);
+      expect(validation1.user?.id).toBe(USER_A_ID);
+      expect(validation1.user?.orgId).toBe(ORG_A_ID);
+
+      // 3. Revoke and commit
+      const revoked = await sessionService.revokeSession(secret);
+      expect(revoked).toBe(true);
+
+      // 4. Verify subsequent validation fails
+      const validation2 = await sessionService.resolveAndValidateSession(secret);
+      expect(validation2.valid).toBe(false);
+      expect(validation2.reason).toBe('SESSION_REVOKED');
     });
   });
 
