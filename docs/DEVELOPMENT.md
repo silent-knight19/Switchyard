@@ -328,15 +328,26 @@ Subphase 1.4 Batch A delivers transaction-scoped tenant isolation and least-priv
 Defined in `apps/gateway/src/db/tenant.ts`, `withTenant` executes tenant-scoped operations within a dedicated database transaction:
 
 ```typescript
+export interface TenantClient {
+  query<R extends pg.QueryResultRow = any, I extends any[] = any[]>(
+    queryTextOrConfig: string | pg.QueryConfig<I>,
+    values?: I,
+  ): Promise<pg.QueryResult<R>>;
+  escapeIdentifier(str: string): string;
+  escapeLiteral(str: string): string;
+}
+
 export async function withTenant<T>(
   pool: Pool,
   orgId: string,
-  callback: (client: PoolClient) => Promise<T>
+  callback: (client: TenantClient) => Promise<T>
 ): Promise<T>;
 ```
 
 - **UUID Validation:** `orgId` is validated fail-closed upfront (`/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i`). Invalid tenant IDs throw `InvalidTenantIdError` without acquiring a pool client.
-- **AsyncLocalStorage Isolation & Nesting Prevention:** Active tenant context is tracked in `AsyncLocalStorage`. Nested invocations of `withTenant` throw `TenantTransactionError` to prevent context collision, transaction hijacking, and accidental commit boundaries.
+- **Transaction Ownership & Tampering Prevention (DB-27):** The callback receives a restricted `TenantClient` interface rather than an unrestricted `PoolClient`. Direct transaction-control statements (`BEGIN`, `COMMIT`, `ROLLBACK`, `START TRANSACTION`, `END`, `ABORT`, `SAVEPOINT`, etc.) and multi-statement evasion attempts are intercepted and rejected with `TenantTransactionError`.
+- **Confirmed COMMIT Verification (DB-26):** `withTenant` inspects PostgreSQL's command completion tag upon `COMMIT`. If PostgreSQL returns `ROLLBACK` (which occurs when `COMMIT` is executed on an aborted transaction block whose error was swallowed inside the callback), `withTenant` immediately throws `TenantTransactionError` and marks the transaction failed, guaranteeing that aborted transactions never silently report success.
+- **AsyncLocalStorage Isolation & Lifetime (DB-29):** Active tenant context is tracked in `AsyncLocalStorage`. Inactive context state prevents detached asynchronous continuations from executing queries through stale `TenantClient` references or mistaking finished transactions for active ones. `getActiveTenantContext()` exposes only `{ orgId }` (never the raw client). Nested active `withTenant` calls are rejected.
 - **Transaction-Local GUC:** Sets PostgreSQL application context `app.current_org_id` transaction-locally (`is_local = true`):
   ```sql
   SELECT pg_catalog.set_config('app.current_org_id', $1, true);
@@ -344,8 +355,10 @@ export async function withTenant<T>(
   Because `is_local = true`, the parameter automatically reverts when the transaction ends (commit or rollback).
 - **Connection Hygiene & Pool Invalidation:**
   - Client release is intercepted during the callback to prevent premature release.
-  - On standard completion, `COMMIT` is executed and the client is safely released to the pool.
-  - On callback error, `ROLLBACK` is issued. If rollback fails or if an error occurs during commit/rollback, the connection state is uncertain: `withTenant` marks the client broken by calling `client.release(true)`, forcing the pool to destroy the physical connection and preventing session-scope context bleed.
+  - On standard completion, confirmed `COMMIT` is verified and the client is safely released to the pool.
+  - On confirmed rollback, the clean idle connection is returned to the pool.
+  - On uncertain connection state (unhandled commit failure, failed rollback, or unconfirmed outcome), the connection is destroyed via `client.release(true)`.
+  - **Residual Limitations:** Custom GUCs provide application context, not cryptographic tokens (§12.6). A process compromised by arbitrary code execution could manipulate memory or execute queries directly; defense-in-depth requires strict input parameterization and application sandbox isolation.
 
 ##### 2. Migration `0009-tenant-rls-policies.sql` & Unified Policy Architecture
 

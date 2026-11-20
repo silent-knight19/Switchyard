@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 import {
   InvalidTenantIdError,
   TenantTransactionError,
+  assertNoTransactionControl,
   getActiveTenantContext,
+  stripCommentsAndLiterals,
   validateTenantId,
 } from './tenant.js';
 
@@ -74,6 +76,108 @@ describe('SW-1.4.1 tenant helper unit tests: input validation & context tracking
       expect(() => validateTenantId("'; DROP TABLE organizations; --")).toThrow(
         InvalidTenantIdError,
       );
+    });
+  });
+
+  describe('stripCommentsAndLiterals', () => {
+    it('strips line comments and block comments without altering outer structure', () => {
+      expect(stripCommentsAndLiterals('SELECT 1; -- line comment\nSELECT 2;').trim()).toBe(
+        'SELECT 1;  \nSELECT 2;',
+      );
+      expect(stripCommentsAndLiterals('SELECT /* block comment */ 1;').trim()).toBe('SELECT   1;');
+      expect(stripCommentsAndLiterals('SELECT 1; /* multi\nline\ncomment */').trim()).toBe(
+        'SELECT 1;',
+      );
+    });
+
+    it('strips single-quoted string literals including escaped quotes', () => {
+      expect(stripCommentsAndLiterals("SELECT 'hello world';").trim()).toBe('SELECT  ;');
+      expect(stripCommentsAndLiterals("SELECT 'hello ''nested'' world';").trim()).toBe('SELECT  ;');
+      expect(stripCommentsAndLiterals("SELECT 'hello \\'escaped\\' world';").trim()).toBe(
+        'SELECT  ;',
+      );
+    });
+
+    it('strips dollar-quoted string literals', () => {
+      expect(stripCommentsAndLiterals('SELECT $$hello world$$;').trim()).toBe('SELECT  ;');
+      expect(stripCommentsAndLiterals('SELECT $tag$hello world$tag$;').trim()).toBe('SELECT  ;');
+    });
+  });
+
+  describe('assertNoTransactionControl (DB-27)', () => {
+    it('rejects standalone transaction control statements', () => {
+      expect(() => assertNoTransactionControl('COMMIT')).toThrow(TenantTransactionError);
+      expect(() => assertNoTransactionControl('commit;')).toThrow(TenantTransactionError);
+      expect(() => assertNoTransactionControl('ROLLBACK')).toThrow(TenantTransactionError);
+      expect(() => assertNoTransactionControl('rollback;')).toThrow(TenantTransactionError);
+      expect(() => assertNoTransactionControl('BEGIN')).toThrow(TenantTransactionError);
+      expect(() => assertNoTransactionControl('begin;')).toThrow(TenantTransactionError);
+      expect(() => assertNoTransactionControl('START TRANSACTION')).toThrow(TenantTransactionError);
+      expect(() => assertNoTransactionControl('END')).toThrow(TenantTransactionError);
+      expect(() => assertNoTransactionControl('ABORT')).toThrow(TenantTransactionError);
+      expect(() => assertNoTransactionControl('SAVEPOINT sp1')).toThrow(TenantTransactionError);
+      expect(() => assertNoTransactionControl('RELEASE SAVEPOINT sp1')).toThrow(
+        TenantTransactionError,
+      );
+      expect(() => assertNoTransactionControl('ROLLBACK TO sp1')).toThrow(TenantTransactionError);
+      expect(() => assertNoTransactionControl('ROLLBACK TO SAVEPOINT sp1')).toThrow(
+        TenantTransactionError,
+      );
+    });
+
+    it('rejects multi-statement transaction control evasion', () => {
+      expect(() => assertNoTransactionControl('SELECT 1; COMMIT;')).toThrow(TenantTransactionError);
+      expect(() => assertNoTransactionControl('INSERT INTO foo VALUES (1); ROLLBACK;')).toThrow(
+        TenantTransactionError,
+      );
+      expect(() => assertNoTransactionControl('SELECT 1; BEGIN; SELECT 2;')).toThrow(
+        TenantTransactionError,
+      );
+      expect(() => assertNoTransactionControl('SELECT 1; START TRANSACTION;')).toThrow(
+        TenantTransactionError,
+      );
+    });
+
+    it('rejects comment-wrapped transaction control evasion', () => {
+      expect(() => assertNoTransactionControl('/* comment */ COMMIT;')).toThrow(
+        TenantTransactionError,
+      );
+      expect(() => assertNoTransactionControl('-- comment\nROLLBACK;')).toThrow(
+        TenantTransactionError,
+      );
+      expect(() => assertNoTransactionControl('SELECT 1; /* sneaky */ COMMIT;')).toThrow(
+        TenantTransactionError,
+      );
+    });
+
+    it('permits legitimate queries containing transaction words inside literals', () => {
+      expect(() =>
+        assertNoTransactionControl("SELECT * FROM organizations WHERE name = 'COMMIT'"),
+      ).not.toThrow();
+      expect(() =>
+        assertNoTransactionControl("SELECT * FROM organizations WHERE name = 'foo; COMMIT; bar'"),
+      ).not.toThrow();
+      expect(() =>
+        assertNoTransactionControl(
+          'SELECT * FROM organizations WHERE name = $$foo; ROLLBACK; bar$$',
+        ),
+      ).not.toThrow();
+      expect(() =>
+        assertNoTransactionControl(
+          "UPDATE users SET role = 'member' WHERE email = 'begin@example.com'",
+        ),
+      ).not.toThrow();
+    });
+
+    it('permits legitimate single-statement parameterized queries', () => {
+      expect(() =>
+        assertNoTransactionControl('SELECT * FROM users WHERE org_id = $1 AND role = $2'),
+      ).not.toThrow();
+      expect(() =>
+        assertNoTransactionControl(
+          'INSERT INTO gateway_requests (request_id, org_id) VALUES ($1, $2)',
+        ),
+      ).not.toThrow();
     });
   });
 
