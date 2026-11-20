@@ -1,5 +1,4 @@
 import { ZodError, type ZodIssue } from 'zod';
-import { sanitizeString } from './redaction.js';
 
 const MAX_MESSAGE_LENGTH = 256;
 const MAX_ERROR_DEPTH = 2;
@@ -68,6 +67,11 @@ export const SAFE_ERROR_CODES = new Set([
   'OVERPRIVILEGED_CONFIG_PERMITTED',
   'OVERPRIVILEGED_KEYS_PERMITTED',
   'OVERPRIVILEGED_ACL_PERMITTED',
+  'OVERPRIVILEGED_FLUSHALL_PERMITTED',
+  'OVERPRIVILEGED_FLUSHDB_PERMITTED',
+  'OVERPRIVILEGED_SHUTDOWN_PERMITTED',
+  'OVERPRIVILEGED_REPLICAOF_PERMITTED',
+  'OVERPRIVILEGED_DEBUG_PERMITTED',
   'REDIS_ACL_PROBE_FAILED',
   'POSTGRES_QUERY_TIMEOUT',
   'POSTGRES_CONNECTION_FAILED',
@@ -107,6 +111,14 @@ export const SAFE_STARTUP_MESSAGES: Record<string, string> = {
   OVERPRIVILEGED_CONFIG_PERMITTED: 'Administrative CONFIG command permitted in runtime identity',
   OVERPRIVILEGED_KEYS_PERMITTED: 'Unrestricted KEYS command permitted in runtime identity',
   OVERPRIVILEGED_ACL_PERMITTED: 'Administrative ACL command permitted in runtime identity',
+  OVERPRIVILEGED_FLUSHALL_PERMITTED:
+    'Administrative FLUSHALL command permitted in runtime identity',
+  OVERPRIVILEGED_FLUSHDB_PERMITTED: 'Administrative FLUSHDB command permitted in runtime identity',
+  OVERPRIVILEGED_SHUTDOWN_PERMITTED:
+    'Administrative SHUTDOWN command permitted in runtime identity',
+  OVERPRIVILEGED_REPLICAOF_PERMITTED:
+    'Administrative REPLICAOF command permitted in runtime identity',
+  OVERPRIVILEGED_DEBUG_PERMITTED: 'Administrative DEBUG command permitted in runtime identity',
   STARTUP_TIMEOUT: 'Gateway startup timed out',
   LISTEN_FAILED: 'Gateway HTTP listen failed',
 };
@@ -141,6 +153,14 @@ export const SAFE_ERROR_MESSAGES = new Set([
   'Fatal error during graceful shutdown',
   'Payload too large',
   '[CIRCULAR REFERENCE DETECTED]',
+  'Administrative CONFIG command permitted in runtime identity',
+  'Administrative KEYS command permitted in runtime identity',
+  'Administrative ACL command permitted in runtime identity',
+  'Administrative FLUSHALL command permitted in runtime identity',
+  'Administrative FLUSHDB command permitted in runtime identity',
+  'Administrative SHUTDOWN command permitted in runtime identity',
+  'Administrative REPLICAOF command permitted in runtime identity',
+  'Administrative DEBUG command permitted in runtime identity',
 ]);
 
 export const SAFE_ISSUE_FIELDS = new Set([
@@ -366,9 +386,28 @@ export function safeErrorSerializer(
   return serialized;
 }
 
+const SAFE_HOSTS = new Set([
+  '127.0.0.1',
+  '127.0.0.1:3000',
+  '127.0.0.1:3001',
+  'localhost',
+  'localhost:3000',
+  'localhost:3001',
+]);
+
+const SAFE_CONTENT_TYPES = new Set([
+  'application/json',
+  'text/plain',
+  'application/x-www-form-urlencoded',
+]);
+
+const SAFE_ACCEPTS = new Set(['*/*', 'application/json', 'text/plain', 'text/html']);
+
 /**
- * Serializes HTTP request metadata safely.
+ * Serializes HTTP request metadata safely (Finding S2).
  * Never logs raw query strings or arbitrary path segments.
+ * Never emits raw user-controlled header values in logs.
+ * Preserves request correlation, method, safe route identifier, and operational metadata using fixed safe placeholders.
  */
 export function safeReqSerializer(req: unknown): Record<string, unknown> {
   if (typeof req !== 'object' || req === null) return {};
@@ -382,19 +421,96 @@ export function safeReqSerializer(req: unknown): Record<string, unknown> {
 
   const safeRoute = getSafeRouteIdentifier(rawUrl, routeUrl);
 
+  // Preserve request correlation while strictly rejecting arbitrary injected user input
+  let safeId: string;
+  if (typeof r['id'] === 'string') {
+    if (
+      /^req-\d+$/.test(r['id']) ||
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(r['id'])
+    ) {
+      safeId = r['id'];
+    } else {
+      safeId = '[CORRELATION_ID]';
+    }
+  } else if (typeof r['id'] === 'number') {
+    safeId = String(r['id']);
+  } else {
+    safeId = '[UNKNOWN_ID]';
+  }
+
+  // Preserve HTTP method safely
+  const rawMethod = typeof r['method'] === 'string' ? r['method'].toUpperCase() : '';
+  const safeMethod = /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/.test(rawMethod)
+    ? rawMethod
+    : '[METHOD]';
+
   const safeHeaders: Record<string, unknown> = {};
   if (typeof r['headers'] === 'object' && r['headers'] !== null) {
     for (const [key, val] of Object.entries(r['headers'])) {
       const lowerKey = key.toLowerCase();
-      if (ALLOWED_REQ_HEADERS.has(lowerKey)) {
-        safeHeaders[lowerKey] = typeof val === 'string' ? sanitizeString(val) : val;
+      if (!ALLOWED_REQ_HEADERS.has(lowerKey)) {
+        continue;
+      }
+
+      switch (lowerKey) {
+        case 'host':
+          if (typeof val === 'string' && SAFE_HOSTS.has(val)) {
+            safeHeaders['host'] = val;
+          } else {
+            safeHeaders['host'] = '[REDACTED]';
+          }
+          break;
+        case 'user-agent':
+          // User-controlled header; confidentiality cannot be guaranteed via regex, replace with safe fixed placeholder
+          safeHeaders['user-agent'] = '[REDACTED]';
+          break;
+        case 'x-request-id':
+          // User-controlled header; replace with safe fixed placeholder
+          safeHeaders['x-request-id'] = '[REDACTED]';
+          break;
+        case 'content-type':
+          if (typeof val === 'string') {
+            const mime = val.toLowerCase().split(';')[0]?.trim();
+            if (mime && SAFE_CONTENT_TYPES.has(mime)) {
+              safeHeaders['content-type'] = mime;
+            } else {
+              safeHeaders['content-type'] = '[REDACTED]';
+            }
+          } else {
+            safeHeaders['content-type'] = '[REDACTED]';
+          }
+          break;
+        case 'accept':
+          if (typeof val === 'string') {
+            const acc = val.toLowerCase().split(';')[0]?.trim();
+            if (acc && SAFE_ACCEPTS.has(acc)) {
+              safeHeaders['accept'] = acc;
+            } else {
+              safeHeaders['accept'] = '[REDACTED]';
+            }
+          } else {
+            safeHeaders['accept'] = '[REDACTED]';
+          }
+          break;
+        case 'content-length':
+          if (typeof val === 'string' && /^\d+$/.test(val)) {
+            safeHeaders['content-length'] = val;
+          } else if (typeof val === 'number' && Number.isInteger(val) && val >= 0) {
+            safeHeaders['content-length'] = String(val);
+          } else {
+            safeHeaders['content-length'] = '[REDACTED]';
+          }
+          break;
+        default:
+          safeHeaders[lowerKey] = '[REDACTED]';
+          break;
       }
     }
   }
 
   return {
-    id: r['id'],
-    method: r['method'],
+    id: safeId,
+    method: safeMethod,
     url: safeRoute,
     route: safeRoute,
     headers: safeHeaders,

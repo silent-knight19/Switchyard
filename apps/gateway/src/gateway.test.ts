@@ -6,7 +6,9 @@ import { GracefulShutdownManager, type ShutdownDependencies } from './lifecycle/
 import { buildApp } from './app.js';
 import { createLogger } from './logging/index.js';
 import type { PostgresClient } from './infrastructure/postgres.js';
-import type { RedisClient } from './infrastructure/redis.js';
+import { createRedisClient, type RedisClient } from './infrastructure/redis.js';
+import { loadConfig, type GatewayConfig } from './config/index.js';
+import type { Redis } from 'ioredis';
 
 const VALID_DEV_ENV: Record<string, string> = {
   NODE_ENV: 'development',
@@ -605,48 +607,52 @@ describe('SW-1.2.4 Gateway Boot, Health, and Shutdown Lifecycle', () => {
     await app.close();
   });
 
-  it('20. redis verifyAclRestrictions accepts restricted user and rejects overprivileged default user (Finding 2)', async () => {
-    // Restricted user switchyard_app
+  it('20. redis verifyAclRestrictions accepts restricted user and rejects overprivileged default user (Finding 2, Finding S1)', async () => {
+    // Restricted user switchyard_app exercising actual implementation logic
     const restrictedRedis = {
       acl: async (subcmd: string) => {
         if (subcmd === 'WHOAMI') return 'switchyard_app';
         throw new Error('NOPERM');
       },
       call: async (cmd: string) => {
-        if (cmd === 'CONFIG' || cmd === 'KEYS' || cmd === 'ACL') {
+        if (
+          cmd === 'CONFIG' ||
+          cmd === 'KEYS' ||
+          cmd === 'ACL' ||
+          cmd === 'FLUSHALL' ||
+          cmd === 'FLUSHDB' ||
+          cmd === 'SHUTDOWN' ||
+          cmd === 'REPLICAOF'
+        ) {
           throw new Error(
             `NOPERM User switchyard_app has no permissions to run the '${cmd.toLowerCase()}' command`,
           );
         }
+        if (cmd === 'DEBUG') {
+          throw new Error('ERR DEBUG command not allowed');
+        }
         return 'OK';
       },
     };
-    const clientRestricted = createMockRedis({
-      verifyAclRestrictions: async () => {
-        const whoami = (await restrictedRedis.acl('WHOAMI')) as string;
-        if (whoami === 'default') {
-          return { ok: false, code: 'DEFAULT_USER_FORBIDDEN' };
-        }
-        return { ok: true };
-      },
-    });
+    const clientRestricted = createRedisClient(
+      VALID_DEV_ENV as unknown as GatewayConfig,
+      restrictedRedis as unknown as Redis,
+    );
     const resRestricted = await clientRestricted.verifyAclRestrictions();
     expect(resRestricted.ok).toBe(true);
 
-    // Overprivileged 'default' user
-    const clientOverprivileged = createMockRedis({
-      verifyAclRestrictions: async () => {
-        const whoami = 'default';
-        if (whoami === 'default') {
-          return {
-            ok: false,
-            code: 'DEFAULT_USER_FORBIDDEN',
-            error: 'Redis runtime identity cannot be default',
-          };
-        }
-        return { ok: true };
+    // Overprivileged 'default' user exercising actual implementation logic
+    const defaultRedis = {
+      acl: async (subcmd: string) => {
+        if (subcmd === 'WHOAMI') return 'default';
+        throw new Error('NOPERM');
       },
-    });
+      call: async () => 'OK',
+    };
+    const clientOverprivileged = createRedisClient(
+      VALID_DEV_ENV as unknown as GatewayConfig,
+      defaultRedis as unknown as Redis,
+    );
     const resOverprivileged = await clientOverprivileged.verifyAclRestrictions();
     expect(resOverprivileged.ok).toBe(false);
     expect(resOverprivileged.code).toBe('DEFAULT_USER_FORBIDDEN');
@@ -804,5 +810,69 @@ describe('SW-1.2.4 Gateway Boot, Health, and Shutdown Lifecycle', () => {
     await expect(checkRequired(true)).rejects.toThrow(
       `Integration test required mode failed: port ${unreachablePort} is unreachable`,
     );
+  });
+
+  it('24. real redis integration: named non-default user permitting FLUSHALL fails verifyAclRestrictions gate (Finding S1)', async () => {
+    const reachable = await isPortReachable(6379);
+    if (!reachable) {
+      if (REQUIRE_INTEGRATION) {
+        expect.fail(
+          'Redis integration test failed: service is not reachable on 127.0.0.1:6379 while INTEGRATION_TESTS is required',
+        );
+      }
+      console.warn('Redis service not reachable on 127.0.0.1:6379; skipping live integration test');
+      return;
+    }
+
+    const { Redis: IORedis } = await import('ioredis');
+    const adminRedis = new IORedis({
+      host: '127.0.0.1',
+      port: 6379,
+      password: 'switchyard_dev_password',
+      connectTimeout: 2000,
+      lazyConnect: false,
+    });
+
+    const testUserName = `switchyard_test_flushall_${Date.now()}`;
+    const testPassword = 'test_disposable_password_987';
+
+    // Provision disposable test user that denies CONFIG, KEYS, and ACL LIST but permits FLUSHALL
+    await adminRedis.acl(
+      'SETUSER',
+      testUserName,
+      'on',
+      `>${testPassword}`,
+      '~*',
+      '&*',
+      '+@all',
+      '-@admin',
+      '-@dangerous',
+      '+info',
+      '-CONFIG',
+      '-KEYS',
+      '+FLUSHALL',
+    );
+
+    try {
+      // Connect using real createRedisClient with this user's credentials
+      const testConfig = loadConfig({
+        ...VALID_DEV_ENV,
+        REDIS_USER: testUserName,
+        REDIS_PASSWORD: testPassword,
+      });
+
+      const overprivilegedClient = createRedisClient(testConfig);
+      const aclResult = await overprivilegedClient.verifyAclRestrictions();
+
+      // The gate must fail-closed because FLUSHALL is permitted
+      expect(aclResult.ok).toBe(false);
+      expect(aclResult.code).toBe('OVERPRIVILEGED_FLUSHALL_PERMITTED');
+
+      await overprivilegedClient.close();
+    } finally {
+      // Clean up disposable test user
+      await adminRedis.acl('DELUSER', testUserName);
+      await adminRedis.quit();
+    }
   });
 });

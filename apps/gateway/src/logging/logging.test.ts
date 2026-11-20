@@ -559,4 +559,62 @@ describe('SW-1.2.3 Structured Logging and Redaction', () => {
     expect(issues[0]?.path).toBe('configuration');
     expect(issues[0]?.message).toBe('Invalid configuration value');
   });
+
+  it('27. request-header confidentiality: eliminates raw synthetic secrets from User-Agent, Host, X-Request-ID, Content-Type, Accept, and custom headers (Finding S2)', () => {
+    const { stream, getLogs, getRawOutput } = createLogCapture();
+    const logger = createLogger({ stream });
+
+    const secretUserAgent = 'Mozilla/5.0 synthetic_secret_token_in_user_agent_xyz789';
+    const secretHost = 'synthetic_confidential_host_9876.internal.corp';
+    const secretRequestIdHeader = 'synthetic_secret_x_request_id_header_555';
+    const secretContentTypeParam = 'application/json; secret_bearer=token_abc123';
+    const secretAcceptParam = 'application/json; confidential_param=token_def456';
+    const secretCustomHeader = 'super_secret_custom_header_token_999';
+
+    logger.info(
+      {
+        req: {
+          id: 'req-42',
+          method: 'POST',
+          url: '/v1/chat/completions',
+          headers: {
+            host: secretHost,
+            'user-agent': secretUserAgent,
+            'x-request-id': secretRequestIdHeader,
+            'content-type': secretContentTypeParam,
+            accept: secretAcceptParam,
+            'content-length': '1024',
+            'x-custom-secret': secretCustomHeader,
+          },
+        },
+      },
+      'Inference dispatch',
+    );
+
+    const raw = getRawOutput();
+    // All synthetic secrets must be 100% absent from serialized output
+    expect(raw).not.toContain(secretUserAgent);
+    expect(raw).not.toContain(secretHost);
+    expect(raw).not.toContain(secretRequestIdHeader);
+    expect(raw).not.toContain('token_abc123');
+    expect(raw).not.toContain('token_def456');
+    expect(raw).not.toContain(secretCustomHeader);
+
+    // Operational metadata must be preserved
+    const logs = getLogs();
+    const req = logs[0]?.req as Record<string, unknown>;
+    expect(req?.id).toBe('req-42');
+    expect(req?.method).toBe('POST');
+    expect(req?.url).toBe('/v1/chat/completions');
+    expect(req?.route).toBe('/v1/chat/completions');
+
+    const headers = req?.headers as Record<string, unknown>;
+    expect(headers?.['host']).toBe('[REDACTED]');
+    expect(headers?.['user-agent']).toBe('[REDACTED]');
+    expect(headers?.['x-request-id']).toBe('[REDACTED]');
+    expect(headers?.['content-type']).toBe('application/json');
+    expect(headers?.['accept']).toBe('application/json');
+    expect(headers?.['content-length']).toBe('1024');
+    expect(headers?.['x-custom-secret']).toBeUndefined();
+  });
 });
