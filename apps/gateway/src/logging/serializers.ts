@@ -1,8 +1,9 @@
 import { ZodError, type ZodIssue } from 'zod';
 import { sanitizeString } from './redaction.js';
 
-const MAX_MESSAGE_LENGTH = 1024;
-const MAX_ERROR_DEPTH = 3;
+const MAX_MESSAGE_LENGTH = 256;
+const MAX_ERROR_DEPTH = 2;
+const MAX_ISSUES = 8;
 
 const ALLOWED_REQ_HEADERS = new Set([
   'host',
@@ -21,9 +22,6 @@ export const ALLOWED_STATIC_ROUTES = new Set([
   '/v1/embeddings',
 ]);
 
-/**
- * Returns a safe route identifier, never leaking arbitrary URL path segments or query strings.
- */
 export function getSafeRouteIdentifier(
   rawUrl?: string | undefined,
   routePattern?: string | undefined,
@@ -49,6 +47,7 @@ export const SAFE_ERROR_TYPES = new Set([
   'PostgresError',
   'RedisError',
   'ReplyError',
+  'OperationalError',
   'Error',
   'TypeError',
   'RangeError',
@@ -57,6 +56,60 @@ export const SAFE_ERROR_TYPES = new Set([
   'ReferenceError',
   'CyclicReference',
 ]);
+
+export const SAFE_ERROR_CODES = new Set([
+  'CONFIG_VALIDATION_FAILED',
+  'STARTUP_TIMEOUT',
+  'DATABASE_CONNECT_FAILED',
+  'REDIS_CONNECT_FAILED',
+  'UNSAFE_REDIS_POLICY',
+  'UNSAFE_REDIS_ACL',
+  'DEFAULT_USER_FORBIDDEN',
+  'OVERPRIVILEGED_CONFIG_PERMITTED',
+  'OVERPRIVILEGED_KEYS_PERMITTED',
+  'OVERPRIVILEGED_ACL_PERMITTED',
+  'REDIS_ACL_PROBE_FAILED',
+  'POSTGRES_QUERY_TIMEOUT',
+  'POSTGRES_CONNECTION_FAILED',
+  'DATABASE_ERROR',
+  'REDIS_ERROR',
+  'TIMEOUT',
+  'UNEXPECTED_PING_RESPONSE',
+  'UNSAFE_POLICY',
+  'WHOAMI_FAILED',
+  'ACL_PROBE_ERROR',
+  'LISTEN_FAILED',
+  'SIGTERM',
+  'SIGINT',
+  'MANUAL',
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  '57014',
+  '28P01',
+  '08006',
+  '42P01',
+  'FST_ERR_NOT_FOUND',
+  'FST_ERR_BAD_URL',
+  'ERR_UPSTREAM_FAILURE',
+  'ERR_NESTED_ROOT',
+  'ERR_PAYLOAD_TOO_LARGE',
+]);
+
+export const SAFE_STARTUP_MESSAGES: Record<string, string> = {
+  DATABASE_CONNECT_FAILED: 'PostgreSQL readiness check failed during startup',
+  REDIS_CONNECT_FAILED: 'Redis readiness check failed during startup',
+  UNSAFE_REDIS_POLICY: 'Unsafe Redis policy: expected "noeviction"',
+  UNSAFE_REDIS_ACL: 'Redis ACL verification failed: runtime identity is not properly restricted',
+  DEFAULT_USER_FORBIDDEN: 'Redis runtime identity cannot be default user',
+  OVERPRIVILEGED_CONFIG_PERMITTED: 'Administrative CONFIG command permitted in runtime identity',
+  OVERPRIVILEGED_KEYS_PERMITTED: 'Unrestricted KEYS command permitted in runtime identity',
+  OVERPRIVILEGED_ACL_PERMITTED: 'Administrative ACL command permitted in runtime identity',
+  STARTUP_TIMEOUT: 'Gateway startup timed out',
+  LISTEN_FAILED: 'Gateway HTTP listen failed',
+};
 
 export const SAFE_ERROR_MESSAGES = new Set([
   'PostgreSQL readiness check failed during startup',
@@ -86,7 +139,64 @@ export const SAFE_ERROR_MESSAGES = new Set([
   'Gateway server is listening and ready',
   'Process signal received; shutting down',
   'Fatal error during graceful shutdown',
+  'Payload too large',
   '[CIRCULAR REFERENCE DETECTED]',
+]);
+
+export const SAFE_ISSUE_FIELDS = new Set([
+  'NODE_ENV',
+  'PORT',
+  'HOST',
+  'POSTGRES_HOST',
+  'POSTGRES_PORT',
+  'POSTGRES_DB',
+  'POSTGRES_USER',
+  'POSTGRES_PASSWORD',
+  'REDIS_HOST',
+  'REDIS_PORT',
+  'REDIS_USER',
+  'REDIS_PASSWORD',
+  'REDIS_TLS',
+  'REDIS_MAXMEMORY_POLICY',
+  'COOKIE_SECRET',
+  'COOKIE_SECURE',
+  'COOKIE_DOMAIN',
+  'TLS_VERIFY',
+  'MOCK_PROVIDER_ENABLED',
+  'DEMO_SEEDING_ENABLED',
+  'UPSTREAM_ENDPOINT_URL',
+  'FAIL_OPEN',
+  'ALLOW_FAIL_OPEN',
+  'BYPASS_AUTH',
+  'ALLOW_INSECURE_AUTH',
+  'BYPASS_RLS',
+  'DISABLE_TENANT_ISOLATION',
+  'DISABLE_AUTH',
+  'INSECURE_MODE',
+  'NODE_TLS_REJECT_UNAUTHORIZED',
+]);
+
+export const SAFE_CUSTOM_ZOD_MESSAGES = new Set([
+  'Expected "true" or "false"',
+  'Expected integer between 1 and 65535',
+  'Expected exactly "true" or "false" string',
+  'PORT must be an integer between 1 and 65535',
+  'Malformed endpoint URL: expected valid http:// or https:// URL without embedded credentials',
+  'Unsafe Redis policy: must be "noeviction" to prevent silent monetary eviction',
+  'UPSTREAM_ENDPOINT_URL must use http or https protocol',
+  'UPSTREAM_ENDPOINT_URL must not contain embedded user credentials',
+  'Production profile requires secure cookies (COOKIE_SECURE=true)',
+  'COOKIE_SECURE must be true in production profile',
+  'Production profile requires TLS verification (TLS_VERIFY=true)',
+  'TLS_VERIFY must be true in production profile',
+  'Mock provider is prohibited in production profile',
+  'Demo seeding is prohibited in production profile',
+  'Default development credentials are prohibited in production profile',
+  'Custom upstream endpoint overrides are prohibited in production profile',
+  'Custom upstream endpoint URL overrides are prohibited in production profile pending provider allowlist specification',
+  'Disabling Node TLS verification is prohibited in production.',
+  'Forbidden security bypass flag detected. Switchyard is strictly fail-closed.',
+  'Invalid value provided for sensitive credential',
 ]);
 
 export interface SerializedError {
@@ -94,7 +204,6 @@ export interface SerializedError {
   message: string;
   code?: string | number | undefined;
   statusCode?: number | undefined;
-  stack?: string | undefined;
   issues?: Array<{ path: string; message: string }> | undefined;
   cause?: SerializedError | undefined;
 }
@@ -105,14 +214,15 @@ export function truncateMessage(msg: string, maxLength = MAX_MESSAGE_LENGTH): st
 }
 
 /**
- * Formats a safe Zod issue message that never echoes raw input values.
+ * Formats a safe Zod issue message strictly from allowlisted messages.
+ * Never echoes raw received values or unrecognized custom messages.
  */
 export function formatSafeZodMessage(issue: ZodIssue): string {
   switch (issue.code) {
     case 'invalid_type':
       return `Expected ${issue.expected}`;
     case 'invalid_value':
-      return `Invalid option: expected one of ${issue.values.map(String).join(' | ')}`;
+      return 'Invalid option provided';
     case 'too_small':
       return `Must contain at least ${issue.minimum} character(s)`;
     case 'too_big':
@@ -120,16 +230,18 @@ export function formatSafeZodMessage(issue: ZodIssue): string {
     case 'invalid_format':
       return `Invalid format: ${issue.format}`;
     case 'custom':
-      return sanitizeString(issue.message);
+      return SAFE_CUSTOM_ZOD_MESSAGES.has(issue.message)
+        ? issue.message
+        : 'Invalid configuration value';
     default:
       return 'Invalid configuration value';
   }
 }
 
 /**
- * Safe error serializer enforcing strict allowlisting (Finding 1).
- * Never serializes arbitrary upstream, database, Redis, or validation error text into production logs.
- * Never exposes raw stack traces containing untrusted values.
+ * Safe error serializer enforcing strict allowlisting (Finding B).
+ * Never serializes arbitrary upstream, database, Redis, startup, or validation error text into production logs.
+ * Never exposes raw stack-frame lines.
  */
 export function safeErrorSerializer(
   err: unknown,
@@ -157,17 +269,17 @@ export function safeErrorSerializer(
   const rawType = typeof errorObj['name'] === 'string' ? errorObj['name'] : 'Error';
   const type = SAFE_ERROR_TYPES.has(rawType) ? rawType : 'OperationalError';
 
-  // Handle Safe Error Code
+  // Handle Safe Error Code via strict allowlist
   let code: string | number | undefined;
   if (
     'code' in errorObj &&
     (typeof errorObj['code'] === 'string' || typeof errorObj['code'] === 'number')
   ) {
     const rawCode = String(errorObj['code']);
-    if (/^[A-Za-z0-9_.-]{1,64}$/.test(rawCode)) {
+    if (SAFE_ERROR_CODES.has(rawCode)) {
       code = errorObj['code'];
     } else {
-      code = 'ERR_UNKNOWN';
+      code = 'UNKNOWN_ERROR';
     }
   }
 
@@ -183,28 +295,29 @@ export function safeErrorSerializer(
   let message: string;
   const rawMessage = typeof errorObj['message'] === 'string' ? errorObj['message'] : '';
 
-  if (type === 'StartupError' && errorObj['message']) {
-    message = truncateMessage(sanitizeString(rawMessage));
+  if (type === 'StartupError') {
+    const mapped = code ? SAFE_STARTUP_MESSAGES[String(code)] : undefined;
+    message = mapped ?? 'Gateway startup failed';
   } else if (type === 'ConfigValidationError') {
     message = 'Configuration validation failed';
   } else if (type === 'DatabaseError' || type === 'PostgresError') {
     message = 'PostgreSQL database operation failed';
   } else if (type === 'RedisError' || type === 'ReplyError') {
     message = 'Redis operation failed';
+  } else if (rawMessage.startsWith('ERR_PAYLOAD_TOO_LARGE') || code === 'ERR_PAYLOAD_TOO_LARGE') {
+    message = 'Payload too large';
   } else if (SAFE_ERROR_MESSAGES.has(rawMessage)) {
     message = rawMessage;
-  } else if (rawMessage.startsWith('ERR_PAYLOAD_TOO_LARGE')) {
-    message = truncateMessage(rawMessage);
   } else if (type === 'FastifyError' && statusCode) {
     message = statusCode === 404 ? 'Not Found' : 'HTTP Request Failed';
   } else {
-    // Un-allowlisted arbitrary error text: do not emit into logs to prevent secret leakage
-    message = code ? `Operation failed: ${String(code)}` : 'Operation failed';
+    message =
+      code && code !== 'UNKNOWN_ERROR' ? `Operation failed: ${String(code)}` : 'Operation failed';
   }
 
   const serialized: SerializedError = {
     type,
-    message,
+    message: truncateMessage(message),
   };
 
   if (code !== undefined) {
@@ -214,27 +327,35 @@ export function safeErrorSerializer(
     serialized.statusCode = statusCode;
   }
 
-  // Safe Stack Trace: never expose line 0 (which contains raw error message).
-  // Filter only call site frames ('at ...') to prevent leaking sensitive values.
-  if (typeof errorObj['stack'] === 'string') {
-    const lines = errorObj['stack'].split('\n');
-    const callFrames = lines.filter((l) => /^\s*at\s+/.test(l)).slice(0, 10);
-    serialized.stack = [`${type}: [STACK_FRAMES]`, ...callFrames].join('\n');
-  }
+  // Stack traces: omit raw stack-frame lines completely to eliminate any risk of leaking sensitive values
+  // (Architecture §14.3 & Finding B requirement: omission is acceptable).
 
-  // Safe Issues (Zod / Config issues)
+  // Safe Issues (Zod / Config issues) capped at MAX_ISSUES
   if (err instanceof ZodError) {
-    serialized.issues = err.issues.map((i) => ({
-      path: i.path.join('.'),
-      message: formatSafeZodMessage(i),
-    }));
+    serialized.issues = err.issues.slice(0, MAX_ISSUES).map((i) => {
+      const fieldPath = i.path.join('.');
+      const safePath = SAFE_ISSUE_FIELDS.has(fieldPath) ? fieldPath : 'configuration';
+      return {
+        path: safePath,
+        message: formatSafeZodMessage(i),
+      };
+    });
   } else if (Array.isArray(errorObj['issues'])) {
-    serialized.issues = (
-      errorObj['issues'] as Array<{ field?: string; path?: string; message?: string }>
-    ).map((i) => ({
-      path: String(i.field ?? i.path ?? 'field'),
-      message: sanitizeString(String(i.message ?? 'Invalid value')),
-    }));
+    const rawIssues = errorObj['issues'] as Array<{
+      field?: string;
+      path?: string;
+      message?: string;
+    }>;
+    serialized.issues = rawIssues.slice(0, MAX_ISSUES).map((i) => {
+      const rawPath = String(i.field ?? i.path ?? 'configuration');
+      const safePath = SAFE_ISSUE_FIELDS.has(rawPath) ? rawPath : 'configuration';
+      const rawMsg = String(i.message ?? '');
+      const safeMsg = SAFE_CUSTOM_ZOD_MESSAGES.has(rawMsg) ? rawMsg : 'Invalid configuration value';
+      return {
+        path: safePath,
+        message: safeMsg,
+      };
+    });
   }
 
   // Recurse into cause if within depth limit

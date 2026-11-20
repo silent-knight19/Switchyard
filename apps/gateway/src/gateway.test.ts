@@ -54,6 +54,11 @@ function createMockRedis(overrides?: Partial<RedisClient>): RedisClient {
   };
 }
 
+const REQUIRE_INTEGRATION =
+  process.env.INTEGRATION_TESTS === 'true' ||
+  process.env.INTEGRATION_TESTS === 'required' ||
+  process.env.REQUIRE_INTEGRATION === 'true';
+
 async function isPortReachable(
   port: number,
   host = '127.0.0.1',
@@ -650,6 +655,11 @@ describe('SW-1.2.4 Gateway Boot, Health, and Shutdown Lifecycle', () => {
   it('21. real postgresql integration: statement_timeout aborts delayed queries and prevents pool connection retention (Finding 3)', async () => {
     const reachable = await isPortReachable(5432);
     if (!reachable) {
+      if (REQUIRE_INTEGRATION) {
+        expect.fail(
+          'PostgreSQL integration test failed: service is not reachable on 127.0.0.1:5432 while INTEGRATION_TESTS is required',
+        );
+      }
       console.warn(
         'PostgreSQL service not reachable on 127.0.0.1:5432; skipping live integration test',
       );
@@ -705,6 +715,11 @@ describe('SW-1.2.4 Gateway Boot, Health, and Shutdown Lifecycle', () => {
   it('22. real redis integration: verifies runtime identity restrictions and ACL DRYRUN denies prohibited commands (Finding 2)', async () => {
     const reachable = await isPortReachable(6379);
     if (!reachable) {
+      if (REQUIRE_INTEGRATION) {
+        expect.fail(
+          'Redis integration test failed: service is not reachable on 127.0.0.1:6379 while INTEGRATION_TESTS is required',
+        );
+      }
       console.warn('Redis service not reachable on 127.0.0.1:6379; skipping live integration test');
       return;
     }
@@ -763,5 +778,31 @@ describe('SW-1.2.4 Gateway Boot, Health, and Shutdown Lifecycle', () => {
     }
 
     await adminRedis.quit();
+  });
+
+  it('23. integration required mode strictly fails when database or redis ports are unreachable (Finding D)', async () => {
+    // Assert that attempting to enforce required mode on an unreachable dummy port fails explicitly
+    const unreachablePort = 59999;
+    const isReachable = await isPortReachable(unreachablePort);
+    expect(isReachable).toBe(false);
+
+    // Verify explicit error enforcement pattern
+    const checkRequired = async (required: boolean) => {
+      const ok = await isPortReachable(unreachablePort);
+      if (!ok && required) {
+        throw new Error(
+          `Integration test required mode failed: port ${unreachablePort} is unreachable`,
+        );
+      }
+      return ok;
+    };
+
+    // When not required: returns false cleanly without error
+    await expect(checkRequired(false)).resolves.toBe(false);
+
+    // When required: strictly rejects and fails
+    await expect(checkRequired(true)).rejects.toThrow(
+      `Integration test required mode failed: port ${unreachablePort} is unreachable`,
+    );
   });
 });

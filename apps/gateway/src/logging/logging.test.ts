@@ -160,17 +160,16 @@ describe('SW-1.2.3 Structured Logging and Redaction', () => {
     const { stream, getLogs, getRawOutput } = createLogCapture();
     const logger = createLogger({ stream });
 
-    const hugeErrorString = 'ERR_PAYLOAD_TOO_LARGE: ' + 'X'.repeat(5000);
+    const hugeErrorString = 'X'.repeat(5000);
     const err = new Error(hugeErrorString);
     logger.error({ err }, 'Operation failed');
 
     const raw = getRawOutput();
-    expect(raw).toContain('[TRUNCATED]');
-    expect(raw.length).toBeLessThan(4000); // Truncated well below 5000 chars
+    expect(raw.length).toBeLessThan(1000);
 
     const logs = getLogs();
     const loggedErr = logs[0]?.err as Record<string, unknown>;
-    expect(String(loggedErr?.message).endsWith('... [TRUNCATED]')).toBe(true);
+    expect(loggedErr?.message).toBe('Operation failed');
   });
 
   it('11. handles cyclic and malformed error objects safely without stack overflow', () => {
@@ -322,7 +321,7 @@ describe('SW-1.2.3 Structured Logging and Redaction', () => {
     const logs = getLogs();
     const loggedErr = logs[0]?.err as Record<string, unknown>;
     expect(loggedErr?.code).toBe('ECONNREFUSED');
-    expect(loggedErr?.stack).not.toContain(secretPassword);
+    expect(loggedErr?.stack).toBeUndefined();
   });
 
   it('17. bounds deep nested object traversal to prevent resource exhaustion (R2)', () => {
@@ -366,8 +365,7 @@ describe('SW-1.2.3 Structured Logging and Redaction', () => {
     const loggedErr = logs[0]?.err as Record<string, unknown>;
     expect(loggedErr?.code).toBe('ERR_UPSTREAM_FAILURE');
     expect(loggedErr?.message).toBe('Operation failed: ERR_UPSTREAM_FAILURE');
-    expect(loggedErr?.stack).not.toContain(arbitrarySecret);
-    expect(loggedErr?.stack).not.toContain(customFormatSecret);
+    expect(loggedErr?.stack).toBeUndefined();
   });
 
   it('19. error allowlisting redacts nested errors and cause chains containing arbitrary secrets (Finding 1)', () => {
@@ -391,7 +389,7 @@ describe('SW-1.2.3 Structured Logging and Redaction', () => {
     expect(cause).toBeDefined();
     expect(cause?.code).toBe('ERR_NESTED_ROOT');
     expect(cause?.message).toBe('Operation failed: ERR_NESTED_ROOT');
-    expect(cause?.stack).not.toContain(nestedSecret);
+    expect(cause?.stack).toBeUndefined();
   });
 
   it('20. error allowlisting handles malformed exceptions and non-object errors without leaking values (Finding 1)', () => {
@@ -450,5 +448,115 @@ describe('SW-1.2.3 Structured Logging and Redaction', () => {
     const logsB = getLogs();
     const reqB = logsB[1]?.req as Record<string, unknown>;
     expect(reqB?.route).toBe('/health/live');
+  });
+
+  it('22. StartupError strictly uses allowlisted safe messages and eliminates arbitrary secret text (Finding B)', () => {
+    const { stream, getLogs, getRawOutput } = createLogCapture();
+    const logger = createLogger({ stream });
+
+    const arbitrarySecret = 'raw_leak_password_in_startup_message_999';
+    const startupErr = new Error(`Connection string: postgresql://admin:${arbitrarySecret}@host`);
+    startupErr.name = 'StartupError';
+    (startupErr as unknown as Record<string, unknown>).code = 'DATABASE_CONNECT_FAILED';
+
+    logger.error({ err: startupErr }, 'Startup failed');
+
+    const raw = getRawOutput();
+    expect(raw).not.toContain(arbitrarySecret);
+
+    const logs = getLogs();
+    const loggedErr = logs[0]?.err as Record<string, unknown>;
+    expect(loggedErr?.type).toBe('StartupError');
+    expect(loggedErr?.code).toBe('DATABASE_CONNECT_FAILED');
+    expect(loggedErr?.message).toBe('PostgreSQL readiness check failed during startup');
+    expect(loggedErr?.stack).toBeUndefined();
+  });
+
+  it('23. ERR_PAYLOAD_TOO_LARGE eliminates arbitrary suffix text from log output (Finding B)', () => {
+    const { stream, getLogs, getRawOutput } = createLogCapture();
+    const logger = createLogger({ stream });
+
+    const secretSuffix = 'super_secret_payload_tail_token_777';
+    const payloadErr = new Error(`ERR_PAYLOAD_TOO_LARGE: sensitive body content: ${secretSuffix}`);
+
+    logger.error({ err: payloadErr }, 'Request body rejected');
+
+    const raw = getRawOutput();
+    expect(raw).not.toContain(secretSuffix);
+
+    const logs = getLogs();
+    const loggedErr = logs[0]?.err as Record<string, unknown>;
+    expect(loggedErr?.message).toBe('Payload too large');
+  });
+
+  it('24. error code allowlisting maps unallowlisted codes to UNKNOWN_ERROR (Finding B)', () => {
+    const { stream, getLogs, getRawOutput } = createLogCapture();
+    const logger = createLogger({ stream });
+
+    const secretCode = 'ERR_SECRET_CODE_PASSWORD_555';
+    const customErr = new Error('Generic operational failure');
+    (customErr as unknown as Record<string, unknown>).code = secretCode;
+
+    logger.error({ err: customErr }, 'Operation failed');
+
+    const raw = getRawOutput();
+    expect(raw).not.toContain(secretCode);
+
+    const logs = getLogs();
+    const loggedErr = logs[0]?.err as Record<string, unknown>;
+    expect(loggedErr?.code).toBe('UNKNOWN_ERROR');
+    expect(loggedErr?.message).toBe('Operation failed');
+  });
+
+  it('25. error issues sanitizer maps unallowlisted paths and messages to safe fixed strings (Finding B)', () => {
+    const { stream, getLogs, getRawOutput } = createLogCapture();
+    const logger = createLogger({ stream });
+
+    const secretPath = 'secret_env_var_credential_path_333';
+    const secretMsg = 'Arbitrary secret error description text 222';
+    const issueErr = new Error('Issue validation failure');
+    (issueErr as unknown as Record<string, unknown>).issues = [
+      { field: secretPath, message: secretMsg },
+    ];
+
+    logger.error({ err: issueErr }, 'Issue error logged');
+
+    const raw = getRawOutput();
+    expect(raw).not.toContain(secretPath);
+    expect(raw).not.toContain(secretMsg);
+
+    const logs = getLogs();
+    const loggedErr = logs[0]?.err as Record<string, unknown>;
+    const issues = loggedErr?.issues as Array<{ path: string; message: string }>;
+    expect(issues[0]?.path).toBe('configuration');
+    expect(issues[0]?.message).toBe('Invalid configuration value');
+  });
+
+  it('26. custom Zod issues sanitizer eliminates unrecognized custom messages containing secrets (Finding B)', () => {
+    const { stream, getLogs, getRawOutput } = createLogCapture();
+    const logger = createLogger({ stream });
+
+    const secretCustomMsg = 'Custom secret token leak in zod message 111';
+    const customZodIssue = {
+      code: 'custom',
+      path: ['customField'],
+      message: secretCustomMsg,
+    };
+    const mockZodErr = {
+      name: 'ZodError',
+      issues: [customZodIssue],
+    };
+    Object.setPrototypeOf(mockZodErr, z.ZodError.prototype);
+
+    logger.error({ err: mockZodErr }, 'Zod validation error');
+
+    const raw = getRawOutput();
+    expect(raw).not.toContain(secretCustomMsg);
+
+    const logs = getLogs();
+    const loggedErr = logs[0]?.err as Record<string, unknown>;
+    const issues = loggedErr?.issues as Array<{ path: string; message: string }>;
+    expect(issues[0]?.path).toBe('configuration');
+    expect(issues[0]?.message).toBe('Invalid configuration value');
   });
 });
