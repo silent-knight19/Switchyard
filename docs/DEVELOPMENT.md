@@ -176,30 +176,140 @@ docker compose stop
 - **Process Credential Masking & Docker Inspection Boundary:** Redis credentials are provided to `redis-server` via standard input stream and to `redis-cli` via `REDISCLI_AUTH`, avoiding password visibility in process table listings (`ps aux`) and suppressing CLI warning banners. However, environment variables remain visible via `docker inspect <container>`; therefore, this mechanism is strictly intended for local development. Production deployments must not rely on environment variables for sensitive secrets and must utilize external secret management with separate least-privilege database roles as defined in Architecture v1.2 §19.
 - **Development Credentials:** The default credentials (`switchyard_dev_password`, `switchyard_app_password`) are strictly intended for local development.
 
-### 7.7 Database Migrations and Roles (SW-1.3.1, SW-1.3.2)
+### 7.7 Database Bootstrap, Migrations, and Roles (SW-1.3.1, SW-1.3.2)
 
-The migration process applies versioned SQL migrations from `apps/gateway/src/db/migrations/` (`NNNN-name.sql`) into the `gateway_migrations` ledger table, in version order, each in its own transaction (`apps/gateway/src/db/migrate.ts`).
+Two separate steps are required, in this order. Role provisioning is a privileged, one-time
+cluster operation; schema migrations are ordinary forward-only migrations executed by an
+unprivileged deployment role.
 
-- Apply pending migrations from the gateway package root:
+#### 7.7.1 Step 1 — provision roles (superuser, once per cluster/database)
 
-  ```bash
-  pnpm --filter @switchyard/gateway migrate
-  ```
+```bash
+# Reads POSTGRES_* (optionally BOOTSTRAP_POSTGRES_USER/PASSWORD) from the environment.
+# Requires a superuser session.
+pnpm --filter @switchyard/gateway bootstrap:roles
+```
 
-- Local development runs migrations as the database superuser (`switchyard`); reruns are idempotent (no new ledger rows).
-- After applying `0001-roles` locally, grant the tenant-table owner schema creation once (the migration `0002-org-tables` creates tenant tables via `SET ROLE gateway_owner`):
+`apps/gateway/src/db/bootstrap/provision-roles.sql` is idempotent: it creates the roles if
+absent and then re-asserts every security attribute, so it doubles as the drift-reconciliation
+path. It also performs the superuser-only schema work:
 
-  ```bash
-  docker exec switchyard-postgres psql -U switchyard -d switchyard -c "GRANT CREATE ON SCHEMA public TO gateway_owner;"
-  pnpm --filter @switchyard/gateway migrate
-  ```
+- `REVOKE CREATE ON SCHEMA public FROM PUBLIC`
+- `GRANT USAGE, CREATE ON SCHEMA public TO gateway_owner, gateway_migrator`
+- `GRANT USAGE ON SCHEMA public TO gateway_startup, gateway_app, gateway_worker`
+- creates `app_private` owned by `gateway_owner`, with no `PUBLIC` privilege
 
-  The `organizations`, `gateway_control`, `users`, `web_sessions`, `provider_keys`, and `virtual_keys` tables created by `0002-org-tables` are owned by `gateway_owner` with RLS ENABLE + FORCE per Architecture v1.2 §12.3.
-- Real PostgreSQL migration and role-security tests: `pnpm --filter @switchyard/gateway test:integration` (real PG at `127.0.0.1:5432`; requires the local Compose stack from SW-1.2.1).
-- Production bootstrap (one time, in order; production credentials are separate from development ones per `§19.2`):
-  1. As the `switchyard` superuser: `CREATE ROLE gateway_migrator LOGIN NOSUPERUSER NOBYPASSRLS;`
-  2. Run `pnpm --filter @switchyard/gateway migrate` as `gateway_migrator` with `POSTGRES_USER=gateway_migrator POSTGRES_PASSWORD=<secret>` — applies `0001-roles`.
-  3. As the superuser: `GRANT CREATE ON SCHEMA public TO gateway_owner;` and `GRANT gateway_owner TO gateway_migrator;`
-  4. Run `pnpm --filter @switchyard/gateway migrate` as `gateway_migrator` again — applies `0002-org-tables`.
+Role passwords are **not** created by this script; set deployment credentials separately per
+Architecture v1.2 §19.2.
 
-The role matrix created by `0001-roles.sql` (Architecture v1.2 §12.1): `gateway_owner` (tenant-table owner; NOLOGIN), `gateway_migrator` (deployment-only; LOGIN, NOSUPERUSER, NOBYPASSRLS), `gateway_startup` (LOGIN, NOSUPERUSER, NOBYPASSRLS), `gateway_app` (LOGIN, NOSUPERUSER, NOBYPASSRLS), `gateway_worker` (LOGIN, NOSUPERUSER, NOBYPASSRLS), `gateway_auth_executor` (NOLOGIN, BYPASSRLS; owns restricted authentication/bootstrap functions only), `gateway_ops_executor` (NOLOGIN, BYPASSRLS; owns the restricted maintenance enumerator only).
+#### 7.7.2 Step 2 — apply migrations (as `gateway_migrator`)
+
+```bash
+pnpm --filter @switchyard/gateway migrate
+```
+
+`apps/gateway/src/db/migrate.ts` applies `apps/gateway/src/db/migrations/NNNN-name.sql` into the
+`gateway_migrations` ledger, each file in its own transaction. `gateway_migrator` holds no
+`CREATEROLE`/`SUPERUSER`; it only owns `gateway_migrations` and may `SET ROLE gateway_owner` to
+apply tenant-table DDL.
+
+Migration set: `0001-roles` (idempotent no-op when bootstrap ran first), `0002-org-tables`
+(six core tables), `0003-rls-default-deny`, `0004-gateway-control-privileges`,
+`0005-virtual-key-integrity`, `0006-schema-privilege-hardening`. `0001`/`0002` are historical
+and byte-frozen; corrections are forward-only migrations.
+
+#### 7.7.3 Integrity: checksums and fail-closed history
+
+Each ledger row stores the SHA-256 of the exact file bytes. Before applying anything the runner
+validates the whole history and fails closed (`MigrationError` with a stable code):
+
+| Condition | Code |
+| --- | --- |
+| Applied file missing from the directory | `MIGRATION_FILE_MISSING` |
+| Applied file bytes changed | `MIGRATION_CHECKSUM_MISMATCH` |
+| Ledger name differs from file name | `MIGRATION_NAME_MISMATCH` |
+| Pending version older than the highest applied version | `MIGRATION_ORDER_INVALID` |
+| Duplicate or non-contiguous versions in the directory | `MIGRATION_DUPLICATE_VERSION` / `MIGRATION_ORDER_INVALID` |
+| Applied row has no checksum (pre-checksum ledger) | `MIGRATION_LEGACY_CHECKSUM_MISSING` |
+| Advisory lock wait exceeded | `MIGRATION_LOCK_TIMEOUT` |
+| A migration statement failed (transaction rolled back) | `MIGRATION_APPLY_FAILED` |
+
+Installations created before checksums existed can be reconciled non-destructively:
+
+```bash
+pnpm --filter @switchyard/gateway migrate:adopt-legacy
+```
+
+This records the checksum of the **unmodified** file for each NULL-checksum row and emits an
+`adopted` event per version. It never invents a checksum, never rewrites an applied version, and
+never runs implicitly — without the flag the run fails closed.
+
+#### 7.7.4 Concurrency: advisory lock
+
+The runner takes a session-level advisory lock (`pg_advisory_lock(7312000001)`) on the **same
+connection** that inspects history and applies migrations, with `lock_timeout` (default 10 s,
+`lockTimeoutMs` override) so a stuck peer cannot block deployment forever. The lock is released
+in `finally` on success, failure, and backend termination; an interrupted migration rolls back
+and leaves no ledger row. A real three-way concurrent-runner test asserts each migration is
+applied exactly once.
+
+#### 7.7.5 Role matrix (Architecture v1.2 §12.1)
+
+| Role | Login | Superuser | BypassRLS | Purpose |
+| --- | --- | --- | --- | --- |
+| `gateway_owner` | no | no | no | owns tenant tables and `app_private` |
+| `gateway_migrator` | yes | no | no | deployment-only migrations; member of `gateway_owner` |
+| `gateway_startup` | yes | no | no | startup/epoch; `SELECT` + `UPDATE (gateway_epoch)` on `gateway_control` |
+| `gateway_app` | yes | no | no | request path; `SELECT` only on `gateway_control` |
+| `gateway_worker` | yes | no | no | background work; no `gateway_control` privilege in Batch A |
+| `gateway_auth_executor` | no | no | yes | owns future restricted authentication functions only |
+| `gateway_ops_executor` | no | no | yes | owns the future restricted maintenance enumerator only |
+
+Runtime roles hold **no** privilege on `organizations`, `users`, `web_sessions`,
+`provider_keys`, or `virtual_keys`, no `CREATE` on `public` or `app_private`, and no membership
+that would let them assume the owner or an executor. `gateway_control` grants are exactly
+`SELECT` to `gateway_app`/`gateway_startup` plus column-scoped `UPDATE (gateway_epoch)` to
+`gateway_startup`.
+
+#### 7.7.6 Row-level security posture (Batch A: default deny, not isolation)
+
+Tenant tables keep `ENABLE` + `FORCE ROW LEVEL SECURITY` with **zero policies**. That is a
+deliberate default-deny posture: every non-bypassing role — including the table owner — sees no
+rows and can write none. It is **not** tenant isolation and must not be described as such.
+
+`0002-org-tables.sql` originally created two permissive policies per table (one carrying
+`USING`, one carrying `WITH CHECK`); PostgreSQL ORs permissive policies, so that was not a
+validated guarantee. `0003-rls-default-deny.sql` drops them. Comprehensive tenant policies, the
+tenant-context helper, and per-role table grants are **Subphase 1.4** (SW-1.4.1/SW-1.4.2) work.
+`gateway_control` is the only global table and intentionally has no RLS.
+
+#### 7.7.7 Known limitations (Phase 2)
+
+- `gateway_startup` may update `gateway_epoch` but not `updated_at`; the §12.1 column grant is
+  literal, so epoch bumps leave `updated_at` stale. A trigger or a widened grant is a Phase 2
+  decision, not a Batch A deviation.
+- §12.5 requires the epoch to change only while holding the singleton session lock and the
+  exclusive transaction advisory lock. Column grants cannot enforce lock ordering; that
+  admission-protocol invariant is a Phase 2 implementation concern.
+
+#### 7.7.8 Database integration tests
+
+```bash
+pnpm --filter @switchyard/gateway test:db   # or: pnpm test:db from the repo root
+```
+
+`apps/gateway/vitest.db.config.ts` runs `src/**/*.db.test.ts` serially. Each test file starts its
+own throwaway `postgres:16.8-alpine` container on a random loopback port, creates
+`switchyard_test_*` databases, runs the real bootstrap, and destroys the container. Guards refuse
+`NODE_ENV=production`, any database name that is not `switchyard_test_*`, a non-loopback
+`TEST_POSTGRES_ADMIN_URL` (unless `ALLOW_NON_LOOPBACK_TEST_PG=true` for a disposable CI cluster),
+and any admin URL that is not the `postgres` maintenance database. The persistent development
+database is never contacted. A missing Docker daemon or unreachable PostgreSQL **fails** the run;
+nothing is skipped.
+
+The default `pnpm test` suite excludes `*.db.test.ts`, and CI runs them in a separate required
+`database-integration` job so they cannot silently drop out of the gate.
+
+The older `pnpm --filter @switchyard/gateway test:integration` suite (live Compose PostgreSQL and
+Redis, gated by `INTEGRATION_TESTS`) still exists for connectivity tests; it is not a substitute
+for `test:db`.
