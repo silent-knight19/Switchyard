@@ -5,6 +5,7 @@ import type { PostgresClient } from './infrastructure/postgres.js';
 import type { RedisClient } from './infrastructure/redis.js';
 import type { LifecycleCoordinator } from './lifecycle/state.js';
 import { registerHealthRoutes } from './routes/health.js';
+import { registerVirtualKeyRoutes } from './routes/virtual-keys.js';
 import { getSafeRouteIdentifier } from './logging/serializers.js';
 import { SessionService } from './auth/session.js';
 import { installAuthorizationBoundary } from './auth/authorization.js';
@@ -72,6 +73,7 @@ export async function buildApp(options: BuildAppOptions): Promise<AppInstance> {
   });
 
   await registerHealthRoutes(app, { postgres, redis, lifecycle });
+  await registerVirtualKeyRoutes(app, { pool: postgres.pool });
 
   return app;
 }

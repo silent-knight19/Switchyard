@@ -311,9 +311,9 @@ Switchyard implements cryptographic virtual API key issuance as an internal Gate
 - **Bounded Collision Handling (VK-02):** Retry is strictly limited to SQLSTATE `23505` (`unique_violation`) matching explicitly confirmed unique constraints on `public.virtual_keys`: `virtual_keys_key_hash_key`, `virtual_keys_pkey`, and `virtual_keys_id_org_id_key`. If the constraint name is missing or unrecognized, or if any other database error occurs (foreign-key, check constraint, RLS, permission, connection), the service fails closed immediately without retry. A maximum of 3 attempts are permitted before raising `KEY_COLLISION_EXHAUSTED`.
 - **Role Isolation:** `gateway_worker` is strictly denied `INSERT` and `UPDATE` on `virtual_keys` (42501).
 
-### 11.4 Future Integration Contracts
-- **SW-1.6.2 (Authentication):** Implemented in `src/auth/virtual-key-authenticator.ts` and `src/auth/virtual-key-rate-limiter.ts`.
-- **SW-1.6.3 (Management & Policy):** Will introduce administrator-only API routes (`POST /api/keys`, `GET /api/keys`, `DELETE /api/keys/:id`). Model access enablement will require explicit validation and updating of model allowlists and operational rate/concurrency limits together.
+### 11.4 Future Integration Contracts & Status
+- **SW-1.6.2 (Authentication):** ACCEPTED (PR #15, merge commit `c5cde0aac18ddc288d6c1d85a7f6e9c5bea36880`). Implemented in `src/auth/virtual-key-authenticator.ts` and `src/auth/virtual-key-rate-limiter.ts`.
+- **SW-1.6.3 (Management & Policy):** IMPLEMENTED. Implemented in `src/auth/virtual-key-management.ts` and `src/routes/virtual-keys.ts`.
 
 ---
 
@@ -379,3 +379,67 @@ Switchyard implements secure virtual API key authentication and restricted hash 
 ### 12.6 Architectural Limitation Notice (Phase 2 Admission Recheck)
 - **Notice:** This pre-tenant authentication lookup resolves identity and initial policy only. It does **NOT** replace the Phase 2 requirement to execute durable row-locking (`SELECT ... FOR UPDATE`) and re-check the virtual-key record during transactional provider-attempt admission.
 - **Revocation Window:** A virtual API key revoked after initial authentication lookup must be caught and rejected by the Phase 2 admission row lock before dispatching upstream provider attempts.
+
+---
+
+## 13. Admin-Only Virtual API Key Management & Policy Administration (SW-1.6.3)
+
+Switchyard implements the control-plane administration layer for virtual API keys, enforcing browser-session admin authorization, tenant isolation, full-replacement policy safety, one-time plaintext key disclosure, and idempotent permanent revocation (Architecture v1.2 §4.1, §5.3, §11.6, §12.1–12.6, §13.1, §13.2–13.3, §13.5, §14.3, §16, §17.1, §21).
+
+### 13.1 HTTP Management API Contracts
+
+All management routes require a verified browser session and an administrative tenant role (`config.authz = { principal: 'browser', minRole: 'admin' }`). Mutations require a valid Origin and CSRF token.
+
+| Method | Endpoint | Purpose | CSRF & Origin Required? | Success Status |
+| :--- | :--- | :--- | :---: | :---: |
+| `POST` | `/api/keys` | Create virtual API key and disclose plaintext raw key once | Yes | `201 Created` |
+| `GET` | `/api/keys` | List organization-owned key metadata via keyset pagination | No (safe read) | `200 OK` |
+| `PUT` | `/api/keys/:id/policy` | Atomically replace full mutable policy under row lock | Yes | `200 OK` |
+| `DELETE` | `/api/keys/:id` | Logically revoke key permanently and idempotently | Yes | `204 No Content` |
+
+### 13.2 Administrative Authorization & Principal Separation
+- **Admin Only:** Organization members lacking the `admin` role are rejected with HTTP 403 (`Forbidden`).
+- **Anonymous Access Denied:** Requests without a valid browser session cookie are rejected with HTTP 401 (`Unauthorized`).
+- **Principal Separation:** Bearer-token credentials (e.g. `Authorization: Bearer <key>`) and conflicting browser credentials on management routes are rejected with HTTP 401. Data-plane virtual keys cannot manage keys.
+- **Tenant Context Authority:** The organization ID is derived strictly from the authenticated browser principal (`req.principal.orgId`). User-provided `orgId` parameters in bodies, queries, or headers are prohibited and rejected.
+
+### 13.3 CSRF & Canonical Origin Enforcement
+- Mutating endpoints (`POST`, `PUT`, `DELETE`) require:
+  - Exact match of the `Origin` header against the canonical gateway origin (`BROWSER_ORIGIN`).
+  - Valid, unexpired browser session cookie (`switchyard_session`).
+  - Valid `x-csrf-token` header whose HMAC-SHA-256 digest matches the session record.
+- CSRF tokens from other sessions or organizations are rejected with HTTP 403.
+- Mutating handlers never execute if CSRF or origin validation fails.
+
+### 13.4 One-Time Key Disclosure & Browser Secret Boundary
+- **Plaintext Disclosure:** The raw API key (`gw_live_<11>_<43>`) is disclosed exactly once in the `POST /api/keys` response body upon confirmed PostgreSQL transaction commit.
+- **Cache Prevention:** The creation response includes mandatory non-cacheable headers:
+  - `Cache-Control: no-store`
+  - `Pragma: no-cache`
+- **Zero Raw Key Recovery:** Raw keys and verifier hashes (`key_hash`) are never stored in plaintext, never returned in list/update/revoke responses, and cannot be retrieved or recovered by administrators. If a key is lost, it must be revoked and replaced.
+- **Browser-JavaScript Secret Exposure Constraint:** Browser JavaScript consuming the gateway API must not retain virtual keys long-term, and keys must never be stored in `localStorage`, `sessionStorage`, browser cookies, SSR hydration bundles, or analytics payloads.
+
+### 13.5 Keyset Pagination & Tenant Isolation
+- **Tenant Filter:** All database operations run inside `withTenant(pool, authenticatedOrgId)`. PostgreSQL's `FORCE ROW LEVEL SECURITY` policy on `virtual_keys` guarantees Tenant A cannot read, update, or revoke Tenant B keys. Cross-tenant lookups return HTTP 404 with identical generic error messages to non-existent keys.
+- **Deterministic Ordering:** Keys are ordered by `created_at DESC, id DESC`.
+- **Keyset Pagination:** Next pages are requested via an opaque base64url cursor containing `{ createdAt, id }`. If multiple keys share the exact same `created_at` timestamp, the composite tie-breaker `id DESC` guarantees stable pagination with zero duplicate or skipped keys.
+- **Bounded Page Size:** Query limit defaults to 20, with a strict maximum of 100. Arbitrary `OFFSET` queries and unbounded scans are prohibited.
+- **Fail-Closed Cursors:** Malformed or tampered cursors return HTTP 400 validation errors rather than falling back to unbounded table scans.
+
+### 13.6 Full-Replacement Policy Validation
+The `PUT /api/keys/:id/policy` endpoint implements strict full-replacement semantics to prevent partial policy inheritance:
+- **Model Allowlist (`allowedModels`):** Must be an array of non-empty strings (maximum 100 entries, maximum 128 characters per ID). Leading/trailing whitespace, control characters, duplicates, and wildcards (`*`) are rejected with HTTP 400. An empty array (`[]`) represents deny-all.
+- **Numeric Limits (`rpmLimit`, `tpmLimit`, `concurrentStreamLimit`):** Must be positive, finite JavaScript safe integers between 1 and PostgreSQL's maximum 32-bit signed integer (`2147483647`). Zero, negative values, fractional values, numeric strings, and `NaN`/`Infinity` are rejected.
+- **Privacy & Cache Flags:** `piiRedactionEnabled` and `storePayloads` must be explicit booleans.
+- **Deferred Caching Guards:** Because caching is deferred (Architecture §16), setting `exactCacheEnabled: true` or `semanticCacheEnabled: true` is rejected with HTTP 400 until the respective features pass their own acceptance gates.
+
+### 13.7 Logical Revocation & Row Locking Protocol
+- **Logical Deletion:** `DELETE /api/keys/:id` sets `revoked_at = clock_timestamp()` under a row lock (`SELECT ... FOR UPDATE`). Rows and verifier hashes are preserved for auditing and attribution.
+- **Idempotency:** Revoking an already-revoked key succeeds with HTTP 204 without modifying the original revocation timestamp.
+- **Revocation Precedence:** A revoked key cannot receive policy updates (HTTP 409 Conflict).
+- **Authentication Invalidation:** Once revoked, the key immediately fails SW-1.6.2 authentication with generic HTTP 401 (`KEY_REVOKED`).
+- **Concurrency Serialization:** Competing revocation and policy update transactions serialize under PostgreSQL row locking. Once revocation commits, subsequent policy updates fail closed and cannot reactivate the key.
+
+### 13.8 Architectural Limitation Notices
+- **Deferred Model Capability Verification:** Syntactic validation of model identifiers does not verify that a model exists in provider pricing tables or is eligible for dispatch. Request admission in Phase 2 independently validates requested models against the capability registry.
+- **Phase 2 Admission Recheck:** Revocation marks the database record. Phase 2 provider-attempt admission must acquire a row lock on `public.virtual_keys` and re-verify the key's revocation status at request dispatch time.
