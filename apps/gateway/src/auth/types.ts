@@ -40,6 +40,40 @@ export class SessionError extends Error {
   }
 }
 
+export type CsrfFailureReason =
+  | 'MISSING_TOKEN'
+  | 'MALFORMED_TOKEN'
+  | 'CSRF_TOKEN_MISMATCH'
+  | 'SESSION_INVALID'
+  | 'SESSION_NOT_FOUND'
+  | 'SESSION_REVOKED'
+  | 'SESSION_EXPIRED_IDLE'
+  | 'SESSION_EXPIRED_ABSOLUTE'
+  | 'DATABASE_ERROR';
+
+export class CsrfError extends Error {
+  public readonly reason: CsrfFailureReason;
+
+  constructor(reason: CsrfFailureReason, message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = 'CsrfError';
+    this.reason = reason;
+  }
+}
+
+export type OriginFailureReason =
+  | 'MISSING_ORIGIN'
+  | 'EMPTY_ORIGIN'
+  | 'MULTIPLE_ORIGINS'
+  | 'MALFORMED_ORIGIN'
+  | 'ORIGIN_MISMATCH'
+  | 'DISALLOWED_PROTOCOL';
+
+export interface OriginValidationResult {
+  readonly valid: boolean;
+  readonly reason?: OriginFailureReason;
+}
+
 export class BootstrapError extends Error {
   public readonly code: string;
 
@@ -74,6 +108,17 @@ export interface SessionValidationResult {
   readonly session?: WebSession;
   readonly user?: AuthenticatedUser;
   readonly reason?: SessionFailureReason;
+}
+
+export interface SessionWithCsrfValidationResult {
+  readonly valid: boolean;
+  readonly session?: WebSession;
+  readonly user?: AuthenticatedUser;
+  readonly reason?: SessionFailureReason | CsrfFailureReason;
+}
+
+export interface CsrfReissueResult {
+  readonly csrfToken: string;
 }
 
 export interface SessionCreationResult {

@@ -74,6 +74,7 @@ export const rawEnvSchema = z
     TLS_VERIFY: strictBoolean.default(true),
     MOCK_PROVIDER_ENABLED: strictBoolean.default(false),
     DEMO_SEEDING_ENABLED: strictBoolean.default(false),
+    BROWSER_ORIGIN: z.string().min(1).default('http://127.0.0.1:3000'),
 
     // Optional Upstream Endpoints
     UPSTREAM_ENDPOINT_URL: z
@@ -111,8 +112,65 @@ export const rawEnvSchema = z
       });
     }
 
+    // Invariant (SW-1.5.3): Strict browser origin validation
+    try {
+      const parsedOrigin = new URL(data.BROWSER_ORIGIN);
+      if (parsedOrigin.protocol !== 'http:' && parsedOrigin.protocol !== 'https:') {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['BROWSER_ORIGIN'],
+          message: 'Browser origin must use http: or https: protocol',
+        });
+      } else if (parsedOrigin.username || parsedOrigin.password) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['BROWSER_ORIGIN'],
+          message: 'Browser origin must not contain credentials',
+        });
+      } else if (parsedOrigin.pathname !== '' && parsedOrigin.pathname !== '/') {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['BROWSER_ORIGIN'],
+          message: 'Browser origin must not contain a path',
+        });
+      } else if (parsedOrigin.search || parsedOrigin.hash) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['BROWSER_ORIGIN'],
+          message: 'Browser origin must not contain query or fragment parameters',
+        });
+      } else if (parsedOrigin.origin !== data.BROWSER_ORIGIN) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['BROWSER_ORIGIN'],
+          message: 'Browser origin must be an exact canonical origin without trailing slash',
+        });
+      }
+    } catch {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['BROWSER_ORIGIN'],
+        message: 'Malformed browser origin URL',
+      });
+    }
+
     // Invariants for production profile
     if (data.NODE_ENV === 'production') {
+      // Invariant (SW-1.5.3): Production profile requires explicit HTTPS non-loopback browser origin
+      if (
+        data.BROWSER_ORIGIN === 'http://127.0.0.1:3000' ||
+        !data.BROWSER_ORIGIN.startsWith('https://') ||
+        data.BROWSER_ORIGIN.includes('localhost') ||
+        data.BROWSER_ORIGIN.includes('127.0.0.1') ||
+        data.BROWSER_ORIGIN.includes('[::1]')
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['BROWSER_ORIGIN'],
+          message:
+            'Production profile requires an explicit non-loopback HTTPS browser origin (BROWSER_ORIGIN)',
+        });
+      }
       // Invariant (R6): Production upstream origin restrictions
       if (data.UPSTREAM_ENDPOINT_URL !== undefined) {
         ctx.addIssue({

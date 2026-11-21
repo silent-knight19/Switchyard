@@ -4,13 +4,17 @@ import type { GatewayConfig } from '../config/index.js';
 import { type TenantClient, withTenant } from '../db/tenant.js';
 import {
   type AuthenticatedUser,
+  type CsrfReissueResult,
+  CsrfError,
   type SessionCookieOptions,
   type SessionCreationResult,
   SessionError,
   type SessionRotationResult,
   type SessionValidationResult,
+  type SessionWithCsrfValidationResult,
   type WebSession,
 } from './types.js';
+import { decodeCsrfToken } from './csrf.js';
 
 export const IDLE_EXPIRY_INTERVAL = "interval '2 hours'";
 export const ABSOLUTE_EXPIRY_INTERVAL = "interval '7 days'";
@@ -715,6 +719,231 @@ export class SessionService {
       );
 
       return res.rowCount ?? 0;
+    });
+  }
+
+  /**
+   * Reissues a fresh CSRF token for an active, valid session (SW-1.5.3).
+   * Atomically locks the session row (FOR UPDATE OF ws) under withTenant RLS.
+   * Concurrency contract: Last-committed-wins. Prior CSRF verifier is invalidated upon commit.
+   */
+  public async reissueCsrfToken(rawSecret: unknown): Promise<CsrfReissueResult> {
+    const secretBytes = decodeSessionSecret(rawSecret);
+    const orgId = await this.lookupSessionOrgId(secretBytes);
+    if (!orgId) {
+      throw new SessionError('SESSION_NOT_FOUND', 'Session not found for CSRF reissuance');
+    }
+
+    const sessionIdHash = hashSecret(secretBytes);
+
+    return withTenant(this.pool, orgId, async (client: TenantClient) => {
+      const { rows } = await client.query<{
+        session_id_hash: Buffer;
+        revoked_at: Date | null;
+        idle_expires_at: Date;
+        absolute_expires_at: Date;
+        db_now: Date;
+      }>(
+        `SELECT
+          ws.session_id_hash,
+          ws.revoked_at,
+          ws.idle_expires_at,
+          ws.absolute_expires_at,
+          clock_timestamp() AS db_now
+        FROM public.web_sessions ws
+        WHERE ws.session_id_hash = $1
+        FOR UPDATE OF ws;`,
+        [sessionIdHash],
+      );
+
+      const row = rows[0];
+      if (!row) {
+        throw new SessionError('SESSION_NOT_FOUND', 'Session row not found for CSRF reissuance');
+      }
+
+      if (row.revoked_at !== null) {
+        throw new SessionError('SESSION_REVOKED', 'Cannot reissue CSRF token for revoked session');
+      }
+
+      const now = row.db_now.getTime();
+      const absExp = row.absolute_expires_at.getTime();
+      const idleExp = row.idle_expires_at.getTime();
+
+      if (now >= absExp) {
+        throw new SessionError(
+          'SESSION_EXPIRED_ABSOLUTE',
+          'Cannot reissue CSRF token for absolute-expired session',
+        );
+      }
+
+      if (now >= idleExp) {
+        throw new SessionError(
+          'SESSION_EXPIRED_IDLE',
+          'Cannot reissue CSRF token for idle-expired session',
+        );
+      }
+
+      const newCsrfBytes = crypto.randomBytes(32);
+      const newCsrfToken = newCsrfBytes.toString('base64url');
+      const newCsrfTokenHash = hashSecret(newCsrfBytes);
+
+      await client.query(
+        `UPDATE public.web_sessions
+        SET
+          csrf_token_hash = $1,
+          last_seen_at = clock_timestamp(),
+          idle_expires_at = LEAST(clock_timestamp() + interval '2 hours', absolute_expires_at)
+        WHERE session_id_hash = $2;`,
+        [newCsrfTokenHash, sessionIdHash],
+      );
+
+      return { csrfToken: newCsrfToken };
+    });
+  }
+
+  /**
+   * Resolves and validates an incoming session and its session-bound CSRF token (SW-1.5.3).
+   * Atomically locks the session row (FOR UPDATE OF ws) to ensure the session-validity check
+   * and CSRF-verifier check execute against the exact same serialization point.
+   */
+  public async resolveAndValidateSessionWithCsrf(
+    rawSecret: unknown,
+    rawCsrfToken: unknown,
+  ): Promise<SessionWithCsrfValidationResult> {
+    let secretBytes: Buffer;
+    try {
+      secretBytes = decodeSessionSecret(rawSecret);
+    } catch (err) {
+      if (err instanceof SessionError) {
+        return { valid: false, reason: err.reason };
+      }
+      return { valid: false, reason: 'MALFORMED_SECRET' };
+    }
+
+    let csrfBytes: Buffer;
+    try {
+      csrfBytes = decodeCsrfToken(rawCsrfToken);
+    } catch (err) {
+      if (err instanceof CsrfError) {
+        return { valid: false, reason: err.reason };
+      }
+      return { valid: false, reason: 'MALFORMED_TOKEN' };
+    }
+
+    const orgId = await this.lookupSessionOrgId(secretBytes);
+    if (!orgId) {
+      return { valid: false, reason: 'SESSION_NOT_FOUND' };
+    }
+
+    const sessionIdHash = hashSecret(secretBytes);
+
+    return withTenant(this.pool, orgId, async (client: TenantClient) => {
+      const { rows } = await client.query<{
+        session_id_hash: Buffer;
+        user_id: string;
+        org_id: string;
+        csrf_token_hash: Buffer;
+        created_at: Date;
+        last_seen_at: Date;
+        idle_expires_at: Date;
+        absolute_expires_at: Date;
+        revoked_at: Date | null;
+        user_role: 'admin' | 'member';
+        email_normalized: string;
+        db_now: Date;
+      }>(
+        `SELECT
+          ws.session_id_hash,
+          ws.user_id,
+          ws.org_id,
+          ws.csrf_token_hash,
+          ws.created_at,
+          ws.last_seen_at,
+          ws.idle_expires_at,
+          ws.absolute_expires_at,
+          ws.revoked_at,
+          u.role AS user_role,
+          u.email_normalized,
+          clock_timestamp() AS db_now
+        FROM public.web_sessions ws
+        JOIN public.users u ON u.id = ws.user_id AND u.org_id = ws.org_id
+        WHERE ws.session_id_hash = $1
+        FOR UPDATE OF ws;`,
+        [sessionIdHash],
+      );
+
+      const row = rows[0];
+      if (!row) {
+        return { valid: false, reason: 'SESSION_NOT_FOUND' };
+      }
+
+      if (row.revoked_at !== null) {
+        return { valid: false, reason: 'SESSION_REVOKED' };
+      }
+
+      const now = row.db_now.getTime();
+      const absExp = row.absolute_expires_at.getTime();
+      const idleExp = row.idle_expires_at.getTime();
+
+      if (now >= absExp) {
+        return { valid: false, reason: 'SESSION_EXPIRED_ABSOLUTE' };
+      }
+
+      if (now >= idleExp) {
+        return { valid: false, reason: 'SESSION_EXPIRED_IDLE' };
+      }
+
+      // Constant-time CSRF verifier comparison
+      const computedCsrfHash = hashSecret(csrfBytes);
+      const storedCsrfHash = row.csrf_token_hash;
+      if (
+        !Buffer.isBuffer(storedCsrfHash) ||
+        storedCsrfHash.length !== 32 ||
+        !crypto.timingSafeEqual(computedCsrfHash, storedCsrfHash)
+      ) {
+        return { valid: false, reason: 'CSRF_TOKEN_MISMATCH' };
+      }
+
+      // Atomically renew last_seen_at and idle_expires_at
+      const { rows: renewedRows } = await client.query<{
+        last_seen_at: Date;
+        idle_expires_at: Date;
+      }>(
+        `UPDATE public.web_sessions
+        SET
+          last_seen_at = clock_timestamp(),
+          idle_expires_at = LEAST(clock_timestamp() + interval '2 hours', absolute_expires_at)
+        WHERE session_id_hash = $1
+        RETURNING last_seen_at, idle_expires_at;`,
+        [sessionIdHash],
+      );
+
+      const renewed = renewedRows[0];
+
+      const session: WebSession = {
+        sessionIdHash: row.session_id_hash,
+        userId: row.user_id,
+        orgId: row.org_id,
+        csrfTokenHash: row.csrf_token_hash,
+        createdAt: row.created_at,
+        lastSeenAt: renewed?.last_seen_at ?? row.last_seen_at,
+        idleExpiresAt: renewed?.idle_expires_at ?? row.idle_expires_at,
+        absoluteExpiresAt: row.absolute_expires_at,
+        revokedAt: row.revoked_at,
+      };
+
+      const user: AuthenticatedUser = {
+        id: row.user_id,
+        orgId: row.org_id,
+        role: row.user_role,
+        emailNormalized: row.email_normalized,
+      };
+
+      return {
+        valid: true,
+        session,
+        user,
+      };
     });
   }
 }
