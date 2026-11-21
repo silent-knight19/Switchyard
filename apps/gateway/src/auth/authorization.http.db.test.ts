@@ -14,6 +14,7 @@ import {
   type DisposableDatabase,
 } from '../db/test/disposable-pg.js';
 import { SessionService } from './session.js';
+import { SessionError } from './types.js';
 import {
   type AuthorizedPrincipal,
   type VirtualKeyAuthenticator,
@@ -971,6 +972,400 @@ describe('SW-1.5.4: HTTP Authorization, Principal Separation & RBAC Suite (Secti
       expect(combinedLogs).not.toContain(CANARY_VIRTUAL_KEY);
 
       await app.close();
+    });
+  });
+
+  describe('Section 18: AUTHZ-05 Pre-Tenant Session Lookup Error Classification & Propagation', () => {
+    // Test A — Unknown session
+    it('Test A — Unknown session: zero matching rows returns null, SESSION_NOT_FOUND, and 401', async () => {
+      const unknownSecret = crypto.randomBytes(32).toString('base64url');
+      const unknownSecretBytes = Buffer.from(unknownSecret, 'base64url');
+
+      // 1. Pre-tenant lookup returns null
+      const orgId = await sessionService.lookupSessionOrgId(unknownSecretBytes);
+      expect(orgId).toBeNull();
+
+      // 2. Session validation returns SESSION_NOT_FOUND
+      const validation = await sessionService.resolveAndValidateSession(unknownSecret);
+      expect(validation.valid).toBe(false);
+      expect(validation.reason).toBe('SESSION_NOT_FOUND');
+
+      const csrfValidation = await sessionService.resolveAndValidateSessionWithCsrf(
+        unknownSecret,
+        crypto.randomBytes(32).toString('base64url'),
+      );
+      expect(csrfValidation.valid).toBe(false);
+      expect(csrfValidation.reason).toBe('SESSION_NOT_FOUND');
+
+      // 3. Browser route responds 401
+      const { app } = setupTestApp();
+      await app.ready();
+      try {
+        const getRes = await app.inject({
+          method: 'GET',
+          url: '/api/profile',
+          headers: { cookie: makeCookieHeader(unknownSecret) },
+        });
+        expect(getRes.statusCode).toBe(401);
+        expect(getRes.json().message).toBe('Authentication required');
+      } finally {
+        await app.close();
+      }
+    });
+
+    // Test B — Database lookup error
+    it('Test B — Database lookup error: pool.query rejection raises SessionError DATABASE_ERROR without leaking SQL', async () => {
+      const failingPool = {
+        query: async (queryText: unknown) => {
+          if (typeof queryText === 'string' && queryText.includes('lookup_session_org_by_hash')) {
+            throw new Error('connection closed by foreign host');
+          }
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          return appPool.query(queryText as any);
+        },
+      } as unknown as pg.Pool;
+
+      const failingService = new SessionService({
+        pool: failingPool,
+        cookieOptions: { isProduction: true },
+      });
+
+      const secretBytes = crypto.randomBytes(32);
+      try {
+        await failingService.lookupSessionOrgId(secretBytes);
+        expect.fail('Expected lookupSessionOrgId to throw');
+      } catch (err) {
+        expect(err).toBeInstanceOf(SessionError);
+        const sessionErr = err as SessionError;
+        expect(sessionErr.reason).toBe('DATABASE_ERROR');
+        expect(sessionErr.message).toBe('Database error during session lookup');
+        expect(sessionErr.message).not.toContain('SELECT');
+        expect(sessionErr.message).not.toContain('lookup_session_org_by_hash');
+        expect(sessionErr.message).not.toContain('postgres');
+      }
+    });
+
+    // Test C — Browser read request
+    it('Test C — Browser read request: PostgreSQL lookup failure produces HTTP 503 and zero handler executions', async () => {
+      let readHandlerCalled = false;
+      const failingPool = {
+        query: async () => {
+          throw new Error('connection timeout during pre-tenant lookup');
+        },
+      } as unknown as pg.Pool;
+
+      const failingService = new SessionService({
+        pool: failingPool,
+        cookieOptions: { isProduction: true },
+      });
+
+      const app = fastify();
+      installAuthorizationBoundary(app, {
+        sessionService: failingService,
+        trustedOrigin: ALLOWED_ORIGIN,
+      });
+
+      app.get(
+        '/api/profile/failing-read',
+        { config: { authz: { principal: 'browser', minRole: 'member' } } },
+        async () => {
+          readHandlerCalled = true;
+          return { secret: 'leak' };
+        },
+      );
+
+      await app.ready();
+      try {
+        const secret = crypto.randomBytes(32).toString('base64url');
+        const res = await app.inject({
+          method: 'GET',
+          url: '/api/profile/failing-read',
+          headers: { cookie: makeCookieHeader(secret) },
+        });
+
+        expect(res.statusCode).toBe(503);
+        expect(res.json()).toEqual({
+          statusCode: 503,
+          error: 'Service Unavailable',
+          message: 'Authentication service unavailable',
+        });
+        expect(readHandlerCalled).toBe(false);
+      } finally {
+        await app.close();
+      }
+    });
+
+    // Test D — Browser mutation request
+    it('Test D — Browser mutation request: PostgreSQL lookup failure produces controlled 500 and zero handler executions', async () => {
+      let mutationHandlerCalled = false;
+      const failingPool = {
+        query: async () => {
+          throw new Error('database connection reset by peer');
+        },
+      } as unknown as pg.Pool;
+
+      const failingService = new SessionService({
+        pool: failingPool,
+        cookieOptions: { isProduction: true },
+      });
+
+      const app = fastify();
+      installAuthorizationBoundary(app, {
+        sessionService: failingService,
+        trustedOrigin: ALLOWED_ORIGIN,
+      });
+
+      app.post(
+        '/api/profile/failing-mutation',
+        { config: { authz: { principal: 'browser', minRole: 'member' } } },
+        async () => {
+          mutationHandlerCalled = true;
+          return { modified: true };
+        },
+      );
+
+      await app.ready();
+      try {
+        const secret = crypto.randomBytes(32).toString('base64url');
+        const csrfToken = crypto.randomBytes(32).toString('base64url');
+        const res = await app.inject({
+          method: 'POST',
+          url: '/api/profile/failing-mutation',
+          headers: {
+            origin: ALLOWED_ORIGIN,
+            cookie: makeCookieHeader(secret),
+            'x-csrf-token': csrfToken,
+          },
+        });
+
+        expect(res.statusCode).toBe(500);
+        expect(res.json()).toEqual({
+          statusCode: 500,
+          error: 'Internal Server Error',
+          message: 'Internal server error',
+        });
+        expect(mutationHandlerCalled).toBe(false);
+      } finally {
+        await app.close();
+      }
+    });
+
+    // Test E — Recovery
+    it('Test E — Recovery: after restoring normal query behavior, active sessions and mutations succeed while invalid sessions remain rejected', async () => {
+      let failQueries = true;
+      const recoverablePool = Object.create(appPool) as pg.Pool;
+      recoverablePool.query = (async (queryText: unknown, values: unknown) => {
+        if (
+          failQueries &&
+          typeof queryText === 'string' &&
+          queryText.includes('lookup_session_org_by_hash')
+        ) {
+          throw new Error('transient database outage');
+        }
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        return appPool.query(queryText as any, values as any);
+      }) as unknown as pg.Pool['query'];
+
+      const recoverableService = new SessionService({
+        pool: recoverablePool,
+        cookieOptions: { isProduction: true },
+      });
+
+      const app = fastify();
+      let mutationCount = 0;
+      installAuthorizationBoundary(app, {
+        sessionService: recoverableService,
+        trustedOrigin: ALLOWED_ORIGIN,
+      });
+
+      app.get(
+        '/api/recoverable/read',
+        { config: { authz: { principal: 'browser', minRole: 'member' } } },
+        async () => ({ ok: true }),
+      );
+
+      app.post(
+        '/api/recoverable/mutate',
+        { config: { authz: { principal: 'browser', minRole: 'member' } } },
+        async () => {
+          mutationCount++;
+          return { mutated: true };
+        },
+      );
+
+      await app.ready();
+      try {
+        const { secret, csrfToken, session } = await sessionService.createSession(
+          ORG_A_ID,
+          USER_A_MEMBER_ID,
+        );
+
+        // 1. Under failure -> 503 on read, 500 on mutation
+        const failRead = await app.inject({
+          method: 'GET',
+          url: '/api/recoverable/read',
+          headers: { cookie: makeCookieHeader(secret) },
+        });
+        expect(failRead.statusCode).toBe(503);
+
+        const failMutate = await app.inject({
+          method: 'POST',
+          url: '/api/recoverable/mutate',
+          headers: {
+            origin: ALLOWED_ORIGIN,
+            cookie: makeCookieHeader(secret),
+            'x-csrf-token': csrfToken,
+          },
+        });
+        expect(failMutate.statusCode).toBe(500);
+        expect(mutationCount).toBe(0);
+
+        // 2. Restore normal query behavior
+        failQueries = false;
+
+        // 3. Valid active session authenticates (200)
+        const okRead = await app.inject({
+          method: 'GET',
+          url: '/api/recoverable/read',
+          headers: { cookie: makeCookieHeader(secret) },
+        });
+        expect(okRead.statusCode).toBe(200);
+
+        // 4. Valid CSRF-protected mutation succeeds (200)
+        const okMutate = await app.inject({
+          method: 'POST',
+          url: '/api/recoverable/mutate',
+          headers: {
+            origin: ALLOWED_ORIGIN,
+            cookie: makeCookieHeader(secret),
+            'x-csrf-token': csrfToken,
+          },
+        });
+        expect(okMutate.statusCode).toBe(200);
+        expect(mutationCount).toBe(1);
+
+        // 5. Unknown session remains rejected with 401
+        const unknownSecret = crypto.randomBytes(32).toString('base64url');
+        const unknownRead = await app.inject({
+          method: 'GET',
+          url: '/api/recoverable/read',
+          headers: { cookie: makeCookieHeader(unknownSecret) },
+        });
+        expect(unknownRead.statusCode).toBe(401);
+
+        // 6. Revoked session remains rejected with 401
+        await adminClient.query(
+          'UPDATE public.web_sessions SET revoked_at = clock_timestamp() WHERE session_id_hash = $1',
+          [session.sessionIdHash],
+        );
+        const revokedRead = await app.inject({
+          method: 'GET',
+          url: '/api/recoverable/read',
+          headers: { cookie: makeCookieHeader(secret) },
+        });
+        expect(revokedRead.statusCode).toBe(401);
+      } finally {
+        await app.close();
+      }
+    });
+
+    // Test F — No information leakage
+    it('Test F — No information leakage: injected connection-string/SQL canary does not leak in responses, logs, or public errors', async () => {
+      const CANARY_CONNECTION_STRING =
+        'postgresql://gateway_app:super_secret_password_canary@db.switchyard.internal:5432/switchyard_prod?sslmode=require';
+      const CANARY_SQL_FRAGMENT = 'SELECT * FROM secret_financial_keys WHERE canary = TRUE';
+
+      const logRecords: string[] = [];
+      const testLogger = pino(
+        { level: 'trace' },
+        {
+          write: (chunk: string) => {
+            logRecords.push(chunk);
+          },
+        },
+      );
+
+      const leakingPool = {
+        query: async () => {
+          throw new Error(
+            `Connection error to ${CANARY_CONNECTION_STRING}: query failed on ${CANARY_SQL_FRAGMENT}`,
+          );
+        },
+      } as unknown as pg.Pool;
+
+      const leakingService = new SessionService({
+        pool: leakingPool,
+        cookieOptions: { isProduction: true },
+      });
+
+      const app = fastify({ loggerInstance: testLogger });
+      installAuthorizationBoundary(app, {
+        sessionService: leakingService,
+        trustedOrigin: ALLOWED_ORIGIN,
+      });
+
+      app.get(
+        '/api/canary/read',
+        { config: { authz: { principal: 'browser', minRole: 'member' } } },
+        async () => ({ ok: true }),
+      );
+
+      app.post(
+        '/api/canary/mutate',
+        { config: { authz: { principal: 'browser', minRole: 'member' } } },
+        async () => ({ ok: true }),
+      );
+
+      await app.ready();
+      try {
+        const secret = crypto.randomBytes(32).toString('base64url');
+        const csrfToken = crypto.randomBytes(32).toString('base64url');
+
+        // 1. Browser read request
+        const resRead = await app.inject({
+          method: 'GET',
+          url: '/api/canary/read',
+          headers: { cookie: makeCookieHeader(secret) },
+        });
+        expect(resRead.statusCode).toBe(503);
+        expect(resRead.body).not.toContain(CANARY_CONNECTION_STRING);
+        expect(resRead.body).not.toContain(CANARY_SQL_FRAGMENT);
+        expect(resRead.body).not.toContain('super_secret_password_canary');
+
+        // 2. Browser mutation request
+        const resMutate = await app.inject({
+          method: 'POST',
+          url: '/api/canary/mutate',
+          headers: {
+            origin: ALLOWED_ORIGIN,
+            cookie: makeCookieHeader(secret),
+            'x-csrf-token': csrfToken,
+          },
+        });
+        expect(resMutate.statusCode).toBe(500);
+        expect(resMutate.body).not.toContain(CANARY_CONNECTION_STRING);
+        expect(resMutate.body).not.toContain(CANARY_SQL_FRAGMENT);
+        expect(resMutate.body).not.toContain('super_secret_password_canary');
+
+        // 3. Serialized public error assertions
+        try {
+          await leakingService.lookupSessionOrgId(Buffer.from(secret, 'base64url'));
+          expect.fail('Expected lookupSessionOrgId to throw');
+        } catch (err) {
+          const sessionErr = err as SessionError;
+          expect(sessionErr.message).not.toContain(CANARY_CONNECTION_STRING);
+          expect(sessionErr.message).not.toContain(CANARY_SQL_FRAGMENT);
+          expect(sessionErr.message).not.toContain('super_secret_password_canary');
+        }
+
+        // 4. Pino log inspection
+        const combinedLogs = logRecords.join('\n');
+        expect(combinedLogs).not.toContain(CANARY_CONNECTION_STRING);
+        expect(combinedLogs).not.toContain(CANARY_SQL_FRAGMENT);
+        expect(combinedLogs).not.toContain('super_secret_password_canary');
+      } finally {
+        await app.close();
+      }
     });
   });
 });

@@ -646,4 +646,31 @@ describe('SW-1.5.2: Server-Side Web Sessions PostgreSQL 16 Integration Suite', (
       }
     });
   });
+
+  describe('6. Pre-Tenant Lookup Error Handling (AUTHZ-05)', () => {
+    it('returns null when session row does not exist in pre-tenant lookup', async () => {
+      const nonexistentBytes = crypto.randomBytes(32);
+      const orgId = await sessionService.lookupSessionOrgId(nonexistentBytes);
+      expect(orgId).toBeNull();
+    });
+
+    it('throws SessionError DATABASE_ERROR when underlying pool.query throws', async () => {
+      const faultyPool = {
+        query: async () => {
+          throw new Error('pg_pool query error');
+        },
+      } as unknown as pg.Pool;
+
+      const testService = new SessionService({ pool: faultyPool });
+      const testSecretBytes = crypto.randomBytes(32);
+
+      await expect(testService.lookupSessionOrgId(testSecretBytes)).rejects.toThrowError(
+        expect.objectContaining({
+          name: 'SessionError',
+          reason: 'DATABASE_ERROR',
+          message: 'Database error during session lookup',
+        }),
+      );
+    });
+  });
 });
