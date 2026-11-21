@@ -423,6 +423,29 @@ Migration `0010-privileged-bootstrap-functions.sql` establishes secure, narrowly
   - Application-level bootstrap self-enrollment controls and rate limits belong to SW-1.5.1.
   - Background maintenance execution with per-organization advisory locking belongs to Phase 2.
 
+##### 4. Migration `0011-session-tenant-lookup.sql` & Pre-Tenant Session Lookup (ADR 0001, SW-1.5.2)
+
+Migration `0011-session-tenant-lookup.sql` introduces an authorized, narrowly scoped `SECURITY DEFINER` function in the `app_private` schema to resolve tenant organization IDs from opaque browser session cookies without bypassing PostgreSQL Row-Level Security (ADR 0001, Architecture §12.4).
+
+- **Function Interface and Signature:**
+  - `app_private.lookup_session_org_by_hash(p_session_id_hash BYTEA)`:
+    - **Owner:** `gateway_auth_executor` (`NOLOGIN BYPASSRLS`).
+    - **Purpose:** Resolves tenant organization UUID from a 32-byte SHA-256 session verifier hash before tenant context is known.
+    - **Return contract:** Exactly one column: `org_id UUID`. Zero or one row returned. Rejects NULL, empty, or wrong-length hashes fail-closed by returning zero rows. Never returns user IDs, CSRF tokens, expiration timestamps, or session secrets.
+    - **EXECUTE:** Granted strictly to `gateway_app`. Denied to `gateway_worker`, `gateway_startup`, and `PUBLIC`.
+- **Privilege & Schema Security:**
+  - `gateway_auth_executor` receives minimal column-level `SELECT (session_id_hash, org_id)` on `public.web_sessions`.
+  - Search path hardened to `pg_catalog, app_private, pg_temp` to prevent `pg_temp` object shadowing attacks.
+  - Zero `BYPASSRLS` privileges granted to runtime roles; `public.web_sessions` maintains `FORCE ROW LEVEL SECURITY`.
+- **Authentication & Session Services (SW-1.5.1 & SW-1.5.2):**
+  - **Password Security:** Argon2id (`v=19`, `m=19456`, `t=2`, `p=1`) via `@node-rs/argon2`. Maximum 128-byte UTF-8 password cap with zero silent truncation.
+  - **Argon2 Concurrency Limiter:** Shared semaphore bounding concurrent hashing operations (default 4) with bounded queue capacity (default 16) and timeout (5000ms), failing closed on overload.
+  - **Email Normalization:** Canonical trimmed lowercase email matching `^[^@\s]+@[^@\s]+$` with maximum 255 characters.
+  - **Login Abuse Protection:** Redis rate-limiting enforcing per-IP (30 / 15m) and per-account (5 / 15m) limits before expensive password operations. Irreversible SHA-256 account keys; fails closed on Redis downtime.
+  - **Timing Equalization:** Dummy verification using genuine Argon2id hash on nonexistent accounts to mitigate enumeration.
+  - **Session Lifecycle:** 256-bit opaque random secret in `__Host-session` cookie; SHA-256 verifier persistence; idle (2h) and absolute (7d) expiration; atomic rotation; user session revocation.
+  - **Internal Bootstrap Service:** Typed internal service interface executing `app_private.create_organization_with_admin` atomically; public self-registration remains deferred until SW-1.7.
+
 #### 7.7.9 Known limitations (Phase 2)
 
 - `gateway_startup` may update `gateway_epoch` but not `updated_at`; the §12.1 column grant is
