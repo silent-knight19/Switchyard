@@ -344,7 +344,63 @@ describe('SW-1.6.4: PostgreSQL 16 Virtual Key Revocation, Tenant Isolation & Con
       client: pg.PoolClient | null;
       pid?: number;
       inTx: boolean;
+      unsafe?: boolean;
+      rollbackError?: unknown;
       released?: boolean;
+    }
+
+    interface PoolBaselineSettings {
+      statementTimeout: string;
+      lockTimeout: string;
+    }
+
+    async function getPoolBaselineTimeouts(pool: pg.Pool): Promise<PoolBaselineSettings> {
+      const client = await pool.connect();
+      try {
+        const stmtRes = await client.query<{ val: string }>(
+          "SELECT current_setting('statement_timeout') AS val",
+        );
+        const lockRes = await client.query<{ val: string }>(
+          "SELECT current_setting('lock_timeout') AS val",
+        );
+        return {
+          statementTimeout: stmtRes.rows[0]!.val,
+          lockTimeout: lockRes.rows[0]!.val,
+        };
+      } finally {
+        client.release();
+      }
+    }
+
+    async function assertPoolConnectionBaselineClean(
+      pool: pg.Pool,
+      baseline: PoolBaselineSettings,
+    ): Promise<void> {
+      const client = await pool.connect();
+      try {
+        const stmtRes = await client.query<{ val: string }>(
+          "SELECT current_setting('statement_timeout') AS val",
+        );
+        expect(stmtRes.rows[0]!.val).toBe(baseline.statementTimeout);
+
+        const lockRes = await client.query<{ val: string }>(
+          "SELECT current_setting('lock_timeout') AS val",
+        );
+        expect(lockRes.rows[0]!.val).toBe(baseline.lockTimeout);
+
+        const gucRes = await client.query<{ val: string | null }>(
+          "SELECT NULLIF(current_setting('app.current_org_id', true), '') AS val",
+        );
+        expect(gucRes.rows[0]?.val).toBeNull();
+      } finally {
+        client.release();
+      }
+    }
+
+    function ensureClientErrorListener(client: pg.PoolClient | pg.Client): void {
+      if (client.listenerCount('error') === 0) {
+        client.on('error', () => undefined);
+      }
     }
 
     interface SafeConcurrencyCleanupOptions {
@@ -364,25 +420,41 @@ describe('SW-1.6.4: PostgreSQL 16 Virtual Key Revocation, Tenant Isolation & Con
 
       // Attach error listeners to prevent uncaught EventEmitter errors if connection is terminated
       if (blocker.client) {
-        blocker.client.on('error', () => undefined);
+        ensureClientErrorListener(blocker.client);
       }
       if (blocked.client) {
-        blocked.client.on('error', () => undefined);
+        ensureClientErrorListener(blocked.client);
       }
 
       // 1. Release blocker transaction first so blocked queries can unblock
-      if (blocker.client && blocker.inTx) {
-        try {
-          await blocker.client.query('ROLLBACK');
-          blocker.inTx = false;
-        } catch (err) {
+      if (blocker.client && (blocker.inTx || blocker.unsafe)) {
+        if (blocker.unsafe) {
           blockerDiscard = true;
-          cleanupErrors.push(err);
+          if (blocker.rollbackError && !cleanupErrors.includes(blocker.rollbackError)) {
+            cleanupErrors.push(blocker.rollbackError);
+          }
           if (blocker.pid) {
             try {
               await adminClient.query('SELECT pg_terminate_backend($1::int)', [blocker.pid]);
             } catch (termErr) {
               cleanupErrors.push(termErr);
+            }
+          }
+        } else {
+          try {
+            await blocker.client.query('ROLLBACK');
+            blocker.inTx = false;
+          } catch (err) {
+            blockerDiscard = true;
+            blocker.unsafe = true;
+            blocker.rollbackError = err;
+            cleanupErrors.push(err);
+            if (blocker.pid) {
+              try {
+                await adminClient.query('SELECT pg_terminate_backend($1::int)', [blocker.pid]);
+              } catch (termErr) {
+                cleanupErrors.push(termErr);
+              }
             }
           }
         }
@@ -409,6 +481,7 @@ describe('SW-1.6.4: PostgreSQL 16 Virtual Key Revocation, Tenant Isolation & Con
           ]);
         } catch (err) {
           blockedDiscard = true;
+          blocked.unsafe = true;
           cleanupErrors.push(err);
           if (blocked.pid) {
             try {
@@ -423,18 +496,34 @@ describe('SW-1.6.4: PostgreSQL 16 Virtual Key Revocation, Tenant Isolation & Con
       }
 
       // 3. Rollback the blocked client's transaction if still open and not discarded
-      if (blocked.client && !blockedDiscard && blocked.inTx) {
-        try {
-          await blocked.client.query('ROLLBACK');
-          blocked.inTx = false;
-        } catch (err) {
+      if (blocked.client && !blockedDiscard && (blocked.inTx || blocked.unsafe)) {
+        if (blocked.unsafe) {
           blockedDiscard = true;
-          cleanupErrors.push(err);
+          if (blocked.rollbackError && !cleanupErrors.includes(blocked.rollbackError)) {
+            cleanupErrors.push(blocked.rollbackError);
+          }
           if (blocked.pid) {
             try {
               await adminClient.query('SELECT pg_terminate_backend($1::int)', [blocked.pid]);
             } catch (termErr) {
               cleanupErrors.push(termErr);
+            }
+          }
+        } else {
+          try {
+            await blocked.client.query('ROLLBACK');
+            blocked.inTx = false;
+          } catch (err) {
+            blockedDiscard = true;
+            blocked.unsafe = true;
+            blocked.rollbackError = err;
+            cleanupErrors.push(err);
+            if (blocked.pid) {
+              try {
+                await adminClient.query('SELECT pg_terminate_backend($1::int)', [blocked.pid]);
+              } catch (termErr) {
+                cleanupErrors.push(termErr);
+              }
             }
           }
         }
@@ -444,7 +533,7 @@ describe('SW-1.6.4: PostgreSQL 16 Virtual Key Revocation, Tenant Isolation & Con
       if (blocker.client && !blocker.released) {
         blocker.released = true;
         try {
-          if (blockerDiscard || blocker.inTx) {
+          if (blockerDiscard || blocker.inTx || blocker.unsafe) {
             blocker.client.release(true);
           } else {
             blocker.client.release();
@@ -457,7 +546,7 @@ describe('SW-1.6.4: PostgreSQL 16 Virtual Key Revocation, Tenant Isolation & Con
       if (blocked.client && !blocked.released) {
         blocked.released = true;
         try {
-          if (blockedDiscard || blocked.inTx) {
+          if (blockedDiscard || blocked.inTx || blocked.unsafe) {
             blocked.client.release(true);
           } else {
             blocked.client.release();
@@ -477,15 +566,13 @@ describe('SW-1.6.4: PostgreSQL 16 Virtual Key Revocation, Tenant Isolation & Con
     }
 
     it('Scenario A: Revocation wins row lock — blocks admission and admission rejects fail-closed', async () => {
+      const baseline = await getPoolBaselineTimeouts(appPool);
       const key = await managementService.createKey(ORG_A_ID, 'Scenario A Race Key');
 
       const clientR = await appPool.connect();
       const clientA = await appPool.connect();
-
-      await clientR.query("SET statement_timeout = '3000'");
-      await clientR.query("SET lock_timeout = '3000'");
-      await clientA.query("SET statement_timeout = '3000'");
-      await clientA.query("SET lock_timeout = '3000'");
+      ensureClientErrorListener(clientR);
+      ensureClientErrorListener(clientA);
 
       const pidResR = await clientR.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
       const pidR = pidResR.rows[0]!.pid;
@@ -505,6 +592,8 @@ describe('SW-1.6.4: PostgreSQL 16 Virtual Key Revocation, Tenant Isolation & Con
         // 1. Transaction R begins and acquires exclusive row lock
         await clientR.query('BEGIN');
         trackR.inTx = true;
+        await clientR.query("SET LOCAL statement_timeout = '3000'");
+        await clientR.query("SET LOCAL lock_timeout = '3000'");
         await clientR.query(`SET LOCAL app.current_org_id = '${ORG_A_ID}'`);
         const lockR = await clientR.query<{ id: string }>(
           'SELECT id FROM public.virtual_keys WHERE id = $1 FOR UPDATE',
@@ -521,6 +610,8 @@ describe('SW-1.6.4: PostgreSQL 16 Virtual Key Revocation, Tenant Isolation & Con
         // 3. Transaction A starts admission check in tenant context, attempting SELECT ... FOR UPDATE
         await clientA.query('BEGIN');
         trackA.inTx = true;
+        await clientA.query("SET LOCAL statement_timeout = '3000'");
+        await clientA.query("SET LOCAL lock_timeout = '3000'");
         await clientA.query(`SET LOCAL app.current_org_id = '${ORG_A_ID}'`);
 
         admissionPromise = (async () => {
@@ -586,18 +677,18 @@ describe('SW-1.6.4: PostgreSQL 16 Virtual Key Revocation, Tenant Isolation & Con
           if (!testError) throw cleanupErr;
         }
       }
+
+      await assertPoolConnectionBaselineClean(appPool, baseline);
     });
 
     it('Scenario B: Admission lock wins row lock — blocks revocation until admission commits', async () => {
+      const baseline = await getPoolBaselineTimeouts(appPool);
       const key = await managementService.createKey(ORG_A_ID, 'Scenario B Race Key');
 
       const clientA = await appPool.connect();
       const clientR = await appPool.connect();
-
-      await clientA.query("SET statement_timeout = '3000'");
-      await clientA.query("SET lock_timeout = '3000'");
-      await clientR.query("SET statement_timeout = '3000'");
-      await clientR.query("SET lock_timeout = '3000'");
+      ensureClientErrorListener(clientA);
+      ensureClientErrorListener(clientR);
 
       const pidResA = await clientA.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
       const pidA = pidResA.rows[0]!.pid;
@@ -616,6 +707,8 @@ describe('SW-1.6.4: PostgreSQL 16 Virtual Key Revocation, Tenant Isolation & Con
         // 1. Transaction A begins and acquires admission row lock
         await clientA.query('BEGIN');
         trackA.inTx = true;
+        await clientA.query("SET LOCAL statement_timeout = '3000'");
+        await clientA.query("SET LOCAL lock_timeout = '3000'");
         await clientA.query(`SET LOCAL app.current_org_id = '${ORG_A_ID}'`);
         const admissionResult = await simulateProviderAttemptAdmissionLock(clientA, key.id);
 
@@ -626,6 +719,8 @@ describe('SW-1.6.4: PostgreSQL 16 Virtual Key Revocation, Tenant Isolation & Con
         // 3. Transaction R begins revocation attempt, attempting SELECT ... FOR UPDATE
         await clientR.query('BEGIN');
         trackR.inTx = true;
+        await clientR.query("SET LOCAL statement_timeout = '3000'");
+        await clientR.query("SET LOCAL lock_timeout = '3000'");
         await clientR.query(`SET LOCAL app.current_org_id = '${ORG_A_ID}'`);
 
         revocationPromise = (async () => {
@@ -641,8 +736,14 @@ describe('SW-1.6.4: PostgreSQL 16 Virtual Key Revocation, Tenant Isolation & Con
             trackR.inTx = false;
           } catch (err) {
             revocationError = err;
-            await clientR.query('ROLLBACK').catch(() => undefined);
-            trackR.inTx = false;
+            try {
+              await clientR.query('ROLLBACK');
+              trackR.inTx = false;
+            } catch (rollbackErr) {
+              trackR.unsafe = true;
+              trackR.rollbackError = rollbackErr;
+              // preserve trackR.inTx = true
+            }
           } finally {
             revocationCompleted = true;
           }
@@ -706,18 +807,18 @@ describe('SW-1.6.4: PostgreSQL 16 Virtual Key Revocation, Tenant Isolation & Con
           if (!testError) throw cleanupErr;
         }
       }
+
+      await assertPoolConnectionBaselineClean(appPool, baseline);
     });
 
     it('Cleanup Safety: deliberately injected failure while lock held triggers safe rollback and preserves connection pool integrity', async () => {
+      const baseline = await getPoolBaselineTimeouts(appPool);
       const key = await managementService.createKey(ORG_A_ID, 'Injected Failure Test Key');
 
       const clientA = await appPool.connect();
       const clientB = await appPool.connect();
-
-      await clientA.query("SET statement_timeout = '3000'");
-      await clientA.query("SET lock_timeout = '3000'");
-      await clientB.query("SET statement_timeout = '3000'");
-      await clientB.query("SET lock_timeout = '3000'");
+      ensureClientErrorListener(clientA);
+      ensureClientErrorListener(clientB);
 
       const pidResA = await clientA.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
       const pidA = pidResA.rows[0]!.pid;
@@ -735,12 +836,16 @@ describe('SW-1.6.4: PostgreSQL 16 Virtual Key Revocation, Tenant Isolation & Con
       // 1. Acquire row lock using Client A
       await clientA.query('BEGIN');
       trackA.inTx = true;
+      await clientA.query("SET LOCAL statement_timeout = '3000'");
+      await clientA.query("SET LOCAL lock_timeout = '3000'");
       await clientA.query(`SET LOCAL app.current_org_id = '${ORG_A_ID}'`);
       await clientA.query('SELECT id FROM public.virtual_keys WHERE id = $1 FOR UPDATE', [key.id]);
 
       // 2. Start Client B attempting the conflicting row lock
       await clientB.query('BEGIN');
       trackB.inTx = true;
+      await clientB.query("SET LOCAL statement_timeout = '3000'");
+      await clientB.query("SET LOCAL lock_timeout = '3000'");
       await clientB.query(`SET LOCAL app.current_org_id = '${ORG_A_ID}'`);
 
       clientBPromise = (async () => {
@@ -801,38 +906,48 @@ describe('SW-1.6.4: PostgreSQL 16 Virtual Key Revocation, Tenant Isolation & Con
       // Acquire a reusable connection from the test pool
       const freshClient = await appPool.connect();
       try {
-        // 8a. Verify no residual tenant context
+        // 8a. Verify timeouts match baseline
+        const stmtRes = await freshClient.query<{ val: string }>(
+          "SELECT current_setting('statement_timeout') AS val",
+        );
+        expect(stmtRes.rows[0]!.val).toBe(baseline.statementTimeout);
+        const lockTimeoutRes = await freshClient.query<{ val: string }>(
+          "SELECT current_setting('lock_timeout') AS val",
+        );
+        expect(lockTimeoutRes.rows[0]!.val).toBe(baseline.lockTimeout);
+
+        // 8b. Verify no residual tenant context
         const gucRes = await freshClient.query<{ val: string | null }>(
           "SELECT NULLIF(current_setting('app.current_org_id', true), '') AS val",
         );
         expect(gucRes.rows[0]?.val).toBeNull();
 
-        // 8b. Verify no transaction is left in open or aborted state
+        // 8c. Verify no transaction is left in open or aborted state
         // Executing BEGIN succeeds cleanly without WARNING: there is already a transaction in progress
         // and without SQLSTATE 25P02 (current transaction is aborted)
         await freshClient.query('BEGIN');
         await freshClient.query(`SET LOCAL app.current_org_id = '${ORG_A_ID}'`);
 
-        // 8c. Verify no leaked row lock: acquire same row lock with NOWAIT
+        // 8d. Verify no leaked row lock: acquire same row lock with NOWAIT
         // If an abandoned transaction still held the lock, NOWAIT would throw SQLSTATE 55P03 immediately
-        const lockRes = await freshClient.query<{ id: string }>(
+        const rowLockRes = await freshClient.query<{ id: string }>(
           'SELECT id FROM public.virtual_keys WHERE id = $1 FOR UPDATE NOWAIT',
           [key.id],
         );
-        expect(lockRes.rows).toHaveLength(1);
-        expect(lockRes.rows[0]!.id).toBe(key.id);
+        expect(rowLockRes.rows).toHaveLength(1);
+        expect(rowLockRes.rows[0]!.id).toBe(key.id);
 
-        // 8d. Verify key row remains in expected unrevoked state
+        // 8e. Verify key row remains in expected unrevoked state
         const rowRes = await freshClient.query<{ revoked_at: Date | null }>(
           'SELECT revoked_at FROM public.virtual_keys WHERE id = $1',
           [key.id],
         );
         expect(rowRes.rows[0]?.revoked_at).toBeNull();
 
-        // 8e. Complete the new transaction cleanly
+        // 8f. Complete the new transaction cleanly
         await freshClient.query('COMMIT');
 
-        // 8f. Verify backend is not in transaction via pg_stat_activity
+        // 8g. Verify backend is not in transaction via pg_stat_activity
         const activityRes = await adminClient.query<{ state: string }>(
           'SELECT state FROM pg_stat_activity WHERE pid = $1',
           [
@@ -844,11 +959,16 @@ describe('SW-1.6.4: PostgreSQL 16 Virtual Key Revocation, Tenant Isolation & Con
       } finally {
         freshClient.release();
       }
+
+      await assertPoolConnectionBaselineClean(appPool, baseline);
     });
 
-    it('Cleanup Safety: unsettled query or unconfirmed rollback terminates backend and discards connection from pool', async () => {
+    it('Cleanup Safety: unsettled query terminates backend and discards connection from pool', async () => {
+      const baseline = await getPoolBaselineTimeouts(appPool);
       const clientA = await appPool.connect();
       const clientB = await appPool.connect();
+      ensureClientErrorListener(clientA);
+      ensureClientErrorListener(clientB);
 
       const pidResA = await clientA.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
       const pidA = pidResA.rows[0]!.pid;
@@ -896,9 +1016,141 @@ describe('SW-1.6.4: PostgreSQL 16 Virtual Key Revocation, Tenant Isolation & Con
           await freshClient.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')
         ).rows[0]!.pid;
         expect(freshPid).not.toBe(pidB); // fresh connection, not the discarded pid
+
+        const stmtRes = await freshClient.query<{ val: string }>(
+          "SELECT current_setting('statement_timeout') AS val",
+        );
+        expect(stmtRes.rows[0]!.val).toBe(baseline.statementTimeout);
+        const lockRes = await freshClient.query<{ val: string }>(
+          "SELECT current_setting('lock_timeout') AS val",
+        );
+        expect(lockRes.rows[0]!.val).toBe(baseline.lockTimeout);
       } finally {
         freshClient.release();
       }
+
+      await assertPoolConnectionBaselineClean(appPool, baseline);
+    });
+
+    it('Cleanup Safety (VKSEC-09): unconfirmed rollback marks connection unsafe, triggers discard, and terminates backend', async () => {
+      const baseline = await getPoolBaselineTimeouts(appPool);
+      const key = await managementService.createKey(ORG_A_ID, 'Rollback Failure Test Key');
+
+      const clientA = await appPool.connect();
+      const clientB = await appPool.connect();
+      ensureClientErrorListener(clientA);
+      ensureClientErrorListener(clientB);
+
+      const pidResA = await clientA.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+      const pidA = pidResA.rows[0]!.pid;
+      const pidResB = await clientB.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+      const pidB = pidResB.rows[0]!.pid;
+
+      const trackA: ConcurrencyClientTrack = { client: clientA, pid: pidA, inTx: false };
+      const trackB: ConcurrencyClientTrack = { client: clientB, pid: pidB, inTx: false };
+
+      // 1. Client A begins tx, sets local timeouts and tenant, acquires row lock
+      await clientA.query('BEGIN');
+      trackA.inTx = true;
+      await clientA.query("SET LOCAL statement_timeout = '3000'");
+      await clientA.query("SET LOCAL lock_timeout = '3000'");
+      await clientA.query(`SET LOCAL app.current_org_id = '${ORG_A_ID}'`);
+      await clientA.query('SELECT id FROM public.virtual_keys WHERE id = $1 FOR UPDATE', [key.id]);
+
+      // 2. Client B begins tx, sets local timeouts and tenant, attempts same row lock
+      await clientB.query('BEGIN');
+      trackB.inTx = true;
+      await clientB.query("SET LOCAL statement_timeout = '3000'");
+      await clientB.query("SET LOCAL lock_timeout = '3000'");
+      await clientB.query(`SET LOCAL app.current_org_id = '${ORG_A_ID}'`);
+
+      let clientBPromise: Promise<void> | null = null;
+      let clientBAcquired = false;
+      clientBPromise = (async () => {
+        try {
+          await clientB.query('SELECT id FROM public.virtual_keys WHERE id = $1 FOR UPDATE', [
+            key.id,
+          ]);
+          clientBAcquired = true;
+        } catch {
+          // May be rolled back during cleanup
+        }
+      })();
+
+      // 3. Confirm PID blocking deterministically
+      let blockedByA = false;
+      const deadline = Date.now() + 2000;
+      while (Date.now() < deadline) {
+        const blockersRes = await adminClient.query<{ blockers: number[] }>(
+          'SELECT pg_blocking_pids($1::int) AS blockers',
+          [pidB],
+        );
+        if (blockersRes.rows[0]?.blockers?.includes(pidA)) {
+          blockedByA = true;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      expect(blockedByA).toBe(true);
+      expect(clientBAcquired).toBe(false);
+
+      // 4. Inject deterministic rollback failure on Client A
+      const rollbackFailError = new Error('INJECTED_DETERMINISTIC_ROLLBACK_FAILURE');
+      const origAQuery = clientA.query.bind(clientA);
+      (clientA as unknown as { query: typeof origAQuery }).query = async (...args: unknown[]) => {
+        const sql = typeof args[0] === 'string' ? args[0] : (args[0] as { text?: string })?.text;
+        if (typeof sql === 'string' && sql.trim().toUpperCase() === 'ROLLBACK') {
+          throw rollbackFailError;
+        }
+        return Reflect.apply(origAQuery, clientA, args);
+      };
+
+      // 5. Execute safeConcurrencyCleanup
+      let cleanupError: unknown = null;
+      try {
+        await safeConcurrencyCleanup({
+          blocker: trackA,
+          blocked: trackB,
+          blockedPromise: clientBPromise,
+          adminClient,
+        });
+      } catch (err) {
+        cleanupError = err;
+      }
+
+      // 6. Assertions on failed rollback handling:
+      // 6a. Cleanup surfaced the rollback error
+      expect(cleanupError).toBe(rollbackFailError);
+      // 6b. Transaction state on trackA was NOT marked clean
+      expect(trackA.inTx).toBe(true);
+      expect(trackA.unsafe).toBe(true);
+      expect(trackA.rollbackError).toBe(rollbackFailError);
+      // 6c. Backend A was terminated via adminClient
+      const activityA = await adminClient.query<{ count: number }>(
+        'SELECT count(*)::int as count FROM pg_stat_activity WHERE pid = $1',
+        [pidA],
+      );
+      expect(activityA.rows[0]!.count).toBe(0);
+      // 6d. Connection A was released with discard
+      expect(trackA.released).toBe(true);
+
+      // 7. Verify pool integrity: fresh pooled connection executes normally without held locks
+      const freshClient = await appPool.connect();
+      try {
+        await freshClient.query('BEGIN');
+        await freshClient.query(`SET LOCAL app.current_org_id = '${ORG_A_ID}'`);
+        const lockRes = await freshClient.query<{ id: string }>(
+          'SELECT id FROM public.virtual_keys WHERE id = $1 FOR UPDATE NOWAIT',
+          [key.id],
+        );
+        expect(lockRes.rows).toHaveLength(1);
+        await freshClient.query('COMMIT');
+      } finally {
+        freshClient.release();
+      }
+
+      // 8. Verify pool baseline timeouts and GUC cleanliness
+      await assertPoolConnectionBaselineClean(appPool, baseline);
     });
 
     it('Scenario C: Stale authenticated principal cannot bypass admission-time row check', async () => {
