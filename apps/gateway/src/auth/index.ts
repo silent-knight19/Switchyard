@@ -5,3 +5,4 @@ export * from './rate-limiter.js';
 export * from './service.js';
 export * from './session.js';
 export * from './csrf.js';
+export * from './authorization.js';

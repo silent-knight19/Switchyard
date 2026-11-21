@@ -379,8 +379,13 @@ export class SessionService {
       }
 
       return rows[0].org_id;
-    } catch {
-      return null;
+    } catch (err) {
+      if (err instanceof SessionError) {
+        throw err;
+      }
+      throw new SessionError('DATABASE_ERROR', 'Database error during session lookup', {
+        cause: err,
+      });
     }
   }
 

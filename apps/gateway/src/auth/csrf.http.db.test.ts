@@ -19,6 +19,7 @@ import { REDACTION_PATHS } from '../logging/redaction.js';
 import { SessionService } from './session.js';
 import { createCsrfProtectionPreHandler, validateOrigin } from './csrf.js';
 import { CsrfError, SessionError } from './types.js';
+import { loadConfig } from '../config/index.js';
 import { buildApp } from '../app.js';
 import * as authBarrel from './index.js';
 
@@ -810,6 +811,10 @@ describe('SW-1.5.3: Fastify HTTP Injection & Security Test Suite', () => {
         redis: mockRed,
         lifecycle: mockLife,
         logger: nullLogger,
+        config: loadConfig({
+          NODE_ENV: 'test',
+          BROWSER_ORIGIN: ALLOWED_ORIGIN,
+        }),
       });
 
       try {

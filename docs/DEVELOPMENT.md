@@ -445,6 +445,15 @@ Migration `0011-session-tenant-lookup.sql` introduces an authorized, narrowly sc
   - **Timing Equalization:** Dummy verification using genuine Argon2id hash on nonexistent accounts to mitigate enumeration.
   - **Session Lifecycle:** 256-bit opaque random secret in `__Host-session` cookie; SHA-256 verifier persistence; idle (2h) and absolute (7d) expiration; atomic rotation; user session revocation.
   - **Internal Bootstrap Service:** Typed internal service interface executing `app_private.create_organization_with_admin` atomically; public self-registration remains deferred until SW-1.7.
+- **CSRF & Strict Origin Protection (SW-1.5.3):**
+  - **Synchronizer Token:** 256-bit unpadded base64url CSRF tokens verified via SHA-256 hash in constant time (`timingSafeEqual`).
+  - **Origin Verification:** Strict canonical origin comparison (`BROWSER_ORIGIN`) for state-changing browser methods (`POST`, `PUT`, `PATCH`, `DELETE`).
+- **Default-Deny Route Authorization & RBAC (SW-1.5.4):**
+  - **Default-Deny Assertion:** Registration-time Fastify `onRoute` hook requiring explicit `config.authz` metadata on every route (`AUTHZ_ROUTE_POLICY_INVALID`).
+  - **Principal Separation:** Strict non-interchangeable separation between `anonymous`, `browser` (server-side web session), and `virtual_key` (data-plane key authenticator).
+  - **Browser RBAC:** Two-tier role hierarchy (`admin` and `member`) evaluated fresh from PostgreSQL on each request.
+  - **Composition:** Unified preHandler hook enforcing Origin, session validation, CSRF, and role authorization for browser mutations.
+  - **Registration Helper:** `registerAuthorizedRoute` typed entry point enforcing metadata contract before Fastify registration.
 
 #### 7.7.9 Known limitations (Phase 2)
 

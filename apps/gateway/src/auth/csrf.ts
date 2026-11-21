@@ -304,7 +304,10 @@ export function validateOrigin(rawOrigin: unknown, allowedOrigin: string): Origi
 /**
  * Checks whether rawHeaders array contains more than one occurrence of a header name (CSRF-04).
  */
-function hasDuplicateRawHeader(rawHeaders: string[] | undefined, headerName: string): boolean {
+export function hasDuplicateRawHeader(
+  rawHeaders: string[] | undefined,
+  headerName: string,
+): boolean {
   if (!rawHeaders) return false;
   const target = headerName.toLowerCase();
   let count = 0;

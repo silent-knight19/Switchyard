@@ -1,10 +1,13 @@
 import fastify from 'fastify';
 import type pino from 'pino';
+import type { GatewayConfig } from './config/index.js';
 import type { PostgresClient } from './infrastructure/postgres.js';
 import type { RedisClient } from './infrastructure/redis.js';
 import type { LifecycleCoordinator } from './lifecycle/state.js';
 import { registerHealthRoutes } from './routes/health.js';
 import { getSafeRouteIdentifier } from './logging/serializers.js';
+import { SessionService } from './auth/session.js';
+import { installAuthorizationBoundary } from './auth/authorization.js';
 
 export type AppInstance = ReturnType<typeof fastify>;
 
@@ -13,14 +16,32 @@ export interface BuildAppOptions {
   redis: RedisClient;
   lifecycle: LifecycleCoordinator;
   logger: pino.Logger;
+  config: GatewayConfig;
 }
 
 export async function buildApp(options: BuildAppOptions): Promise<AppInstance> {
-  const { postgres, redis, lifecycle, logger } = options;
+  const { postgres, redis, lifecycle, logger, config } = options;
 
   const app = fastify({
     loggerInstance: logger,
     disableRequestLogging: true,
+  });
+
+  // Construct application-scoped session service reusing Postgres pool
+  const sessionService = new SessionService({
+    pool: postgres.pool,
+    config,
+    environment: config.NODE_ENV,
+    cookieOptions: {
+      secure: config.COOKIE_SECURE,
+      isProduction: config.NODE_ENV === 'production',
+    },
+  });
+
+  // Install default-deny authorization boundary before any routes are registered (SW-1.5.4)
+  installAuthorizationBoundary(app, {
+    sessionService,
+    trustedOrigin: config.BROWSER_ORIGIN,
   });
 
   // Safe Request Lifecycle Logging (Finding 4): Log route templates or allowlisted identifiers only; never raw paths or query strings
