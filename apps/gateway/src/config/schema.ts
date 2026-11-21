@@ -3,6 +3,7 @@ import type { ConfigIssue } from './errors.js';
 import { isSensitiveKey } from '../logging/redaction.js';
 import { formatSafeZodMessage } from '../logging/serializers.js';
 import { assertCanonicalOrigin, isLoopbackOrUnspecifiedHost } from '../auth/csrf.js';
+import { inspectKekEnvironment } from '../vault/kek.js';
 
 const FORBIDDEN_SECURITY_FLAGS = [
   'FAIL_OPEN',
@@ -23,6 +24,8 @@ const SENSITIVE_FIELD_NAMES = new Set([
   'CSRF_SECRET',
   'MASTER_KEY',
   'KEK',
+  'MASTER_KEK_V1',
+  'MASTER_KEK_V2',
   'DEK',
   'API_KEY',
 ]);
@@ -76,6 +79,14 @@ export const rawEnvSchema = z
     MOCK_PROVIDER_ENABLED: strictBoolean.default(false),
     DEMO_SEEDING_ENABLED: strictBoolean.default(false),
     BROWSER_ORIGIN: z.string().min(1).default('http://127.0.0.1:3000'),
+
+    // Versioned KEK configuration for provider credential envelope encryption
+    // (SW-1.7.1/SW-1.7.2). Absent configuration leaves the vault uninitialised; partial or
+    // malformed configuration is rejected below. SW-1.7.3 must require valid KEKs before exposing
+    // provider-credential management routes.
+    MASTER_KEK_V1: z.string().optional(),
+    MASTER_KEK_V2: z.string().optional(),
+    ACTIVE_KEK_VERSION: z.string().optional(),
 
     // Optional Upstream Endpoints
     UPSTREAM_ENDPOINT_URL: z
@@ -203,6 +214,20 @@ export const rawEnvSchema = z
           code: z.ZodIssueCode.custom,
           path: ['REDIS_PASSWORD'],
           message: 'Default development credentials are prohibited in production profile',
+        });
+      }
+    }
+
+    // KEK configuration (SW-1.7.1): absent is permitted so existing startup and non-vault tests
+    // remain compatible. Any supplied KEK configuration must be complete, canonical, and
+    // internally consistent. Validation messages never reproduce secret environment values.
+    const kekInspection = inspectKekEnvironment(data);
+    if (kekInspection.status === 'invalid') {
+      for (const issue of kekInspection.issues) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [issue.field],
+          message: issue.message,
         });
       }
     }

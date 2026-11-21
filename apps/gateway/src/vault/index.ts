@@ -1,0 +1,30 @@
+export { VaultError, type VaultErrorReason } from './errors.js';
+export {
+  KekKeyring,
+  SUPPORTED_KEK_VERSIONS,
+  KEK_BYTE_LENGTH,
+  KEK_ENCODED_LENGTH,
+  createKekKeyringFromEnvironment,
+  inspectKekEnvironment,
+  type KekConfigIssue,
+  type KekEnvironment,
+  type KekEnvironmentInspection,
+  type KekField,
+  type KekKeyringInput,
+  type KekVersion,
+} from './kek.js';
+export {
+  EnvelopeVault,
+  AES_GCM_IV_BYTES,
+  AES_GCM_TAG_BYTES,
+  DEK_BYTES,
+  ENVELOPE_FORMAT_VERSION,
+  MAX_PROVIDER_CREDENTIAL_BYTES,
+  SUPPORTED_PROVIDERS,
+  WRAPPED_DEK_BYTES,
+  type DecryptProviderCredentialParams,
+  type EncryptProviderCredentialParams,
+  type OrganizationDekEnvelope,
+  type ProviderCredentialEnvelope,
+  type SupportedProvider,
+} from './envelope.js';

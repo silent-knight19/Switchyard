@@ -115,6 +115,28 @@ cp .env.example .env
 | `REDIS_PORT` | `6379` | Host loopback port for Redis | Bound to `127.0.0.1` |
 | `REDIS_MAXMEMORY` | `64mb` | Redis memory allocation bound | Provisional development baseline; not benchmark-validated (production sizing requires Phase 2 load testing under `bench/`) |
 
+#### 7.2.1 Provider Credential Envelope Encryption Configuration (SW-1.7.1/SW-1.7.2)
+
+Provider credentials use per-organization AES-256-GCM DEKs wrapped under versioned environment KEKs. The central configuration module recognises:
+
+| Variable | Required | Purpose |
+| :--- | :---: | :--- |
+| `MASTER_KEK_V1` | Conditional | Canonical unpadded base64url encoding of exactly 32 bytes (43 characters). |
+| `MASTER_KEK_V2` | Conditional | Same representation; must not duplicate V1 material. |
+| `ACTIVE_KEK_VERSION` | Conditional | Exact decimal string `1` or `2`; must reference a supplied valid KEK. |
+
+Rules:
+- Omit all three variables to leave the vault uninitialised. Existing Gateway startup does not require KEKs.
+- Supplying any KEK value requires a valid active version and its matching key. Partial, padded, noncanonical, all-zero, duplicate, or inconsistent configurations are rejected at startup.
+- Generate development KEKs with a cryptographically secure RNG, for example:
+  ```bash
+  node -e "process.stdout.write(require('node:crypto').randomBytes(32).toString('base64url'))"
+  ```
+- Never commit real KEKs, reuse one key for V1 and V2, or log configuration objects containing KEKs.
+- SW-1.7.3 must require valid KEK configuration before enabling provider-credential management routes.
+- Focused tests: `pnpm --filter @switchyard/gateway test src/vault/kek.test.ts src/vault/envelope.test.ts`.
+- Real PostgreSQL evidence: `pnpm --filter @switchyard/gateway test:db` (includes `src/vault/envelope.db.test.ts`).
+
 ### 7.3 Service Management Commands
 
 #### Safe Startup
