@@ -6,3 +6,4 @@ export * from './service.js';
 export * from './session.js';
 export * from './csrf.js';
 export * from './authorization.js';
+export * from './virtual-key.js';
