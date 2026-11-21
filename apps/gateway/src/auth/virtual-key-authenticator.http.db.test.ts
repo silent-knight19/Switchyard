@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
+import fastify, { type FastifyInstance } from 'fastify';
 import { Redis } from 'ioredis';
 import pg from 'pg';
 import pino from 'pino';
