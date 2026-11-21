@@ -45,11 +45,22 @@ export type BrowserPrincipal = {
   readonly role: BrowserRole;
 };
 
+export interface VirtualKeyPolicy {
+  readonly allowedModels: readonly string[];
+  readonly rpmLimit: number;
+  readonly tpmLimit: number;
+  readonly concurrentStreamLimit: number;
+  readonly exactCacheEnabled: boolean;
+  readonly semanticCacheEnabled: boolean;
+  readonly piiRedactionEnabled: boolean;
+  readonly storePayloads: boolean;
+}
+
 export type VirtualKeyPrincipal = {
   readonly type: 'virtual_key';
   readonly keyId: string;
   readonly orgId: string;
-  readonly keyPolicy?: unknown;
+  readonly keyPolicy?: VirtualKeyPolicy | Record<string, unknown>;
 };
 
 export type AuthorizedPrincipal = AnonymousPrincipal | BrowserPrincipal | VirtualKeyPrincipal;
@@ -86,7 +97,7 @@ export interface VirtualKeyVerificationResult {
 }
 
 export interface VirtualKeyAuthenticator {
-  authenticateKey(rawKey: string): Promise<VirtualKeyVerificationResult>;
+  authenticateKey(rawKey: string, clientIp?: string): Promise<VirtualKeyVerificationResult>;
 }
 
 export interface AuthorizationBoundaryOptions {
@@ -556,8 +567,8 @@ async function handleVirtualKeyAuthorization(
     return;
   }
 
-  const rawKey = authHeader.slice(7).trim();
-  if (!rawKey) {
+  const rawKey = authHeader.slice(7);
+  if (!rawKey || rawKey.trim() === '') {
     reply.status(401).send({
       statusCode: 401,
       error: 'Unauthorized',
@@ -579,12 +590,39 @@ async function handleVirtualKeyAuthorization(
   // 4. Authenticate key
   let result: VirtualKeyVerificationResult;
   try {
-    result = await virtualKeyAuthenticator.authenticateKey(rawKey);
-  } catch {
+    result = await virtualKeyAuthenticator.authenticateKey(rawKey, req.ip);
+  } catch (err) {
+    if (
+      (err &&
+        typeof err === 'object' &&
+        'reason' in err &&
+        (err as { reason?: unknown }).reason === 'RATE_LIMITED') ||
+      (err &&
+        typeof err === 'object' &&
+        'code' in err &&
+        (err as { code?: unknown }).code === 'RATE_LIMITED')
+    ) {
+      reply.status(429).send({
+        statusCode: 429,
+        error: 'Too Many Requests',
+        message: 'Too many authentication attempts from this IP address. Please try again later.',
+      });
+      return;
+    }
     reply.status(503).send({
       statusCode: 503,
       error: 'Service Unavailable',
       message: 'Authentication service unavailable',
+    });
+    return;
+  }
+
+  // Handle RATE_LIMITED returned as non-exception result
+  if (result && result.valid !== true && result.reason === 'RATE_LIMITED') {
+    reply.status(429).send({
+      statusCode: 429,
+      error: 'Too Many Requests',
+      message: 'Too many authentication attempts from this IP address. Please try again later.',
     });
     return;
   }

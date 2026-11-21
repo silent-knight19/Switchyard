@@ -7,3 +7,5 @@ export * from './session.js';
 export * from './csrf.js';
 export * from './authorization.js';
 export * from './virtual-key.js';
+export * from './virtual-key-rate-limiter.js';
+export * from './virtual-key-authenticator.js';

@@ -203,7 +203,8 @@ To allow deployment role `gateway_migrator` to install executor-owned functions 
 
 | Requirement / Task | Status | Reference | Verified Evidence |
 | :--- | :---: | :--- | :--- |
-| **Virtual API Key Issuance (SW-1.6.1)** | IMPLEMENTED | `src/auth/virtual-key.ts`, `src/auth/virtual-key.test.ts`, `src/auth/virtual-key.db.test.ts` | 256-bit cryptographically secure generation, canonical `gw_live_<11>_<43>` format, SHA-256 verifier persistence (`key_hash BYTEA UNIQUE`), public hint (`gw_live_<11>`), one-time raw key disclosure, deny-all model policy (`allowed_models = '{}'`), bounded collision retry (max 3), RLS isolation, worker denial |
+| **Virtual API Key Issuance (SW-1.6.1)** | ACCEPTED | `src/auth/virtual-key.ts`, `src/auth/virtual-key.test.ts`, `src/auth/virtual-key.db.test.ts` | 256-bit cryptographically secure generation, canonical `gw_live_<11>_<43>` format, SHA-256 verifier persistence (`key_hash BYTEA UNIQUE`), public hint (`gw_live_<11>`), one-time raw key disclosure, deny-all model policy (`allowed_models = '{}'`), bounded collision retry (max 3), RLS isolation, worker denial |
+| **Virtual API Key Authentication & Abuse Limiting (SW-1.6.2)** | IMPLEMENTED | `src/auth/virtual-key-authenticator.ts`, `src/auth/virtual-key-rate-limiter.ts`, `src/auth/virtual-key-authenticator.db.test.ts`, `src/auth/virtual-key-authenticator.http.db.test.ts` | Canonical parsing via `parseRawKey()`, 32-byte secret SHA-256 verifier derivation, Redis per-IP abuse rate limiting (30 attempts / 15-min fixed window before DB lookup, `auth:ratelimit:vk:ip:<ip>`), restricted pre-tenant DB lookup via `app_private.lookup_virtual_key_by_hash(BYTEA)` owned by `gateway_auth_executor`, uniform HTTP 401 response for all invalid/missing/malformed/unknown/revoked credentials, fail-closed 503 on Redis/PG outages, 429 on abuse limit, typed immutable `VirtualKeyPrincipal` with `keyPolicy`, strict zero secret leakage |
 
 ---
 
@@ -311,5 +312,70 @@ Switchyard implements cryptographic virtual API key issuance as an internal Gate
 - **Role Isolation:** `gateway_worker` is strictly denied `INSERT` and `UPDATE` on `virtual_keys` (42501).
 
 ### 11.4 Future Integration Contracts
-- **SW-1.6.2 (Authentication):** Will parse `gw_live_<11>_<43>`, decode the 43-character base64url secret into 32 raw bytes, compute SHA-256, and look up the key via `app_private.lookup_virtual_key_by_hash(BYTEA)`. The public prefix is ignored during authentication.
+- **SW-1.6.2 (Authentication):** Implemented in `src/auth/virtual-key-authenticator.ts` and `src/auth/virtual-key-rate-limiter.ts`.
 - **SW-1.6.3 (Management & Policy):** Will introduce administrator-only API routes (`POST /api/keys`, `GET /api/keys`, `DELETE /api/keys/:id`). Model access enablement will require explicit validation and updating of model allowlists and operational rate/concurrency limits together.
+
+---
+
+## 12. Virtual API Key Authentication & Hash Lookup Architecture (SW-1.6.2)
+
+Switchyard implements secure virtual API key authentication and restricted hash lookup as a Gateway service (`VirtualKeyAuthenticatorService`), integrating per-IP abuse rate limiting, canonical format parsing, restricted database lookup, and uniform HTTP 401 error responses (Architecture v1.2 §5.3, §11.6, §12.4, §13.1, §13.5, §14.3).
+
+### 12.1 Authentication Sequence & Canonical Parsing
+- **Transport Extraction:** Incoming HTTP `Authorization: Bearer <rawKey>` credentials are extracted without silent whitespace normalization or repair. If the header is missing, empty, or does not begin with `Bearer `, authentication immediately rejects with generic HTTP 401.
+- **Client IP Abuse Limiter Before Database:** Every bearer-key attempt reaching the authenticator first asserts per-IP rate limits against Redis. Malformed or unknown keys consume the same IP allowance. If the threshold is exceeded, a generic HTTP 429 is returned without querying PostgreSQL.
+- **Envelope Validation:** Incoming keys are parsed using `parseRawKey()`, enforcing:
+  - Exact 63 ASCII character length.
+  - Strict regex matching `^gw_live_([A-Za-z0-9_-]{11})_([A-Za-z0-9_-]{43})$`.
+  - Canonical base64url re-encoding verification, fail-closed against noncanonical trailing padding bits.
+- **Verifier Derivation:** Decodes the 43-character base64url secret into exactly 32 raw bytes, computes `SHA-256(secretBytes)` as a 32-byte binary Buffer, and zeroizes mutable byte buffers (`.fill(0)`) on a best-effort basis. The public prefix is public hint metadata and is excluded from hash computation.
+- **Restricted Database Function:** Parameterized query invokes `app_private.lookup_virtual_key_by_hash($1::bytea)` with the 32-byte binary verifier bound to `$1`.
+
+### 12.2 Per-IP Abuse Rate Limiting (Architecture §13.1)
+- **Namespace:** `auth:ratelimit:vk:ip:<ip>`, strictly separated from browser login rate limit keys (`auth:ratelimit:ip:<ip>`).
+- **Privacy:** Limiter keys contain only normalized, validated client IP addresses (via `sanitizeClientIp()`). Raw keys, secrets, hashes, and authorization headers are strictly excluded from Redis keys.
+- **Threshold Policy:** Fixed-window threshold of 30 attempts per 15-minute window (`ipLimit: 30`, `ipWindowSeconds: 900`).
+- **Atomic Enforcement:** Evaluated using an atomic Redis Lua script (`INCR` with conditional `EXPIRE`).
+- **Fail-Closed Outage Handling:** If Redis encounters network errors or is unavailable, authentication fails closed immediately with generic HTTP 503 (`SERVICE_UNAVAILABLE`).
+
+### 12.3 Restricted Pre-Tenant Hash Lookup (`app_private.lookup_virtual_key_by_hash`)
+- **Pre-Tenant Execution:** Because the tenant identity is unknown prior to authentication, the lookup executes via the restricted `SECURITY DEFINER` function `app_private.lookup_virtual_key_by_hash(BYTEA)` owned by `gateway_auth_executor` (fixed search path `pg_catalog, app_private, pg_temp`).
+- **Least Privilege:** Granted strictly to `gateway_app`. Denied to `gateway_worker` and revoked from `PUBLIC` (42501).
+- **Exact Verifier Contract:** The function accepts only valid 32-byte binary hashes (`pg_catalog.octet_length(p_key_hash) = 32`). NULL, empty, or wrong-length inputs return zero rows.
+- **Field Whitelisting:** Returns only approved identity and policy columns (`id`, `org_id`, `revoked_at`, `allowed_models`, `rpm_limit`, `tpm_limit`, `concurrent_stream_limit`, `exact_cache_enabled`, `semantic_cache_enabled`, `pii_redaction_enabled`, `store_payloads`). Zero secret or verifier data is returned.
+- **Policy Integrity Assertion:** Returned row fields are strictly validated fail-closed. Missing or malformed UUIDs, non-array model lists, non-positive integer limits, or invalid booleans raise `INTEGRITY_ERROR` (resulting in controlled HTTP 503) rather than permissive defaults.
+
+### 12.4 Uniform HTTP Error Responses & Observability
+- **Uniform 401 Identity:** The exact same external HTTP status code (401) and JSON response body:
+  ```json
+  {
+    "statusCode": 401,
+    "error": "Unauthorized",
+    "message": "Authentication required"
+  }
+  ```
+  is returned for every invalid credential scenario:
+  - Missing Authorization header
+  - Empty Authorization header
+  - Unsupported scheme
+  - Missing bearer token
+  - Malformed token envelope
+  - Incorrect token length
+  - Noncanonical base64url padding bits
+  - Well-formed unknown key
+  - Revoked virtual key
+  - Browser cookie on virtual-key route
+  - Conflicting cookie and bearer token
+- **Controlled Outage Responses:**
+  - Database outage / query failure: Generic HTTP 503 (`Service Unavailable`).
+  - Redis limiter outage: Generic HTTP 503 (`Service Unavailable`).
+  - IP abuse threshold exceeded: Generic HTTP 429 (`Too Many Requests`).
+
+### 12.5 Principal Separation & Immutability
+- **Request Principal:** Successful authentication attaches a frozen `VirtualKeyPrincipal` (`type: 'virtual_key'`) containing only `keyId`, `orgId`, and frozen `VirtualKeyPolicy` (`allowedModels`, `rpmLimit`, `tpmLimit`, `concurrentStreamLimit`, `exactCacheEnabled`, `semanticCacheEnabled`, `piiRedactionEnabled`, `storePayloads`).
+- **Principal Isolation:** Virtual keys cannot authenticate as browser sessions or browser administrators. Browser session cookies are rejected on virtual-key routes.
+- **Deny-All Semantics:** An empty `allowed_models` array (`[]`) is preserved and frozen; it indicates all models are denied by policy.
+
+### 12.6 Architectural Limitation Notice (Phase 2 Admission Recheck)
+- **Notice:** This pre-tenant authentication lookup resolves identity and initial policy only. It does **NOT** replace the Phase 2 requirement to execute durable row-locking (`SELECT ... FOR UPDATE`) and re-check the virtual-key record during transactional provider-attempt admission.
+- **Revocation Window:** A virtual API key revoked after initial authentication lookup must be caught and rejected by the Phase 2 admission row lock before dispatching upstream provider attempts.
