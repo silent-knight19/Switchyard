@@ -197,8 +197,37 @@ export class VirtualKeyAuthenticatorService implements VirtualKeyAuthenticator {
 
     const row = rows[0]!;
 
-    // 7. Reject revoked keys
-    if (row.revoked_at !== null && row.revoked_at !== undefined) {
+    // 7. Validate revocation metadata fail-closed and reject revoked keys (VK-AUTH-01)
+    if (
+      !('revoked_at' in (row as unknown as Record<string, unknown>)) ||
+      row.revoked_at === undefined
+    ) {
+      throw new VirtualKeyAuthError(
+        'INTEGRITY_ERROR',
+        'Virtual key revoked_at is missing or undefined',
+      );
+    }
+
+    if (row.revoked_at !== null) {
+      const revokedAt = row.revoked_at;
+      let isValidTimestamp = false;
+
+      if (revokedAt instanceof Date) {
+        isValidTimestamp = !Number.isNaN(revokedAt.getTime());
+      } else if (typeof revokedAt === 'string') {
+        if (/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}/.test(revokedAt)) {
+          const parsed = Date.parse(revokedAt);
+          isValidTimestamp = !Number.isNaN(parsed);
+        }
+      }
+
+      if (!isValidTimestamp) {
+        throw new VirtualKeyAuthError(
+          'INTEGRITY_ERROR',
+          'Virtual key revoked_at contains an invalid timestamp representation',
+        );
+      }
+
       return { valid: false, reason: 'KEY_REVOKED' };
     }
 

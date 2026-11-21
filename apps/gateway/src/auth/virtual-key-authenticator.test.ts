@@ -7,6 +7,7 @@ import {
   VirtualKeyAuthError,
   VirtualKeyAuthenticatorService,
   type VirtualKeyPolicy,
+  type VirtualKeyVerificationResult,
 } from './virtual-key-authenticator.js';
 
 describe('VirtualKeyAuthenticatorService Unit Suite (SW-1.6.2)', () => {
@@ -157,29 +158,76 @@ describe('VirtualKeyAuthenticatorService Unit Suite (SW-1.6.2)', () => {
   });
 
   describe('3. Canonical Key Parsing and Hash Derivation', () => {
-    it('computes 32-byte SHA-256 verifier directly from decoded 32 secret bytes', async () => {
-      const pool = createMockPool([validDbRow]);
+    it('computes 32-byte SHA-256 verifier directly from decoded 32 secret bytes (VK-AUTH-02)', async () => {
+      // 1. Build deterministic canonical test key with known 32-byte secret material
+      const prefixBytes = Buffer.alloc(8, 0x01);
+      const publicPrefix = prefixBytes.toString('base64url');
+      expect(publicPrefix.length).toBe(11);
+
+      const secretBytes = Buffer.alloc(32, 0x02);
+      const secret = secretBytes.toString('base64url');
+      expect(secret.length).toBe(43);
+
+      const deterministicRawKey = `gw_live_${publicPrefix}_${secret}`;
+      expect(deterministicRawKey.length).toBe(63);
+
+      // 2. Compute expected 32-byte SHA-256 digest independently in test
+      const expectedVerifier = crypto.createHash('sha256').update(secretBytes).digest();
+      expect(expectedVerifier.length).toBe(32);
+
+      // 3. Configure mocked PostgreSQL query to copy Buffer argument synchronously when invoked
+      let capturedVerifier: Buffer | null = null;
+      let boundBufferRef: Buffer | null = null;
+
+      const pool = {
+        query: vi.fn().mockImplementation((_sql: string, params: unknown[]) => {
+          if (params && Buffer.isBuffer(params[0])) {
+            boundBufferRef = params[0];
+            capturedVerifier = Buffer.from(params[0]);
+          }
+          return Promise.resolve({ rows: [validDbRow] });
+        }),
+      } as unknown as pg.Pool;
+
       const service = new VirtualKeyAuthenticatorService({
         pool,
         rateLimiter: createMockRateLimiter(),
       });
 
-      const material = generateKeyMaterial();
-      await service.authenticateKey(material.rawKey, VALID_CLIENT_IP);
+      const result = await service.authenticateKey(deterministicRawKey, VALID_CLIENT_IP);
+      expect(result.valid).toBe(true);
 
+      // 4. Assert that captured value equals the independently computed 32-byte SHA-256 digest exactly
+      expect(capturedVerifier).not.toBeNull();
+      expect(capturedVerifier!.length).toBe(32);
+      expect(capturedVerifier!.equals(expectedVerifier)).toBe(true);
+
+      // 5. Assert that the SQL uses the parameterized restricted lookup
       expect(pool.query).toHaveBeenCalledTimes(1);
       const queryCall = vi.mocked(pool.query).mock.calls[0]!;
+      const sqlText = queryCall[0] as string;
+      expect(sqlText).toContain('app_private.lookup_virtual_key_by_hash($1::bytea)');
+
+      // 6. Assert that only one binary verifier argument is supplied
       const boundArgs = queryCall[1] as unknown[];
       expect(boundArgs).toHaveLength(1);
+      expect(Buffer.isBuffer(boundArgs[0])).toBe(true);
+      expect((boundArgs[0] as Buffer).length).toBe(32);
 
-      const boundHash = boundArgs[0] as Buffer;
-      expect(Buffer.isBuffer(boundHash)).toBe(true);
-      expect(boundHash.length).toBe(32);
+      // 7. Assert that hash is not derived from full printable key or public hint
+      const fullKeyHash = crypto.createHash('sha256').update(deterministicRawKey).digest();
+      const publicPrefixHash = crypto.createHash('sha256').update(publicPrefix).digest();
+      const hintHash = crypto.createHash('sha256').update(prefixBytes).digest();
 
-      // The bound hash must NOT be the printable 63-char raw key or public prefix
-      expect(boundHash.toString()).not.toBe(material.rawKey);
-      expect(boundHash.toString()).not.toBe(material.publicPrefix);
-      expect(boundHash.toString()).not.toBe(material.keyPrefix);
+      expect(capturedVerifier!.equals(fullKeyHash)).toBe(false);
+      expect(capturedVerifier!.equals(publicPrefixHash)).toBe(false);
+      expect(capturedVerifier!.equals(hintHash)).toBe(false);
+      expect(capturedVerifier!.toString('utf8')).not.toContain(deterministicRawKey);
+      expect(capturedVerifier!.toString('utf8')).not.toContain(publicPrefix);
+
+      // 8. Assert best-effort zeroization of mutable original buffer after query completes
+      expect(boundBufferRef).not.toBeNull();
+      expect(boundBufferRef!.every((byte) => byte === 0)).toBe(true);
     });
 
     it('rejects keys with wrong length (not exactly 63 characters)', async () => {
@@ -316,6 +364,21 @@ describe('VirtualKeyAuthenticatorService Unit Suite (SW-1.6.2)', () => {
   });
 
   describe('4. PostgreSQL Lookup & Result Handling', () => {
+    it('permits valid authentication when revoked_at is explicit null (VK-AUTH-01)', async () => {
+      const pool = createMockPool([{ ...validDbRow, revoked_at: null }]);
+      const service = new VirtualKeyAuthenticatorService({
+        pool,
+        rateLimiter: createMockRateLimiter(),
+      });
+
+      const material = generateKeyMaterial();
+      const res = await service.authenticateKey(material.rawKey, VALID_CLIENT_IP);
+
+      expect(res.valid).toBe(true);
+      expect(res.principal).toBeDefined();
+      expect(res.principal?.keyId).toBe(TEST_KEY_ID);
+    });
+
     it('returns valid: false (KEY_NOT_FOUND) when zero rows returned', async () => {
       const pool = createMockPool([]);
       const service = new VirtualKeyAuthenticatorService({
@@ -331,10 +394,29 @@ describe('VirtualKeyAuthenticatorService Unit Suite (SW-1.6.2)', () => {
       expect(res.principal).toBeUndefined();
     });
 
-    it('returns valid: false (KEY_REVOKED) when key has non-null revoked_at', async () => {
+    it('returns valid: false (KEY_REVOKED) when key has valid Date revoked_at (VK-AUTH-01)', async () => {
       const revokedRow = {
         ...validDbRow,
         revoked_at: new Date('2026-11-20T12:00:00Z'),
+      };
+      const pool = createMockPool([revokedRow]);
+      const service = new VirtualKeyAuthenticatorService({
+        pool,
+        rateLimiter: createMockRateLimiter(),
+      });
+
+      const material = generateKeyMaterial();
+      const res = await service.authenticateKey(material.rawKey, VALID_CLIENT_IP);
+
+      expect(res.valid).toBe(false);
+      expect(res.reason).toBe('KEY_REVOKED');
+      expect(res.principal).toBeUndefined();
+    });
+
+    it('returns valid: false (KEY_REVOKED) when key has valid ISO timestamp string revoked_at (VK-AUTH-01)', async () => {
+      const revokedRow = {
+        ...validDbRow,
+        revoked_at: '2026-11-20T12:00:00.000Z',
       };
       const pool = createMockPool([revokedRow]);
       const service = new VirtualKeyAuthenticatorService({
@@ -395,6 +477,30 @@ describe('VirtualKeyAuthenticatorService Unit Suite (SW-1.6.2)', () => {
       ['malformed id (not UUID)', { ...validDbRow, id: 'not-a-uuid' }],
       ['missing org_id', { ...validDbRow, org_id: null }],
       ['malformed org_id (not UUID)', { ...validDbRow, org_id: 'bad-org' }],
+      [
+        'missing revoked_at property (VK-AUTH-01)',
+        (() => {
+          const rowCopy = { ...validDbRow };
+          delete (rowCopy as Record<string, unknown>).revoked_at;
+          return rowCopy;
+        })(),
+      ],
+      ['explicit undefined revoked_at (VK-AUTH-01)', { ...validDbRow, revoked_at: undefined }],
+      [
+        'unsupported number type for revoked_at (VK-AUTH-01)',
+        { ...validDbRow, revoked_at: 1700000000000 },
+      ],
+      ['unsupported boolean type for revoked_at (VK-AUTH-01)', { ...validDbRow, revoked_at: true }],
+      [
+        'unsupported plain object type for revoked_at (VK-AUTH-01)',
+        { ...validDbRow, revoked_at: {} },
+      ],
+      ['unsupported array type for revoked_at (VK-AUTH-01)', { ...validDbRow, revoked_at: [] }],
+      ['invalid Date for revoked_at (VK-AUTH-01)', { ...validDbRow, revoked_at: new Date(NaN) }],
+      [
+        'malformed string for revoked_at (VK-AUTH-01)',
+        { ...validDbRow, revoked_at: 'not-a-timestamp' },
+      ],
       ['null allowed_models', { ...validDbRow, allowed_models: null }],
       ['non-array allowed_models', { ...validDbRow, allowed_models: 'not-an-array' }],
       ['array with non-string allowed_models', { ...validDbRow, allowed_models: [123] }],
@@ -418,11 +524,31 @@ describe('VirtualKeyAuthenticatorService Unit Suite (SW-1.6.2)', () => {
       await expect(service.authenticateKey(material.rawKey, VALID_CLIENT_IP)).rejects.toThrow(
         VirtualKeyAuthError,
       );
+      let capturedResult: unknown = null;
       try {
-        await service.authenticateKey(material.rawKey, VALID_CLIENT_IP);
+        capturedResult = await service.authenticateKey(material.rawKey, VALID_CLIENT_IP);
       } catch (err) {
         expect((err as VirtualKeyAuthError).reason).toBe('INTEGRITY_ERROR');
       }
+      expect(capturedResult).toBeNull();
+    });
+
+    it('corrupted lookup result never constructs a principal (VK-AUTH-01)', async () => {
+      const corruptedRow = { ...validDbRow, revoked_at: undefined };
+      const pool = createMockPool([corruptedRow]);
+      const service = new VirtualKeyAuthenticatorService({
+        pool,
+        rateLimiter: createMockRateLimiter(),
+      });
+
+      const material = generateKeyMaterial();
+      let capturedResult: VirtualKeyVerificationResult | null = null;
+      try {
+        capturedResult = await service.authenticateKey(material.rawKey, VALID_CLIENT_IP);
+      } catch (err) {
+        expect((err as VirtualKeyAuthError).reason).toBe('INTEGRITY_ERROR');
+      }
+      expect(capturedResult).toBeNull();
     });
   });
 

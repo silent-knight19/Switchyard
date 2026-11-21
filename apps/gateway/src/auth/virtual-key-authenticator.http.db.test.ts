@@ -3,7 +3,7 @@ import fastify, { type FastifyInstance } from 'fastify';
 import { Redis } from 'ioredis';
 import pg from 'pg';
 import pino from 'pino';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { runMigrations } from '../db/migrate.js';
 import {
   bootstrapDatabase,
@@ -428,6 +428,55 @@ describe('SW-1.6.2: Real HTTP Virtual Key Authentication Suite (Section 10 D & E
       });
       expect(getInferenceCount()).toBe(0);
       await deadPool.end().catch(() => undefined);
+    });
+
+    it('Corrupted database row (missing or malformed revoked_at) produces generic HTTP 503 and zero handler executions (VK-AUTH-01)', async () => {
+      const corruptedPool = {
+        query: vi.fn().mockResolvedValue({
+          rows: [
+            {
+              id: '11111111-1111-4111-8111-111111111111',
+              org_id: ORG_A_ID,
+              revoked_at: 'not-a-valid-timestamp',
+              allowed_models: [],
+              rpm_limit: 1,
+              tpm_limit: 1,
+              concurrent_stream_limit: 1,
+              exact_cache_enabled: false,
+              semantic_cache_enabled: false,
+              pii_redaction_enabled: true,
+              store_payloads: false,
+            },
+          ],
+        }),
+      } as unknown as pg.Pool;
+
+      const corruptedAuth = new VirtualKeyAuthenticatorService({
+        pool: corruptedPool,
+        rateLimiter: vkRateLimiter,
+      });
+
+      const { app, getInferenceCount } = createTestApp(corruptedAuth);
+      const key = await issuanceService.createKey({
+        orgId: ORG_A_ID,
+        name: 'Corrupt Row Test Key',
+      });
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/v1/test-inference',
+        headers: {
+          authorization: `Bearer ${key.rawKey}`,
+        },
+      });
+
+      expect(res.statusCode).toBe(503);
+      expect(res.json()).toEqual({
+        statusCode: 503,
+        error: 'Service Unavailable',
+        message: 'Authentication service unavailable',
+      });
+      expect(getInferenceCount()).toBe(0);
     });
   });
 
