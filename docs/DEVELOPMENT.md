@@ -462,8 +462,18 @@ Migration `0011-session-tenant-lookup.sql` introduces an authorized, narrowly sc
   - **Initial Deny-All Policy:** New keys default to `allowed_models = '{}'` (empty array), `rpm_limit = 1`, `tpm_limit = 1`, `concurrent_stream_limit = 1` (satisfying migration `0005`'s NOT NULL and positive checks), `exact_cache = false`, `semantic_cache = false`, `pii_redaction = true`, `store_payloads = false`, `revoked_at = NULL`.
   - **Bounded Collision Recovery (VK-02):** At most 3 attempts for qualifying unique constraint violations (`virtual_keys_key_hash_key`, `virtual_keys_pkey`, `virtual_keys_id_org_id_key`); missing or unrecognized constraint names and non-collision database errors fail closed immediately without retry.
 
+- **Virtual API Key Authentication & Hash Lookup (SW-1.6.2):**
+  - **Authenticator Service (`VirtualKeyAuthenticatorService`):** Implements `VirtualKeyAuthenticator`, validates keys via `parseRawKey()`, decodes 32-byte secret, derives SHA-256 verifier, and invokes `app_private.lookup_virtual_key_by_hash($1::bytea)` with parameter binding.
+  - **Per-IP Abuse Rate Limiting (`VirtualKeyRateLimiter`):** Redis-backed atomic fixed-window counter under key `auth:ratelimit:vk:ip:<ip>` (30 attempts / 15-minute window), enforced before PostgreSQL lookup on every bearer authentication attempt.
+  - **Restricted Database Lookup:** Resolves identity and policy via `app_private.lookup_virtual_key_by_hash(BYTEA)` (owned by `gateway_auth_executor`, SECURITY DEFINER, granted strictly to `gateway_app`).
+  - **Uniform HTTP 401 Responses:** Exact status 401 and response body `{ "statusCode": 401, "error": "Unauthorized", "message": "Authentication required" }` for all invalid, missing, malformed, noncanonical, unknown, or revoked credentials and credential crossovers.
+  - **Fail-Closed Reliability:** Yields generic 429 on abuse rate limiting and generic 503 on database or Redis outages and corrupted policy rows.
+  - **Principal Immutability & Privacy:** Attaches frozen `VirtualKeyPrincipal` with typed `VirtualKeyPolicy` to `req.principal`. Excludes all secret material, raw keys, verifiers, and headers.
+  - **Phase 2 Admission Requirement:** Initial authentication lookup resolves pre-tenant identity only. It does not replace the Phase 2 requirement to execute durable row-locking and re-checking inside attempt admission.
+
 #### 7.7.9 Known limitations (Phase 2)
 
+- Virtual API key authentication resolves identity and policy at request entry; keys revoked after initial authentication must be caught and rejected by durable row-locking inside Phase 2 provider-attempt admission.
 - `gateway_startup` may update `gateway_epoch` but not `updated_at`; the §12.1 column grant is
   literal, so epoch bumps leave `updated_at` stale. A trigger or a widened grant is a Phase 2
   decision, not a Batch A deviation.
