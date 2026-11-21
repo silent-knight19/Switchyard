@@ -471,6 +471,18 @@ Migration `0011-session-tenant-lookup.sql` introduces an authorized, narrowly sc
   - **Principal Immutability & Privacy:** Attaches frozen `VirtualKeyPrincipal` with typed `VirtualKeyPolicy` to `req.principal`. Excludes all secret material, raw keys, verifiers, and headers.
   - **Phase 2 Admission Requirement:** Initial authentication lookup resolves pre-tenant identity only. It does not replace the Phase 2 requirement to execute durable row-locking and re-checking inside attempt admission.
 
+- **Admin-Only Virtual API Key Management & Policy Administration (SW-1.6.3):**
+  - **Management Service (`VirtualKeyManagementService`):** Tenant-scoped creation, metadata listing with microsecond-precision keyset pagination, atomic policy replacement, and idempotent permanent revocation.
+  - **Admin-Only Authorization & Origin/CSRF Guards:** Endpoints (`/api/keys`) restricted to browser sessions with `admin` role, enforcing canonical Origin and cryptographically verified CSRF tokens.
+  - **One-Time Plaintext Disclosure:** Raw key disclosed strictly once on `POST /api/keys` response under `Cache-Control: no-store` and `Pragma: no-cache`.
+
+- **Virtual Key Revocation, Secret Secrecy & Phase 2 Admission Contract (SW-1.6.4):**
+  - **Uniform HTTP 401 Identity:** Exact error equivalence across all 12 negative credential cases with zero protected-handler execution.
+  - **Concurrency Serialization:** Proven row-lock serialization (`SELECT ... FOR UPDATE`) between revocation and simulated provider-attempt admission under PostgreSQL 16.
+  - **Stale Principal Invalidation:** Demonstrated that retention of an authenticated principal cannot bypass admission-time database row rechecks.
+  - **Worker Privilege Containment:** Proved that `gateway_worker` role cannot insert, update, revoke, delete, or invoke pre-tenant hash lookups on virtual keys.
+  - **Phase 2 Admission Seam:** Formally documented handoff in [`docs/architecture/phase2-admission-key-recheck.md`](./architecture/phase2-admission-key-recheck.md) tracking `SW-2.2.3` and Architecture v1.2 §6.3.
+
 #### 7.7.9 Known limitations (Phase 2)
 
 - Virtual API key authentication resolves identity and policy at request entry; keys revoked after initial authentication must be caught and rejected by durable row-locking inside Phase 2 provider-attempt admission.
