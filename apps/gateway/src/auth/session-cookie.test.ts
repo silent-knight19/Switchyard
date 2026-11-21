@@ -87,7 +87,7 @@ describe('SW-1.5.2: Session Cookie & Secret Encoding', () => {
     });
   });
 
-  describe('SessionService Cookie Security & Regression Matrix (AUTH-02, AUTH-07)', () => {
+  describe('SessionService Cookie Security & Regression Matrix (AUTH-02, AUTH-07, AUTH-10)', () => {
     const dummyPool = {} as unknown as pg.Pool;
 
     function assertSecureHostCookie(service: SessionService) {
@@ -142,198 +142,156 @@ describe('SW-1.5.2: Session Cookie & Secret Encoding', () => {
       expect(clearCookie).not.toContain('Domain=');
     }
 
-    // --- Regression Matrix Row 1: Production | None -> Secure "__Host-session" ---
-    it('Matrix Row 1: Production + None options produces secure __Host-session cookie', () => {
-      const service = new SessionService({
-        pool: dummyPool,
-        environment: 'production',
-      });
-      assertSecureHostCookie(service);
-    });
-
-    // --- Regression Matrix Row 2: Production | "secure: true" -> Secure "__Host-session" ---
-    it('Matrix Row 2: Production + { secure: true } produces secure __Host-session cookie', () => {
-      const service = new SessionService({
-        pool: dummyPool,
-        environment: 'production',
-        cookieOptions: { secure: true },
-      });
-      assertSecureHostCookie(service);
-    });
-
-    // --- Regression Matrix Row 3: Production | "secure: false" -> Rejected ---
-    it('Matrix Row 3: Production + { secure: false } is rejected with CONFIGURATION_ERROR', () => {
-      expect(
-        () =>
-          new SessionService({
-            pool: dummyPool,
-            environment: 'production',
-            cookieOptions: { secure: false },
-          }),
-      ).toThrow(SessionError);
-
-      try {
-        new SessionService({
-          pool: dummyPool,
-          environment: 'production',
-          cookieOptions: { secure: false },
-        });
-      } catch (err) {
-        expect(err).toBeInstanceOf(SessionError);
-        expect((err as SessionError).reason).toBe('CONFIGURATION_ERROR');
-        expect((err as SessionError).message).toContain('Insecure session cookies');
-      }
-    });
-
-    // --- Regression Matrix Row 4: Production | "isProduction: false" -> Rejected ---
-    it('Matrix Row 4: Production + { isProduction: false } is rejected with CONFIGURATION_ERROR (AUTH-07 bypass prevented)', () => {
-      expect(
-        () =>
-          new SessionService({
-            pool: dummyPool,
-            environment: 'production',
-            cookieOptions: { isProduction: false },
-          }),
-      ).toThrow(SessionError);
-
-      try {
-        new SessionService({
-          pool: dummyPool,
-          environment: 'production',
-          cookieOptions: { isProduction: false },
-        });
-      } catch (err) {
-        expect(err).toBeInstanceOf(SessionError);
-        expect((err as SessionError).reason).toBe('CONFIGURATION_ERROR');
-        expect((err as SessionError).message).toContain(
-          'Production environment cannot be overridden with isProduction: false',
-        );
-      }
-    });
-
-    // --- Regression Matrix Row 5: Production | "isProduction: false, secure: false" -> Rejected ---
-    it('Matrix Row 5: Production + { isProduction: false, secure: false } is rejected with CONFIGURATION_ERROR (AUTH-07)', () => {
-      expect(
-        () =>
-          new SessionService({
-            pool: dummyPool,
-            environment: 'production',
-            cookieOptions: { isProduction: false, secure: false },
-          }),
-      ).toThrow(SessionError);
-
-      try {
-        new SessionService({
-          pool: dummyPool,
-          environment: 'production',
-          cookieOptions: { isProduction: false, secure: false },
-        });
-      } catch (err) {
-        expect(err).toBeInstanceOf(SessionError);
-        expect((err as SessionError).reason).toBe('CONFIGURATION_ERROR');
-      }
-    });
-
-    // --- Regression Matrix Row 6: Production | Custom cookie name -> Rejected ---
-    it('Matrix Row 6: Production + custom cookieName is rejected with CONFIGURATION_ERROR', () => {
-      expect(
-        () =>
-          new SessionService({
-            pool: dummyPool,
-            environment: 'production',
-            cookieOptions: { cookieName: 'custom_cookie' },
-          }),
-      ).toThrow(SessionError);
-
-      try {
-        new SessionService({
-          pool: dummyPool,
-          environment: 'production',
-          cookieOptions: { cookieName: 'custom_cookie' },
-        });
-      } catch (err) {
-        expect(err).toBeInstanceOf(SessionError);
-        expect((err as SessionError).reason).toBe('CONFIGURATION_ERROR');
-        expect((err as SessionError).message).toContain('must use the "__Host-session" name');
-      }
-    });
-
-    // --- Regression Matrix Row 7: Development | Explicit HTTP-loopback configuration -> Approved development cookie ---
-    it('Matrix Row 7: Development + explicit HTTP-loopback configuration produces approved development cookie', () => {
-      const service = new SessionService({
-        pool: dummyPool,
-        environment: 'development',
-        cookieOptions: { secure: false },
-      });
-      assertApprovedDevCookie(service);
-    });
-
-    // --- Regression Matrix Row 8: Development | Secure cookie configuration -> Secure cookie ---
-    it('Matrix Row 8: Development + secure cookie configuration produces secure cookie', () => {
-      const service = new SessionService({
-        pool: dummyPool,
-        environment: 'development',
-        cookieOptions: { secure: true },
-      });
-      assertSecureHostCookie(service);
-    });
-
-    // --- Regression Matrix Row 9: Test | Explicit test configuration -> Isolated test behavior ---
-    it('Matrix Row 9: Test + explicit test configuration produces isolated test behavior', () => {
-      const service = new SessionService({
-        pool: dummyPool,
-        environment: 'test',
-        cookieOptions: { cookieName: 'custom_test_session', secure: false },
-      });
-
-      expect(service.getCookieName()).toBe('custom_test_session');
-      const created = service.createSessionCookie('test-token');
-      expect(created.startsWith('custom_test_session=test-token')).toBe(true);
-      expect(created).toContain('Path=/');
-      expect(created).toContain('HttpOnly');
-      expect(created).toContain('SameSite=Lax');
-      expect(created).not.toContain('Secure');
-
-      const cleared = service.createClearSessionCookie();
-      expect(cleared.startsWith('custom_test_session=')).toBe(true);
-      expect(cleared).toContain('Max-Age=0');
-      expect(cleared).not.toContain('Secure');
-    });
-
-    // --- Ambient Environment Protection & GatewayConfig Contract Tests ---
-    it('ambient process.env[NODE_ENV]=production cannot be downgraded through constructor options (AUTH-07)', () => {
-      const originalEnv = process.env['NODE_ENV'];
+    // 1. Ambient production with no overrides
+    it('1. Ambient production with no overrides produces secure __Host-session cookie', () => {
+      const origEnv = process.env['NODE_ENV'];
       try {
         process.env['NODE_ENV'] = 'production';
-
-        // Attempting to downgrade via cookieOptions in production process.env fails closed
-        expect(
-          () =>
-            new SessionService({
-              pool: dummyPool,
-              cookieOptions: { isProduction: false, secure: false },
-            }),
-        ).toThrow(SessionError);
-
-        // Attempting custom cookie name fails closed
-        expect(
-          () =>
-            new SessionService({
-              pool: dummyPool,
-              cookieOptions: { cookieName: 'insecure_app_cookie' },
-            }),
-        ).toThrow(SessionError);
-
-        // Unadorned construction in production ambient env defaults to secure __Host-session
-        const defaultProdService = new SessionService({ pool: dummyPool });
-        assertSecureHostCookie(defaultProdService);
+        const service = new SessionService({ pool: dummyPool });
+        assertSecureHostCookie(service);
       } finally {
-        process.env['NODE_ENV'] = originalEnv;
+        process.env['NODE_ENV'] = origEnv;
       }
     });
 
-    it('validated GatewayConfig for production cannot be downgraded by caller options', () => {
-      const prodGatewayConfig = {
+    // 2. Ambient production + environment: 'development' (AUTH-10 downgrade prevention)
+    it('2. Ambient production + environment: "development" is rejected with CONFIGURATION_ERROR', () => {
+      const origEnv = process.env['NODE_ENV'];
+      try {
+        process.env['NODE_ENV'] = 'production';
+        expect(
+          () =>
+            new SessionService({
+              pool: dummyPool,
+              environment: 'development',
+              cookieOptions: { secure: false },
+            }),
+        ).toThrow(SessionError);
+
+        try {
+          new SessionService({
+            pool: dummyPool,
+            environment: 'development',
+            cookieOptions: { secure: false },
+          });
+        } catch (err) {
+          expect(err).toBeInstanceOf(SessionError);
+          expect((err as SessionError).reason).toBe('CONFIGURATION_ERROR');
+          expect((err as SessionError).message).toContain(
+            'Cannot downgrade production runtime to "development"',
+          );
+        }
+      } finally {
+        process.env['NODE_ENV'] = origEnv;
+      }
+    });
+
+    // 3. Ambient production + environment: 'test'
+    it('3. Ambient production + environment: "test" is rejected with CONFIGURATION_ERROR', () => {
+      const origEnv = process.env['NODE_ENV'];
+      try {
+        process.env['NODE_ENV'] = 'production';
+        expect(
+          () =>
+            new SessionService({
+              pool: dummyPool,
+              environment: 'test',
+            }),
+        ).toThrow(SessionError);
+      } finally {
+        process.env['NODE_ENV'] = origEnv;
+      }
+    });
+
+    // 4. Ambient production + cookieOptions.isProduction = false
+    it('4. Ambient production + cookieOptions.isProduction = false is rejected with CONFIGURATION_ERROR', () => {
+      const origEnv = process.env['NODE_ENV'];
+      try {
+        process.env['NODE_ENV'] = 'production';
+        expect(
+          () =>
+            new SessionService({
+              pool: dummyPool,
+              cookieOptions: { isProduction: false },
+            }),
+        ).toThrow(SessionError);
+
+        try {
+          new SessionService({
+            pool: dummyPool,
+            cookieOptions: { isProduction: false },
+          });
+        } catch (err) {
+          expect(err).toBeInstanceOf(SessionError);
+          expect((err as SessionError).reason).toBe('CONFIGURATION_ERROR');
+          expect((err as SessionError).message).toContain(
+            'Production environment cannot be overridden with isProduction: false',
+          );
+        }
+      } finally {
+        process.env['NODE_ENV'] = origEnv;
+      }
+    });
+
+    // 5. Ambient production + cookieOptions.secure = false
+    it('5. Ambient production + cookieOptions.secure = false is rejected with CONFIGURATION_ERROR', () => {
+      const origEnv = process.env['NODE_ENV'];
+      try {
+        process.env['NODE_ENV'] = 'production';
+        expect(
+          () =>
+            new SessionService({
+              pool: dummyPool,
+              cookieOptions: { secure: false },
+            }),
+        ).toThrow(SessionError);
+
+        try {
+          new SessionService({
+            pool: dummyPool,
+            cookieOptions: { secure: false },
+          });
+        } catch (err) {
+          expect(err).toBeInstanceOf(SessionError);
+          expect((err as SessionError).reason).toBe('CONFIGURATION_ERROR');
+          expect((err as SessionError).message).toContain('Insecure session cookies');
+        }
+      } finally {
+        process.env['NODE_ENV'] = origEnv;
+      }
+    });
+
+    // 6. Ambient production + insecure custom cookie name
+    it('6. Ambient production + insecure custom cookie name is rejected with CONFIGURATION_ERROR', () => {
+      const origEnv = process.env['NODE_ENV'];
+      try {
+        process.env['NODE_ENV'] = 'production';
+        expect(
+          () =>
+            new SessionService({
+              pool: dummyPool,
+              cookieOptions: { cookieName: 'insecure_cookie' },
+            }),
+        ).toThrow(SessionError);
+
+        try {
+          new SessionService({
+            pool: dummyPool,
+            cookieOptions: { cookieName: 'insecure_cookie' },
+          });
+        } catch (err) {
+          expect(err).toBeInstanceOf(SessionError);
+          expect((err as SessionError).reason).toBe('CONFIGURATION_ERROR');
+          expect((err as SessionError).message).toContain('must use the "__Host-session" name');
+        }
+      } finally {
+        process.env['NODE_ENV'] = origEnv;
+      }
+    });
+
+    // 7. Validated production config + explicit development environment
+    it('7. Validated production config + explicit development environment is rejected with CONFIGURATION_ERROR', () => {
+      const prodConfig = {
         NODE_ENV: 'production',
         PORT: 3000,
         HOST: '127.0.0.1',
@@ -341,11 +299,11 @@ describe('SW-1.5.2: Session Cookie & Secret Encoding', () => {
         POSTGRES_PORT: 5432,
         POSTGRES_DB: 'switchyard',
         POSTGRES_USER: 'gateway_app',
-        POSTGRES_PASSWORD: 'real_production_password',
+        POSTGRES_PASSWORD: 'prod_password',
         REDIS_HOST: '127.0.0.1',
         REDIS_PORT: 6379,
         REDIS_USER: 'switchyard_app',
-        REDIS_PASSWORD: 'real_production_password',
+        REDIS_PASSWORD: 'prod_password',
         REDIS_MAXMEMORY_POLICY: 'noeviction',
         REDIS_TLS: false,
         COOKIE_SECURE: true,
@@ -358,30 +316,230 @@ describe('SW-1.5.2: Session Cookie & Secret Encoding', () => {
         () =>
           new SessionService({
             pool: dummyPool,
-            config: prodGatewayConfig,
-            cookieOptions: { isProduction: false, secure: false },
+            config: prodConfig,
+            environment: 'development',
           }),
       ).toThrow(SessionError);
 
-      const validService = new SessionService({
-        pool: dummyPool,
-        config: prodGatewayConfig,
-      });
-      assertSecureHostCookie(validService);
+      try {
+        new SessionService({
+          pool: dummyPool,
+          config: prodConfig,
+          environment: 'development',
+        });
+      } catch (err) {
+        expect(err).toBeInstanceOf(SessionError);
+        expect((err as SessionError).reason).toBe('CONFIGURATION_ERROR');
+        expect((err as SessionError).message).toContain('Conflicting environment configuration');
+      }
     });
 
-    it('development fails closed if __Host- prefix is used with secure: false', () => {
+    // 8. Validated production config + insecure cookie options
+    it('8. Validated production config + insecure cookie options is rejected with CONFIGURATION_ERROR', () => {
+      const prodConfig = {
+        NODE_ENV: 'production',
+        PORT: 3000,
+        HOST: '127.0.0.1',
+        POSTGRES_HOST: '127.0.0.1',
+        POSTGRES_PORT: 5432,
+        POSTGRES_DB: 'switchyard',
+        POSTGRES_USER: 'gateway_app',
+        POSTGRES_PASSWORD: 'prod_password',
+        REDIS_HOST: '127.0.0.1',
+        REDIS_PORT: 6379,
+        REDIS_USER: 'switchyard_app',
+        REDIS_PASSWORD: 'prod_password',
+        REDIS_MAXMEMORY_POLICY: 'noeviction',
+        REDIS_TLS: false,
+        COOKIE_SECURE: true,
+        TLS_VERIFY: true,
+        MOCK_PROVIDER_ENABLED: false,
+        DEMO_SEEDING_ENABLED: false,
+      } as const;
+
       expect(
         () =>
           new SessionService({
             pool: dummyPool,
-            environment: 'development',
-            cookieOptions: { cookieName: '__Host-dev', secure: false },
+            config: prodConfig,
+            cookieOptions: { secure: false },
+          }),
+      ).toThrow(SessionError);
+
+      expect(
+        () =>
+          new SessionService({
+            pool: dummyPool,
+            config: prodConfig,
+            cookieOptions: { isProduction: false },
           }),
       ).toThrow(SessionError);
     });
 
-    it('session cookie and clear-cookie use consistent names and required attributes', () => {
+    // 9. Conflicting validated config and environment overrides
+    it('9. Conflicting validated config and environment overrides fails closed', () => {
+      const devConfig = {
+        NODE_ENV: 'development',
+        PORT: 3000,
+        HOST: '127.0.0.1',
+        POSTGRES_HOST: '127.0.0.1',
+        POSTGRES_PORT: 5432,
+        POSTGRES_DB: 'switchyard',
+        POSTGRES_USER: 'gateway_app',
+        POSTGRES_PASSWORD: 'dev_password',
+        REDIS_HOST: '127.0.0.1',
+        REDIS_PORT: 6379,
+        REDIS_USER: 'switchyard_app',
+        REDIS_PASSWORD: 'dev_password',
+        REDIS_MAXMEMORY_POLICY: 'noeviction',
+        REDIS_TLS: false,
+        COOKIE_SECURE: false,
+        TLS_VERIFY: true,
+        MOCK_PROVIDER_ENABLED: false,
+        DEMO_SEEDING_ENABLED: false,
+      } as const;
+
+      expect(
+        () =>
+          new SessionService({
+            pool: dummyPool,
+            config: devConfig,
+            environment: 'test',
+          }),
+      ).toThrow(SessionError);
+    });
+
+    // 10. Production config with ambient test environment, confirming production protections remain enforced
+    it('10. Production config with ambient test environment enforces production protections', () => {
+      const origEnv = process.env['NODE_ENV'];
+      try {
+        process.env['NODE_ENV'] = 'test';
+        const prodConfig = {
+          NODE_ENV: 'production',
+          PORT: 3000,
+          HOST: '127.0.0.1',
+          POSTGRES_HOST: '127.0.0.1',
+          POSTGRES_PORT: 5432,
+          POSTGRES_DB: 'switchyard',
+          POSTGRES_USER: 'gateway_app',
+          POSTGRES_PASSWORD: 'prod_password',
+          REDIS_HOST: '127.0.0.1',
+          REDIS_PORT: 6379,
+          REDIS_USER: 'switchyard_app',
+          REDIS_PASSWORD: 'prod_password',
+          REDIS_MAXMEMORY_POLICY: 'noeviction',
+          REDIS_TLS: false,
+          COOKIE_SECURE: true,
+          TLS_VERIFY: true,
+          MOCK_PROVIDER_ENABLED: false,
+          DEMO_SEEDING_ENABLED: false,
+        } as const;
+
+        // Default construction with prodConfig produces secure __Host-session
+        const service = new SessionService({
+          pool: dummyPool,
+          config: prodConfig,
+        });
+        assertSecureHostCookie(service);
+
+        // Attempting insecure options fails closed
+        expect(
+          () =>
+            new SessionService({
+              pool: dummyPool,
+              config: prodConfig,
+              cookieOptions: { secure: false },
+            }),
+        ).toThrow(SessionError);
+      } finally {
+        process.env['NODE_ENV'] = origEnv;
+      }
+    });
+
+    // 11. Development HTTP-loopback behavior
+    it('11. Development HTTP-loopback behavior produces approved unencrypted cookie', () => {
+      const service = new SessionService({
+        pool: dummyPool,
+        environment: 'development',
+        cookieOptions: { secure: false },
+      });
+      assertApprovedDevCookie(service);
+    });
+
+    // 12. Development with explicitly secure cookies
+    it('12. Development with explicitly secure cookies produces secure __Host-session cookie', () => {
+      const service = new SessionService({
+        pool: dummyPool,
+        environment: 'development',
+        cookieOptions: { secure: true },
+      });
+      assertSecureHostCookie(service);
+    });
+
+    // 13. Test environment with isolated configuration
+    it('13. Test environment with isolated configuration allows isolated test behavior', () => {
+      const service = new SessionService({
+        pool: dummyPool,
+        environment: 'test',
+        cookieOptions: { cookieName: 'custom_test_cookie', secure: false },
+      });
+
+      expect(service.getCookieName()).toBe('custom_test_cookie');
+      const sessionCookie = service.createSessionCookie('test-token');
+      expect(sessionCookie.startsWith('custom_test_cookie=test-token')).toBe(true);
+      expect(sessionCookie).toContain('Path=/');
+      expect(sessionCookie).toContain('HttpOnly');
+      expect(sessionCookie).toContain('SameSite=Lax');
+      expect(sessionCookie).not.toContain('Secure');
+
+      const clearCookie = service.createClearSessionCookie();
+      expect(clearCookie.startsWith('custom_test_cookie=')).toBe(true);
+      expect(clearCookie).toContain('Max-Age=0');
+      expect(clearCookie).not.toContain('Secure');
+    });
+
+    // 14. Unknown/invalid environment configuration
+    it('14. Unknown/invalid environment configuration fails closed with CONFIGURATION_ERROR', () => {
+      expect(
+        () =>
+          new SessionService({
+            pool: dummyPool,
+            environment: 'staging' as unknown as 'development',
+          }),
+      ).toThrow(SessionError);
+
+      expect(
+        () =>
+          new SessionService({
+            pool: dummyPool,
+            environment: 'unknown' as unknown as 'development',
+          }),
+      ).toThrow(SessionError);
+
+      expect(
+        () =>
+          new SessionService({
+            pool: dummyPool,
+            environment: '' as unknown as 'development',
+          }),
+      ).toThrow(SessionError);
+
+      const origEnv = process.env['NODE_ENV'];
+      try {
+        process.env['NODE_ENV'] = 'invalid_env';
+        expect(
+          () =>
+            new SessionService({
+              pool: dummyPool,
+            }),
+        ).toThrow(SessionError);
+      } finally {
+        process.env['NODE_ENV'] = origEnv;
+      }
+    });
+
+    // 15. Cookie issuance and clearing consistency
+    it('15. Cookie issuance and clearing consistency: same name and required security attributes', () => {
       const service = new SessionService({
         pool: dummyPool,
         environment: 'production',
@@ -402,12 +560,25 @@ describe('SW-1.5.2: Session Cookie & Secret Encoding', () => {
 
       expect(clearCookie).toContain('Max-Age=0');
       expect(clearCookie).toContain('Expires=Thu, 01 Jan 1970 00:00:00 GMT');
+      expect(sessionCookie).not.toContain('Domain=');
+      expect(clearCookie).not.toContain('Domain=');
+    });
+
+    it('development fails closed if __Host- prefix is used with secure: false', () => {
+      expect(
+        () =>
+          new SessionService({
+            pool: dummyPool,
+            environment: 'development',
+            cookieOptions: { cookieName: '__Host-dev', secure: false },
+          }),
+      ).toThrow(SessionError);
     });
 
     it('extracts session secret from Cookie header string', () => {
       const service = new SessionService({
         pool: dummyPool,
-        cookieOptions: { isProduction: true },
+        environment: 'production',
       });
 
       const cookieHeader =
@@ -419,7 +590,7 @@ describe('SW-1.5.2: Session Cookie & Secret Encoding', () => {
     it('returns null if session cookie is absent from Cookie header', () => {
       const service = new SessionService({
         pool: dummyPool,
-        cookieOptions: { isProduction: true },
+        environment: 'production',
       });
 
       expect(service.extractSessionSecretFromCookieHeader('theme=dark; other=1')).toBeNull();

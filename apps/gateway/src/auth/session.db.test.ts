@@ -28,47 +28,69 @@ describe('SW-1.5.2: Server-Side Web Sessions PostgreSQL 16 Integration Suite', (
   const USER_A_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
   const USER_B_ID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 
+  interface CausalLockEvidence {
+    validatorPid: number;
+    lockerPid: number;
+    datname: string;
+    waitEventType: string;
+    waitEvent: string;
+    query: string;
+    blockingPids: number[];
+  }
+
   /**
-   * Positively establishes via PostgreSQL lock manager that a transaction
-   * has entered a blocked waiting state on an ungranted lock (AUTH-08).
+   * Positively establishes via PostgreSQL lock manager that the specific validator backend
+   * is blocked by the specific controlled locker backend on the session validation query (AUTH-11).
    */
-  async function waitForBlockedLock(
+  async function waitForAttributedLock(
     admin: pg.Client,
+    validatorPid: number,
+    lockerPid: number,
+    expectedDbName: string,
     timeoutMs = 5000,
-  ): Promise<{ pid: number; locktype: string; mode: string; waitEventType: string }> {
+  ): Promise<CausalLockEvidence> {
     const startTime = Date.now();
     while (Date.now() - startTime < timeoutMs) {
       const res = await admin.query<{
-        pid: number;
-        locktype: string;
-        mode: string;
+        validator_pid: number;
+        datname: string;
         wait_event_type: string;
         wait_event: string;
+        query: string;
+        blocking_pids: number[];
       }>(
         `SELECT
-          l.pid,
-          l.locktype,
-          l.mode,
+          a.pid AS validator_pid,
+          a.datname,
           a.wait_event_type,
-          a.wait_event
-        FROM pg_locks l
-        JOIN pg_stat_activity a ON a.pid = l.pid
-        WHERE NOT l.granted
-          AND a.pid != pg_backend_pid()
-        LIMIT 1;`,
+          a.wait_event,
+          a.query,
+          pg_blocking_pids(a.pid) AS blocking_pids
+        FROM pg_stat_activity a
+        WHERE a.pid = $1
+          AND a.datname = $2
+          AND a.wait_event_type = 'Lock'
+          AND a.query LIKE '%web_sessions%FOR UPDATE OF ws%'
+          AND $3 = ANY(pg_blocking_pids(a.pid));`,
+        [validatorPid, expectedDbName, lockerPid],
       );
+
       if (res.rows.length > 0 && res.rows[0]) {
+        const row = res.rows[0];
         return {
-          pid: res.rows[0].pid,
-          locktype: res.rows[0].locktype,
-          mode: res.rows[0].mode,
-          waitEventType: res.rows[0].wait_event_type,
+          validatorPid: row.validator_pid,
+          lockerPid,
+          datname: row.datname,
+          waitEventType: row.wait_event_type,
+          waitEvent: row.wait_event,
+          query: row.query,
+          blockingPids: row.blocking_pids,
         };
       }
       await new Promise((r) => setTimeout(r, 10));
     }
     throw new Error(
-      `Timeout after ${timeoutMs}ms waiting for PostgreSQL transaction to reach lock wait state`,
+      `Timeout after ${timeoutMs}ms waiting for validator PID ${validatorPid} to be blocked by locker PID ${lockerPid} on session validation in database "${expectedDbName}"`,
     );
   }
 
@@ -471,14 +493,47 @@ describe('SW-1.5.2: Server-Side Web Sessions PostgreSQL 16 Integration Suite', (
       const err = (rejected[0] as PromiseRejectedResult).reason;
       expect(err).toBeInstanceOf(SessionError);
       expect((err as SessionError).reason).toBe('SESSION_REVOKED');
+
+      // Old token cannot authenticate
+      const oldCheck = await sessionService.resolveAndValidateSession(oldSecret);
+      expect(oldCheck.valid).toBe(false);
+      expect(oldCheck.reason).toBe('SESSION_REVOKED');
+
+      // Winning new token remains valid
+      const winning = (fulfilled[0] as PromiseFulfilledResult<{ newSecret: string }>).value;
+      const newCheck = await sessionService.resolveAndValidateSession(winning.newSecret);
+      expect(newCheck.valid).toBe(true);
+      expect(newCheck.user?.id).toBe(USER_A_ID);
     });
 
-    it('deterministic Ordering A — Revocation first: controlled lock establishes wait state, revocation commits, validation fails with SESSION_REVOKED (AUTH-08)', async () => {
+    it('deterministic Ordering A — Revocation first: controlled lock establishes wait state with verified PID attribution, revocation commits, validation fails with SESSION_REVOKED (AUTH-11)', async () => {
       // 1. Create session
       const { secret, session } = await sessionService.createSession(ORG_A_ID, USER_A_ID);
 
-      // 2. Acquire a controlled database lock
+      // Dedicated isolated pool for the validator operation (AUTH-11)
+      const validatorPool = new pg.Pool({
+        connectionString: roleConnectionString(db.url, 'gateway_app', passwords.gateway_app),
+        max: 1,
+      });
+
+      // Obtain exact backend PID of the dedicated validator connection
+      const valProbe = await validatorPool.connect();
+      const valPidRes = await valProbe.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+      const validatorPid = valPidRes.rows[0]?.pid;
+      if (!validatorPid) throw new Error('Failed to obtain validator backend PID');
+      valProbe.release();
+
+      const validatorService = new SessionService({
+        pool: validatorPool,
+        cookieOptions: { isProduction: true },
+      });
+
+      // 2. Acquire a controlled database lock and capture locker PID
       const client1 = await appPool.connect();
+      const lockerPidRes = await client1.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+      const lockerPid = lockerPidRes.rows[0]?.pid;
+      if (!lockerPid) throw new Error('Failed to obtain locker backend PID');
+
       let committed = false;
       try {
         await client1.query('BEGIN');
@@ -488,14 +543,23 @@ describe('SW-1.5.2: Server-Side Web Sessions PostgreSQL 16 Integration Suite', (
           session.sessionIdHash,
         ]);
 
-        // 3. Start validation (blocks on FOR UPDATE of ws)
-        const validationPromise = sessionService.resolveAndValidateSession(secret);
+        // 3. Start validation (blocks on FOR UPDATE of ws using validatorPool)
+        const validationPromise = validatorService.resolveAndValidateSession(secret);
 
-        // 4. Positively establish that the validation transaction has reached the intended waiting point
-        // Uses PostgreSQL internal lock manager evidence (pg_locks + pg_stat_activity)
-        const waitEvidence = await waitForBlockedLock(adminClient);
-        expect(waitEvidence.waitEventType).toBe('Lock');
-        expect(waitEvidence.pid).toBeDefined();
+        // 4. Positively establish that validatorPid is waiting, blocked by lockerPid, on session validation in this database
+        const causalEvidence = await waitForAttributedLock(
+          adminClient,
+          validatorPid,
+          lockerPid,
+          db.name,
+          5000,
+        );
+        expect(causalEvidence.validatorPid).toBe(validatorPid);
+        expect(causalEvidence.lockerPid).toBe(lockerPid);
+        expect(causalEvidence.datname).toBe(db.name);
+        expect(causalEvidence.waitEventType).toBe('Lock');
+        expect(causalEvidence.blockingPids).toContain(lockerPid);
+        expect(causalEvidence.query).toContain('FOR UPDATE OF ws');
 
         // 5. Revoke session and commit transaction
         await client1.query(
@@ -518,6 +582,7 @@ describe('SW-1.5.2: Server-Side Web Sessions PostgreSQL 16 Integration Suite', (
           }
         }
         client1.release();
+        await validatorPool.end();
       }
     });
 

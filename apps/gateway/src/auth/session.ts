@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import type pg from 'pg';
-import { getConfig, type GatewayConfig } from '../config/index.js';
+import type { GatewayConfig } from '../config/index.js';
 import { type TenantClient, withTenant } from '../db/tenant.js';
 import {
   type AuthenticatedUser,
@@ -80,47 +80,115 @@ export class SessionService {
   constructor(options: SessionServiceOptions) {
     this.pool = options.pool;
 
-    // Resolve authoritative trusted runtime environment (AUTH-07)
-    // Priority:
-    // 1. Explicit validated GatewayConfig passed in options
-    // 2. Explicit environment passed in options
-    // 3. Loaded GatewayConfig singleton (if initialized)
-    // 4. Ambient process.env['NODE_ENV']
-    const trustedEnv: 'development' | 'test' | 'production' = (() => {
-      if (options.config?.NODE_ENV) {
-        return options.config.NODE_ENV;
+    // 1. Validate explicit options.environment if provided
+    const explicitEnv = options.environment;
+    if (explicitEnv !== undefined) {
+      if (explicitEnv !== 'development' && explicitEnv !== 'test' && explicitEnv !== 'production') {
+        throw new SessionError(
+          'CONFIGURATION_ERROR',
+          `Invalid or unknown environment specified in options: "${String(explicitEnv)}"; expected "development", "test", or "production"`,
+        );
       }
-      if (options.environment) {
-        return options.environment;
-      }
-      try {
-        const cfg = getConfig();
-        if (cfg?.NODE_ENV) {
-          return cfg.NODE_ENV;
-        }
-      } catch {
-        // Fall back to process.env if getConfig() is uninitialized or invalid in bare test context
-      }
-      const env = process.env['NODE_ENV'];
-      if (env === 'production') return 'production';
-      if (env === 'test') return 'test';
-      return 'development';
-    })();
+    }
 
-    if (trustedEnv === 'production') {
-      // Production security requirements cannot be downgraded (AUTH-02, AUTH-07)
+    // 2. Validate explicit GatewayConfig if provided
+    const configEnv = options.config?.NODE_ENV;
+    if (configEnv !== undefined) {
+      if (configEnv !== 'development' && configEnv !== 'test' && configEnv !== 'production') {
+        throw new SessionError(
+          'CONFIGURATION_ERROR',
+          `Invalid or unknown environment in GatewayConfig: "${String(configEnv)}"`,
+        );
+      }
+    }
+
+    // Invariant 3: Conflicting authoritative declarations between GatewayConfig and options.environment must fail closed
+    if (explicitEnv !== undefined && configEnv !== undefined && explicitEnv !== configEnv) {
+      throw new SessionError(
+        'CONFIGURATION_ERROR',
+        `Conflicting environment configuration: GatewayConfig declares "${configEnv}" but options.environment specifies "${explicitEnv}"`,
+      );
+    }
+
+    // 3. Inspect ambient runtime environment (process.env.NODE_ENV)
+    const ambientEnv = process.env['NODE_ENV'];
+    if (
+      ambientEnv !== undefined &&
+      ambientEnv !== '' &&
+      ambientEnv !== 'development' &&
+      ambientEnv !== 'test' &&
+      ambientEnv !== 'production'
+    ) {
+      throw new SessionError(
+        'CONFIGURATION_ERROR',
+        `Invalid or unknown ambient NODE_ENV: "${ambientEnv}"; expected "development", "test", or "production"`,
+      );
+    }
+
+    // Invariant 1 & 4: An actual production runtime must NEVER be downgraded by constructor options
+    if (ambientEnv === 'production') {
+      if (explicitEnv !== undefined && explicitEnv !== 'production') {
+        throw new SessionError(
+          'CONFIGURATION_ERROR',
+          `Cannot downgrade production runtime to "${explicitEnv}" via constructor options`,
+        );
+      }
+      if (configEnv !== undefined && configEnv !== 'production') {
+        throw new SessionError(
+          'CONFIGURATION_ERROR',
+          `Cannot downgrade production runtime to "${configEnv}" via GatewayConfig`,
+        );
+      }
+    }
+
+    // Invariant 2: A validated production GatewayConfig must NEVER be downgraded
+    if (configEnv === 'production') {
+      if (explicitEnv !== undefined && explicitEnv !== 'production') {
+        throw new SessionError(
+          'CONFIGURATION_ERROR',
+          `Cannot downgrade production GatewayConfig to "${explicitEnv}" via constructor options`,
+        );
+      }
+    }
+
+    // 4. Resolve effective environment (Invariant 8: no silent fallback to insecure behavior)
+    const effectiveEnv: 'development' | 'test' | 'production' | undefined =
+      configEnv ??
+      explicitEnv ??
+      (ambientEnv === 'production' || ambientEnv === 'test' || ambientEnv === 'development'
+        ? ambientEnv
+        : undefined);
+
+    if (effectiveEnv === undefined) {
+      throw new SessionError(
+        'CONFIGURATION_ERROR',
+        'Cannot determine runtime environment: NODE_ENV is unset and no valid configuration provided',
+      );
+    }
+
+    // Invariant 1, 2, 4, 5: Production requirements are authoritative if effectiveEnv is production,
+    // ambient is production, or options.cookieOptions.isProduction is true.
+    const isProduction =
+      effectiveEnv === 'production' ||
+      ambientEnv === 'production' ||
+      options.cookieOptions?.isProduction === true;
+
+    if (isProduction) {
+      // Invariant 5: cookieOptions.isProduction = false cannot bypass production
       if (options.cookieOptions?.isProduction === false) {
         throw new SessionError(
           'CONFIGURATION_ERROR',
           'Production environment cannot be overridden with isProduction: false',
         );
       }
+      // Invariant 6: secure = false is rejected in production
       if (options.cookieOptions?.secure === false) {
         throw new SessionError(
           'CONFIGURATION_ERROR',
           'Insecure session cookies (secure: false) are strictly prohibited in production',
         );
       }
+      // Invariant 7: Custom cookie names must not override __Host-session in production
       if (
         options.cookieOptions?.cookieName !== undefined &&
         options.cookieOptions.cookieName !== '__Host-session'
@@ -134,44 +202,19 @@ export class SessionService {
       this.isSecureCookie = true;
       this.cookieName = '__Host-session';
     } else {
-      // Non-production environment (development / test)
-      if (options.cookieOptions?.isProduction === true) {
-        // Explicit request to run with production cookie rules in dev/test
-        if (options.cookieOptions?.secure === false) {
-          throw new SessionError(
-            'CONFIGURATION_ERROR',
-            'Insecure session cookies (secure: false) are strictly prohibited when isProduction: true',
-          );
-        }
-        if (
-          options.cookieOptions?.cookieName !== undefined &&
-          options.cookieOptions.cookieName !== '__Host-session'
-        ) {
-          throw new SessionError(
-            'CONFIGURATION_ERROR',
-            `Production session cookies must use the "__Host-session" name; received "${options.cookieOptions.cookieName}"`,
-          );
-        }
+      // Development or test environment
+      this.isSecureCookie = options.cookieOptions?.secure ?? options.config?.COOKIE_SECURE ?? false;
 
-        this.isSecureCookie = true;
-        this.cookieName = '__Host-session';
+      if (options.cookieOptions?.cookieName !== undefined) {
+        if (options.cookieOptions.cookieName.startsWith('__Host-') && !this.isSecureCookie) {
+          throw new SessionError(
+            'CONFIGURATION_ERROR',
+            'Cookies with "__Host-" prefix require secure=true',
+          );
+        }
+        this.cookieName = options.cookieOptions.cookieName;
       } else {
-        // Development / test behavior: explicitly support local development HTTP without weakening production
-        this.isSecureCookie =
-          options.cookieOptions?.secure ?? options.config?.COOKIE_SECURE ?? false;
-
-        if (options.cookieOptions?.cookieName !== undefined) {
-          // Enforce __Host- cookie security invariant: __Host- prefix MUST be Secure
-          if (options.cookieOptions.cookieName.startsWith('__Host-') && !this.isSecureCookie) {
-            throw new SessionError(
-              'CONFIGURATION_ERROR',
-              'Cookies with "__Host-" prefix require secure=true',
-            );
-          }
-          this.cookieName = options.cookieOptions.cookieName;
-        } else {
-          this.cookieName = this.isSecureCookie ? '__Host-session' : 'switchyard_session';
-        }
+        this.cookieName = this.isSecureCookie ? '__Host-session' : 'switchyard_session';
       }
     }
   }
