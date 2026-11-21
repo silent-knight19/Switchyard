@@ -454,6 +454,12 @@ Migration `0011-session-tenant-lookup.sql` introduces an authorized, narrowly sc
   - **Browser RBAC:** Two-tier role hierarchy (`admin` and `member`) evaluated fresh from PostgreSQL on each request.
   - **Composition:** Unified preHandler hook enforcing Origin, session validation, CSRF, and role authorization for browser mutations.
   - **Registration Helper:** `registerAuthorizedRoute` typed entry point enforcing metadata contract before Fastify registration.
+- **Virtual API Key Issuance (SW-1.6.1):**
+  - **Key Generation & Verification:** 256-bit cryptographically secure generation (`crypto.randomBytes(32)`), independent 8-byte public hint (`crypto.randomBytes(8)`), canonical `gw_live_<11>_<43>` format (63 ASCII chars), and SHA-256 verifier storage (`virtual_keys.key_hash BYTEA UNIQUE`).
+  - **One-Time Plaintext Disclosure:** Plaintext raw key is returned exactly once from `VirtualKeyService.createKey()` upon confirmed transaction commit; zero raw key persistence, logging, caching, or recovery interfaces.
+  - **Tenant Transaction Boundary:** All creations execute inside `withTenant(pool, orgId)` using `gateway_app`. Direct insertion without tenant context and cross-tenant insertions are rejected by RLS.
+  - **Initial Deny-All Policy:** New keys default to `allowed_models = '{}'` (empty array), `rpm_limit = 1`, `tpm_limit = 1`, `concurrent_stream_limit = 1` (satisfying migration `0005`'s NOT NULL and positive checks), `exact_cache = false`, `semantic_cache = false`, `pii_redaction = true`, `store_payloads = false`, `revoked_at = NULL`.
+  - **Bounded Collision Recovery:** At most 3 attempts for qualifying unique constraint violations (`virtual_keys_key_hash_key`, `virtual_keys_pkey`); non-collision database errors fail closed immediately without retry.
 
 #### 7.7.9 Known limitations (Phase 2)
 

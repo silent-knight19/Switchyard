@@ -195,11 +195,19 @@ To allow deployment role `gateway_migrator` to install executor-owned functions 
 | **Batch A: Server-Side Web Sessions (SW-1.5.2)** | ACCEPTED | PR #11 (merge commit `2fbe6080919e20dee18af2a94da7f046e6fff20c`) | 256-bit opaque secret (`__Host-session`), SHA-256 verifier persistence, atomic rotation, idle/absolute expiry, revocation, RLS cross-tenant isolation |
 | **Batch A: Pre-Tenant Session Lookup (ADR 0001)** | ACCEPTED | PR #11 (merge commit `2fbe6080919e20dee18af2a94da7f046e6fff20c`) | `app_private.lookup_session_org_by_hash(BYTEA)` owned by `gateway_auth_executor`, UUID-only return, granted strictly to `gateway_app` |
 | **Batch B: Session-Bound CSRF & Strict Origin (SW-1.5.3)** | ACCEPTED | PR #12 (merge commit `639e0d276a72be0f52b239bda5b69e68080d0565`) | 256-bit synchronizer token, constant-time `timingSafeEqual`, exact `Origin` matching against `BROWSER_ORIGIN`, atomic row serialization under RLS, Fastify preHandler boundary |
-| **Batch B: Default-Deny Route Authorization, Principal Separation & RBAC (SW-1.5.4)** | IMPLEMENTED | `src/auth/authorization.ts`, `src/app.ts`, `src/routes/health.ts` | Default-deny Fastify `onRoute` registration guard (`AUTHZ_ROUTE_POLICY_INVALID`), request-time principal separation (`browser`, `virtual_key`, `anonymous`), admin/member RBAC hierarchy, CSRF/RBAC composition on mutations |
+| **Batch B: Default-Deny Route Authorization, Principal Separation & RBAC (SW-1.5.4)** | ACCEPTED | PR #13 (merge commit `05eae92341a023f0eeca3deca7da7171b7a50eb6`) | Default-deny Fastify `onRoute` registration guard (`AUTHZ_ROUTE_POLICY_INVALID`), request-time principal separation (`browser`, `virtual_key`, `anonymous`), admin/member RBAC hierarchy, CSRF/RBAC composition on mutations |
 
 ---
 
-## 8. CSRF & Strict Origin Verification Architecture (SW-1.5.3)
+## 8. Subphase 1.6 Architecture Tracking & Verification
+
+| Requirement / Task | Status | Reference | Verified Evidence |
+| :--- | :---: | :--- | :--- |
+| **Virtual API Key Issuance (SW-1.6.1)** | IMPLEMENTED | `src/auth/virtual-key.ts`, `src/auth/virtual-key.test.ts`, `src/auth/virtual-key.db.test.ts` | 256-bit cryptographically secure generation, canonical `gw_live_<11>_<43>` format, SHA-256 verifier persistence (`key_hash BYTEA UNIQUE`), public hint (`gw_live_<11>`), one-time raw key disclosure, deny-all model policy (`allowed_models = '{}'`), bounded collision retry (max 3), RLS isolation, worker denial |
+
+---
+
+## 9. CSRF & Strict Origin Verification Architecture (SW-1.5.3)
 
 Switchyard implements the server-side synchronizer token pattern bound to authenticated server-side sessions (Architecture v1.2 §13.3) combined with strict browser Origin verification.
 
@@ -225,24 +233,24 @@ Switchyard implements the server-side synchronizer token pattern bound to authen
 - Revoked, idle-expired, or absolute-expired sessions cannot issue or verify tokens.
 - Transaction rollback on token issuance leaves prior committed verifiers intact.
 
-### 8.4 Integration with Default-Deny Authorization (SW-1.5.4)
+### 9.4 Integration with Default-Deny Authorization (SW-1.5.4)
 - SW-1.5.3 CSRF and Origin verification is unified directly into the central authorization boundary in `apps/gateway/src/auth/authorization.ts`.
 - Browser state-changing mutations (`POST`, `PUT`, `PATCH`, `DELETE`) compose strict Origin checking, CSRF validation, session validation, and RBAC enforcement into a single atomic preHandler gate.
 
 ---
 
-## 9. Default-Deny Route Authorization, Principal Separation & RBAC (SW-1.5.4)
+## 10. Default-Deny Route Authorization, Principal Separation & RBAC (SW-1.5.4)
 
 Switchyard enforces default-deny route authorization across all HTTP entry points (Architecture v1.2 §13.5).
 
-### 9.1 Default-Deny Route Registration Assertion
+### 10.1 Default-Deny Route Registration Assertion
 - Every application route must explicitly declare its authorized principal metadata under `config.authz`.
 - Fastify `onRoute` assertion executes at route registration time, before application startup completes.
 - Any undeclared route, malformed policy, empty object, unknown principal, or invalid browser role immediately throws `AuthorizationError` with code `AUTHZ_ROUTE_POLICY_INVALID` and prevents application startup.
 - Applies to all route registration mechanisms: direct methods (`app.get`, `app.post`, `app.route`), nested plugins, prefixed plugins, and typed helper `registerAuthorizedRoute`.
 - Fastify automatically exposed `HEAD` routes inherit their corresponding `GET` route's policy; `HEAD` requests never bypass authorization.
 
-### 9.2 Route Metadata Contract
+### 10.2 Route Metadata Contract
 The accepted shapes of `config.authz` are:
 1. **Anonymous route:** `{ principal: 'anonymous' }` (no `minRole` permitted).
 2. **Browser route:** `{ principal: 'browser', minRole: 'member' | 'admin' }`.
@@ -250,21 +258,57 @@ The accepted shapes of `config.authz` are:
 
 Additional undeclared properties on `config.authz` are rejected at runtime.
 
-### 9.3 Strict Principal Separation
+### 10.3 Strict Principal Separation
 - **Browser Routes:** Accept only valid browser sessions (via configured session cookie). Bearer credentials, API keys, and mixed credentials fail closed with 401 Unauthorized.
 - **Virtual-Key Routes:** Reserved for data-plane API requests. Require an approved verified-key authenticator dependency. Registration fails closed if no verified authenticator is installed. Session cookies on virtual-key routes fail closed with 401 Unauthorized.
 - **Anonymous Routes:** Accessible without credentials. Handlers receive `{ type: 'anonymous' }` principal context. Session cookies or Authorization headers never upgrade an anonymous route.
 
-### 9.4 Role-Based Access Control (RBAC)
+### 10.4 Role-Based Access Control (RBAC)
 - Only two browser roles are supported: `admin` and `member`.
 - `admin` satisfies routes requiring `member` or `admin`.
 - `member` is rejected (403 Forbidden) on routes requiring `admin`.
 - Roles are evaluated fresh from PostgreSQL user state on every request via `public.web_sessions JOIN public.users`; no stale roles are cached in JWTs, Redis, or process memory.
 - Privilege changes and session revocations immediately invalidate prior active sessions.
 
-### 9.5 Production Route Inventory (SW-1.5.4)
+### 10.5 Production Route Inventory (SW-1.5.4)
 The production Gateway exposes only:
 - `/health/live`: Explicitly authorized with `{ principal: 'anonymous' }`.
 - `/health/ready`: Explicitly authorized with `{ principal: 'anonymous' }`.
 
 No production business or management endpoints are exposed in SW-1.5.4. Test endpoints exist strictly inside isolated test harnesses.
+
+---
+
+## 11. Virtual API Key Issuance Architecture (SW-1.6.1)
+
+Switchyard implements cryptographic virtual API key issuance as an internal Gateway service (`VirtualKeyService`), enforcing SHA-256 verifier persistence, tenant isolation, restrictive initial policy, and one-time plaintext disclosure (Architecture v1.2 §13.1, §14.3).
+
+### 11.1 Key Representation & Cryptographic Entropy
+- **Entropy Sources:** Generated using Node.js built-in `crypto.randomBytes()`. No deterministic PRNG, predictable seeds, timestamps, user IDs, or organization IDs are used.
+- **Public Prefix:** 8 random bytes encoded as unpadded base64url (exactly 11 characters). Stored in `virtual_keys.key_prefix` as `gw_live_<11>`. The prefix is public metadata for listings, disambiguated by row UUID; it is never treated as authentication evidence.
+- **Secret Material:** 32 random bytes (256-bit entropy) encoded as unpadded base64url (exactly 43 characters).
+- **Canonical Envelope:** `gw_live_<11-char-public-prefix>_<43-char-secret>` (exactly 63 ASCII characters).
+- **Verifier Computation:** Computed as `SHA-256(secretBytes)` over the 32 raw secret bytes. The resulting 32-byte digest is stored in `virtual_keys.key_hash` as binary `BYTEA UNIQUE`. The printable key string, prefix, and base64url secret are never hashed or stored.
+
+### 11.2 One-Time Disclosure & Secrecy Invariants
+- **Transient Plaintext:** The plaintext raw key exists only in memory during creation and is returned once from `createKey()`.
+- **Zero Raw Key Persistence:** Raw keys and secret bytes are never stored in PostgreSQL, Redis, cookies, browser storage, background queues, or application caches.
+- **Zero Logging:** Raw keys, secrets, hashes, SQL parameters, and connection strings are excluded from Pino logs, error messages, and exception serialization.
+- **No Recovery Mechanism:** No `getRawKey()` or secret retrieval method exists. Plaintext cannot be recovered from the 32-byte SHA-256 verifier.
+- **Memory Hygiene:** Mutable secret and prefix byte buffers are zeroed out (`buffer.fill(0)`) immediately following digest computation.
+
+### 11.3 Database Integrity & Deny-All Initial Policy
+- **Transaction Scope:** All insertions execute within `withTenant(pool, orgId)` using the runtime role `gateway_app`. Direct insertion without tenant context and cross-tenant insertion are strictly denied by RLS (`FORCE ROW LEVEL SECURITY`).
+- **Initial Deny-All Policy:**
+  - `allowed_models = '{}'` (empty array): Denies all model invocation.
+  - `rpm_limit = 1`, `tpm_limit = 1`, `concurrent_stream_limit = 1`: Deliberately restrictive positive values satisfying migration `0005`'s `NOT NULL` and `CHECK (> 0)` constraints (Principal Architect Decision 2).
+  - `exact_cache_enabled = false`, `semantic_cache_enabled = false`.
+  - `pii_redaction_enabled = true`, `store_payloads = false`.
+  - `revoked_at = NULL`.
+- **Commit Confirmation:** The raw key is returned to the caller only after PostgreSQL confirms durable transaction commit (`COMMIT`). Failed or rolled-back transactions never return a key.
+- **Bounded Collision Handling:** Qualifying unique constraint violations on `virtual_keys_key_hash_key` or `virtual_keys_pkey` trigger regeneration of all key material up to a maximum of 3 total attempts before failing closed with `KEY_COLLISION_EXHAUSTED`. Non-collision errors fail closed without retry.
+- **Role Isolation:** `gateway_worker` is strictly denied `INSERT` and `UPDATE` on `virtual_keys` (42501).
+
+### 11.4 Future Integration Contracts
+- **SW-1.6.2 (Authentication):** Will parse `gw_live_<11>_<43>`, decode the 43-character base64url secret into 32 raw bytes, compute SHA-256, and look up the key via `app_private.lookup_virtual_key_by_hash(BYTEA)`. The public prefix is ignored during authentication.
+- **SW-1.6.3 (Management & Policy):** Will introduce administrator-only API routes (`POST /api/keys`, `GET /api/keys`, `DELETE /api/keys/:id`). Model access enablement will require explicit validation and updating of model allowlists and operational rate/concurrency limits together.
