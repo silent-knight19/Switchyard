@@ -192,6 +192,14 @@ describe('SW-1.5.4: HTTP Authorization, Principal Separation & RBAC Suite (Secti
       }),
     );
 
+    // 7. Browser route with OPTIONS method for testing unsupported method rejection
+    app.route({
+      method: 'OPTIONS',
+      url: '/api/browser/options',
+      config: { authz: { principal: 'browser', minRole: 'member' } },
+      handler: async () => ({ ok: true }),
+    });
+
     return {
       app,
       vkAuthenticator,
@@ -428,6 +436,84 @@ describe('SW-1.5.4: HTTP Authorization, Principal Separation & RBAC Suite (Secti
       expect(res.statusCode).toBe(401);
       expect(res.json().message).toBe('Authentication required');
       expect(getAdminMutationCount()).toBe(0);
+      await app.close();
+    });
+
+    it('Row 11: Unsupported browser method -> fails closed (405)', async () => {
+      const { app } = setupTestApp();
+      await app.ready();
+      const res = await app.inject({
+        method: 'OPTIONS',
+        url: '/api/browser/options',
+      });
+      expect(res.statusCode).toBe(405);
+      expect(res.json().error).toBe('Method Not Allowed');
+      await app.close();
+    });
+
+    it('Row 12: PostgreSQL failure during session validation -> safe 5xx', async () => {
+      const brokenSessionService = {
+        getCookieName: () => cookieName,
+        extractSessionSecretFromCookieHeader: (cookieHeader?: string) =>
+          sessionService.extractSessionSecretFromCookieHeader(cookieHeader),
+        resolveAndValidateSession: async () => {
+          throw new Error('Database connection reset');
+        },
+        resolveAndValidateSessionWithCsrf: async () => {
+          throw new Error('Database connection reset');
+        },
+      } as unknown as SessionService;
+
+      const app = fastify();
+      let handlerCalled = false;
+      installAuthorizationBoundary(app, {
+        sessionService: brokenSessionService,
+        trustedOrigin: ALLOWED_ORIGIN,
+      });
+
+      app.get(
+        '/api/test-db-failure',
+        { config: { authz: { principal: 'browser', minRole: 'member' } } },
+        async () => {
+          handlerCalled = true;
+          return { ok: true };
+        },
+      );
+
+      app.post(
+        '/api/test-db-failure-mutation',
+        { config: { authz: { principal: 'browser', minRole: 'member' } } },
+        async () => {
+          handlerCalled = true;
+          return { ok: true };
+        },
+      );
+
+      await app.ready();
+      const secret = crypto.randomBytes(32).toString('base64url');
+
+      // Safe read with DB error -> 503
+      const getRes = await app.inject({
+        method: 'GET',
+        url: '/api/test-db-failure',
+        headers: { cookie: makeCookieHeader(secret) },
+      });
+      expect(getRes.statusCode).toBe(503);
+      expect(handlerCalled).toBe(false);
+
+      // Mutation with DB error -> 500
+      const postRes = await app.inject({
+        method: 'POST',
+        url: '/api/test-db-failure-mutation',
+        headers: {
+          origin: ALLOWED_ORIGIN,
+          cookie: makeCookieHeader(secret),
+          'x-csrf-token': crypto.randomBytes(32).toString('base64url'),
+        },
+      });
+      expect(postRes.statusCode).toBe(500);
+      expect(handlerCalled).toBe(false);
+
       await app.close();
     });
   });

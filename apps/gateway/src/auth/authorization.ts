@@ -6,8 +6,12 @@ import type {
   RouteOptions,
 } from 'fastify';
 import type { SessionService } from './session.js';
-import type { SessionValidationResult, SessionWithCsrfValidationResult } from './types.js';
-import { assertCanonicalOrigin, hasDuplicateRawHeader, validateOrigin } from './csrf.js';
+import type { AuthenticatedUser, SessionValidationResult, WebSession } from './types.js';
+import {
+  assertCanonicalOrigin,
+  createCsrfProtectionPreHandler,
+  PROTECTED_HTTP_METHODS,
+} from './csrf.js';
 
 export type RoutePrincipalType = 'anonymous' | 'browser' | 'virtual_key';
 export type BrowserRole = 'admin' | 'member';
@@ -97,6 +101,8 @@ declare module 'fastify' {
   }
   interface FastifyRequest {
     principal?: AuthorizedPrincipal;
+    user?: AuthenticatedUser;
+    session?: WebSession;
   }
 }
 
@@ -235,13 +241,13 @@ export type AuthorizedRouteOptions<
   RouteOptions<any, any, any, RouteGeneric, ContextConfig>,
   'config'
 > & {
-  authz?: RouteAuthorizationPolicy;
-  config?: ContextConfig & { authz?: RouteAuthorizationPolicy };
+  config: ContextConfig & { authz: RouteAuthorizationPolicy };
 };
 
 /**
- * Standard typed route-registration entry point (SW-1.5.4).
- * Enforces explicit authorization policy before registering the route with Fastify.
+ * Standard typed route-registration entry point (SW-1.5.4, AUTHZ-03).
+ * Enforces mandatory config.authz policy before registering the route with Fastify.
+ * Rejects unexpected top-level authz properties and ensures options are not mutated.
  */
 export function registerAuthorizedRoute<
   RouteGeneric extends RouteGenericInterface = RouteGenericInterface,
@@ -251,24 +257,90 @@ export function registerAuthorizedRoute<
   app: FastifyInstance<any, any, any, any, any>,
   options: AuthorizedRouteOptions<RouteGeneric, ContextConfig>,
 ): void {
-  const policy = options.authz ?? options.config?.authz;
-  const validatedPolicy = validateRouteAuthorizationPolicy(policy, {
+  if (!options || typeof options !== 'object') {
+    throw new AuthorizationError(
+      'AUTHZ_ROUTE_POLICY_INVALID',
+      'Route options must be a non-null object',
+      500,
+    );
+  }
+
+  // Reject unexpected or conflicting top-level authz declaration at runtime
+  if ('authz' in (options as Record<string, unknown>)) {
+    throw new AuthorizationError(
+      'AUTHZ_ROUTE_POLICY_INVALID',
+      `Route "${options.url ?? 'UNKNOWN'}": Top-level "authz" property is not permitted; declare policy under "config.authz"`,
+      500,
+    );
+  }
+
+  if (!options.config || typeof options.config !== 'object') {
+    throw new AuthorizationError(
+      'AUTHZ_ROUTE_POLICY_INVALID',
+      `Route "${options.url ?? 'UNKNOWN'}": Missing "config" object with "authz" policy`,
+      500,
+    );
+  }
+
+  const rawPolicy = (options.config as Record<string, unknown>).authz;
+  const validatedPolicy = validateRouteAuthorizationPolicy(rawPolicy, {
     method: options.method,
     url: options.url,
   });
 
-  const routeOptionsCopy = { ...options };
-  delete routeOptionsCopy.authz;
-  const config = {
-    ...(options.config ?? {}),
-    authz: { ...validatedPolicy },
-  } as ContextConfig & { authz: RouteAuthorizationPolicy };
+  const routeOptionsCopy = {
+    ...options,
+    config: {
+      ...options.config,
+      authz: { ...validatedPolicy },
+    },
+  };
 
-  app.route({
-    ...routeOptionsCopy,
-    config,
+  app.route(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  } as any);
+    routeOptionsCopy as RouteOptions<any, any, any, RouteGeneric, ContextConfig>,
+  );
+}
+
+/**
+ * Validates the runtime shape of a verified virtual-key principal (AUTHZ-01).
+ * Requires valid: true, virtual_key type, nonempty keyId and orgId, and rejects browser-role identity.
+ */
+function isValidVirtualKeyPrincipal(principal: unknown): principal is VirtualKeyPrincipal {
+  if (!principal || typeof principal !== 'object' || Array.isArray(principal)) {
+    return false;
+  }
+  const p = principal as Record<string, unknown>;
+  if (p.type !== 'virtual_key') {
+    return false;
+  }
+  if (typeof p.keyId !== 'string' || p.keyId.trim() === '') {
+    return false;
+  }
+  if (typeof p.orgId !== 'string' || p.orgId.trim() === '') {
+    return false;
+  }
+  // Reject browser-role identity fields (role, userId)
+  if ('role' in p || 'userId' in p) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Extracts validated user and session objects established on the request (AUTHZ-02).
+ */
+function extractBrowserIdentity(req: FastifyRequest): {
+  user: AuthenticatedUser;
+  session: WebSession;
+} | null {
+  const reqObj = req as unknown as { user?: unknown; session?: unknown };
+  const user = reqObj.user as AuthenticatedUser | undefined;
+  const session = reqObj.session as WebSession | undefined;
+  if (!user || !session) {
+    return null;
+  }
+  return { user, session };
 }
 
 async function handleBrowserAuthorization(
@@ -276,7 +348,7 @@ async function handleBrowserAuthorization(
   reply: FastifyReply,
   policy: BrowserRoutePolicy,
   options: AuthorizationBoundaryOptions,
-  trustedOrigin: string,
+  csrfPreHandler: (req: FastifyRequest, reply: FastifyReply) => Promise<void>,
 ): Promise<void> {
   const { sessionService } = options;
 
@@ -294,6 +366,21 @@ async function handleBrowserAuthorization(
 
   const method = req.method.toUpperCase();
   const isSafeRead = method === 'GET' || method === 'HEAD';
+  const isProtectedMutation = PROTECTED_HTTP_METHODS.has(method);
+
+  if (!isSafeRead && !isProtectedMutation) {
+    reply.status(405).send({
+      statusCode: 405,
+      error: 'Method Not Allowed',
+      message: 'Method Not Allowed',
+    });
+    return;
+  }
+
+  // Clear any preexisting identity on req to prevent trusting unverified attributes
+  const rawReq = req as unknown as { user?: unknown; session?: unknown };
+  delete rawReq.user;
+  delete rawReq.session;
 
   if (isSafeRead) {
     // 2. Extract Session Cookie
@@ -363,56 +450,30 @@ async function handleBrowserAuthorization(
       return;
     }
 
-    // 6. Attach trusted immutable browser principal
+    // 6. Attach trusted immutable browser principal and request identity
     req.principal = Object.freeze({
       type: 'browser',
       userId: validation.user.id,
       orgId: validation.user.orgId,
       role: userRole,
     });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (req as any).user = validation.user;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (req as any).session = validation.session;
+    req.user = validation.user;
+    req.session = validation.session;
     return;
   }
 
   // State-changing browser mutation (POST, PUT, PATCH, DELETE)
-  // Check duplicate raw headers (SW-1.5.3, CSRF-04)
-  if (hasDuplicateRawHeader(req.raw.rawHeaders, 'origin')) {
-    reply.status(403).send({
-      statusCode: 403,
-      error: 'Forbidden',
-      message: 'Invalid or missing Origin',
-    });
+  // Invoke accepted CSRF preHandler (AUTHZ-02)
+  await csrfPreHandler(req, reply);
+
+  // If CSRF preHandler sent an error response, terminate authorization immediately
+  if (reply.sent) {
     return;
   }
 
-  if (hasDuplicateRawHeader(req.raw.rawHeaders, 'x-csrf-token')) {
-    reply.status(403).send({
-      statusCode: 403,
-      error: 'Forbidden',
-      message: 'Invalid or missing CSRF token',
-    });
-    return;
-  }
-
-  // Strict Origin verification
-  const rawOrigin = req.headers['origin'];
-  const originResult = validateOrigin(rawOrigin, trustedOrigin);
-  if (!originResult.valid) {
-    reply.status(403).send({
-      statusCode: 403,
-      error: 'Forbidden',
-      message: 'Invalid or missing Origin',
-    });
-    return;
-  }
-
-  // Extract Session Cookie
-  const cookieHeader = req.headers['cookie'];
-  const sessionSecret = sessionService.extractSessionSecretFromCookieHeader(cookieHeader);
-  if (!sessionSecret) {
+  // Only after successful CSRF validation, read verified user/session identity established by middleware
+  const identity = extractBrowserIdentity(req);
+  if (!identity) {
     reply.status(401).send({
       statusCode: 401,
       error: 'Unauthorized',
@@ -421,47 +482,10 @@ async function handleBrowserAuthorization(
     return;
   }
 
-  // Extract CSRF Token Header
-  const rawCsrfHeader = req.headers['x-csrf-token'];
-  if (!rawCsrfHeader || Array.isArray(rawCsrfHeader) || rawCsrfHeader.includes(',')) {
-    reply.status(403).send({
-      statusCode: 403,
-      error: 'Forbidden',
-      message: 'Invalid or missing CSRF token',
-    });
-    return;
-  }
+  const { user, session } = identity;
 
-  // Session-bound validation with CSRF
-  let validation: SessionWithCsrfValidationResult;
-  try {
-    validation = await sessionService.resolveAndValidateSessionWithCsrf(
-      sessionSecret,
-      rawCsrfHeader,
-    );
-  } catch {
-    reply.status(503).send({
-      statusCode: 503,
-      error: 'Service Unavailable',
-      message: 'Authentication service unavailable',
-    });
-    return;
-  }
-
-  if (!validation.valid || !validation.user || !validation.session) {
-    if (
-      validation.reason === 'CSRF_TOKEN_MISMATCH' ||
-      validation.reason === 'MALFORMED_TOKEN' ||
-      validation.reason === 'MISSING_TOKEN'
-    ) {
-      reply.status(403).send({
-        statusCode: 403,
-        error: 'Forbidden',
-        message: 'Invalid or missing CSRF token',
-      });
-      return;
-    }
-
+  // Validate user/session ID and organization agreement
+  if (user.id !== session.userId || user.orgId !== session.orgId) {
     reply.status(401).send({
       statusCode: 401,
       error: 'Unauthorized',
@@ -470,21 +494,8 @@ async function handleBrowserAuthorization(
     return;
   }
 
-  // Verify user and session relationship
-  if (
-    validation.user.id !== validation.session.userId ||
-    validation.user.orgId !== validation.session.orgId
-  ) {
-    reply.status(401).send({
-      statusCode: 401,
-      error: 'Unauthorized',
-      message: 'Authentication required',
-    });
-    return;
-  }
-
-  // RBAC role check
-  const userRole = validation.user.role;
+  // Apply declared minimum browser role
+  const userRole = user.role;
   if (policy.minRole === 'admin' && userRole !== 'admin') {
     reply.status(403).send({
       statusCode: 403,
@@ -503,17 +514,13 @@ async function handleBrowserAuthorization(
     return;
   }
 
-  // Attach trusted immutable browser principal
+  // Construct the immutable browser principal
   req.principal = Object.freeze({
     type: 'browser',
-    userId: validation.user.id,
-    orgId: validation.user.orgId,
+    userId: user.id,
+    orgId: user.orgId,
     role: userRole,
   });
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  (req as any).user = validation.user;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  (req as any).session = validation.session;
 }
 
 async function handleVirtualKeyAuthorization(
@@ -582,7 +589,8 @@ async function handleVirtualKeyAuthorization(
     return;
   }
 
-  if (!result.valid || !result.principal) {
+  // Authenticator returns valid: false -> 401 Unauthorized
+  if (!result || result.valid !== true) {
     reply.status(401).send({
       statusCode: 401,
       error: 'Unauthorized',
@@ -591,8 +599,23 @@ async function handleVirtualKeyAuthorization(
     return;
   }
 
+  // Authenticator returns a malformed purported-success result -> controlled 503 (AUTHZ-01)
+  if (!isValidVirtualKeyPrincipal(result.principal)) {
+    reply.status(503).send({
+      statusCode: 503,
+      error: 'Service Unavailable',
+      message: 'Authentication service unavailable',
+    });
+    return;
+  }
+
   // 5. Attach trusted virtual-key principal
-  req.principal = Object.freeze(result.principal);
+  req.principal = Object.freeze({
+    type: 'virtual_key',
+    keyId: result.principal.keyId,
+    orgId: result.principal.orgId,
+    ...(result.principal.keyPolicy !== undefined ? { keyPolicy: result.principal.keyPolicy } : {}),
+  });
 }
 
 /**
@@ -605,6 +628,10 @@ export function installAuthorizationBoundary(
   options: AuthorizationBoundaryOptions,
 ): void {
   const trustedOrigin = assertCanonicalOrigin(options.trustedOrigin);
+  const csrfPreHandler = createCsrfProtectionPreHandler({
+    sessionService: options.sessionService,
+    allowedOrigin: trustedOrigin,
+  });
 
   // 1. Registration-time assertion: enforces default-deny on every route registered
   app.addHook('onRoute', (routeOptions) => {
@@ -651,7 +678,7 @@ export function installAuthorizationBoundary(
     }
 
     if (policy.principal === 'browser') {
-      await handleBrowserAuthorization(req, reply, policy, options, trustedOrigin);
+      await handleBrowserAuthorization(req, reply, policy, options, csrfPreHandler);
       return;
     }
 

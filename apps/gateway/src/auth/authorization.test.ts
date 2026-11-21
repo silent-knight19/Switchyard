@@ -1,10 +1,10 @@
-import fastify from 'fastify';
+import fastify, { type FastifyInstance } from 'fastify';
 import { describe, expect, it } from 'vitest';
 import {
-  type AuthorizedPrincipal,
-  type BrowserRole,
+  type AuthorizedRouteOptions,
   type RouteAuthorizationPolicy,
   type VirtualKeyAuthenticator,
+  type VirtualKeyVerificationResult,
   AuthorizationError,
   installAuthorizationBoundary,
   registerAuthorizedRoute,
@@ -194,76 +194,202 @@ describe('SW-1.5.4: Route Authorization Policy & Registration Enforcement', () =
     });
   });
 
-  describe('2. Role matrix & principal separation logic tests (Section 12)', () => {
-    function evaluateRoleAccess(userRole: unknown, requiredMinRole: BrowserRole): boolean {
-      if (userRole !== 'admin' && userRole !== 'member') {
-        return false;
-      }
-      if (requiredMinRole === 'admin') {
-        return userRole === 'admin';
-      }
-      if (requiredMinRole === 'member') {
-        return userRole === 'member' || userRole === 'admin';
-      }
-      return false;
+  describe('2. Role matrix & principal separation tests on production boundary (AUTHZ-04)', () => {
+    function createRbacSessionService(role?: unknown): SessionService {
+      return {
+        extractSessionSecretFromCookieHeader: (cookie?: string) => {
+          if (cookie?.includes('valid_secret'))
+            return 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+          return null;
+        },
+        resolveAndValidateSession: async () => {
+          return {
+            valid: true,
+            user: {
+              id: 'u1',
+              orgId: 'o1',
+              ...(role !== undefined ? { role } : {}),
+              emailNormalized: 'u1@o1.com',
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            } as any,
+            session: {
+              sessionIdHash: Buffer.alloc(32, 1),
+              userId: 'u1',
+              orgId: 'o1',
+              csrfTokenHash: Buffer.alloc(32, 2),
+              createdAt: new Date(),
+              lastSeenAt: new Date(),
+              idleExpiresAt: new Date(Date.now() + 3600000),
+              absoluteExpiresAt: new Date(Date.now() + 86400000),
+              revokedAt: null,
+            },
+          };
+        },
+        resolveAndValidateSessionWithCsrf: async () => ({
+          valid: false,
+          reason: 'SESSION_NOT_FOUND',
+        }),
+      } as unknown as SessionService;
     }
 
-    it('enforces role access matrix: member -> member is allow', () => {
-      expect(evaluateRoleAccess('member', 'member')).toBe(true);
+    async function buildBoundaryApp(
+      role?: unknown,
+      vkAuthenticator?: VirtualKeyAuthenticator,
+    ): Promise<FastifyInstance> {
+      const app = fastify();
+      installAuthorizationBoundary(app, {
+        sessionService: createRbacSessionService(role),
+        trustedOrigin: TRUSTED_ORIGIN,
+        virtualKeyAuthenticator: vkAuthenticator ?? {
+          authenticateKey: async () => ({
+            valid: true,
+            principal: { type: 'virtual_key', keyId: 'k1', orgId: 'o1' },
+          }),
+        },
+      });
+
+      app.get(
+        '/member-route',
+        { config: { authz: { principal: 'browser', minRole: 'member' } } },
+        async (req) => ({ ok: true, principal: req.principal }),
+      );
+
+      app.get(
+        '/admin-route',
+        { config: { authz: { principal: 'browser', minRole: 'admin' } } },
+        async (req) => ({ ok: true, principal: req.principal }),
+      );
+
+      app.get(
+        '/virtual-key-route',
+        { config: { authz: { principal: 'virtual_key' } } },
+        async (req) => ({ ok: true, principal: req.principal }),
+      );
+
+      app.get('/anon-route', { config: { authz: { principal: 'anonymous' } } }, async (req) => ({
+        ok: true,
+        principal: req.principal,
+      }));
+
+      await app.ready();
+      return app;
+    }
+
+    it('enforces role access: member -> member is allow (200)', async () => {
+      const app = await buildBoundaryApp('member');
+      const res = await app.inject({
+        method: 'GET',
+        url: '/member-route',
+        headers: { cookie: 'switchyard_session=valid_secret' },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().principal.role).toBe('member');
+      await app.close();
     });
 
-    it('enforces role access matrix: admin -> member is allow', () => {
-      expect(evaluateRoleAccess('admin', 'member')).toBe(true);
+    it('enforces role access: admin -> member is allow (200)', async () => {
+      const app = await buildBoundaryApp('admin');
+      const res = await app.inject({
+        method: 'GET',
+        url: '/member-route',
+        headers: { cookie: 'switchyard_session=valid_secret' },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().principal.role).toBe('admin');
+      await app.close();
     });
 
-    it('enforces role access matrix: member -> admin is deny', () => {
-      expect(evaluateRoleAccess('member', 'admin')).toBe(false);
+    it('enforces role access: member -> admin is deny (403)', async () => {
+      const app = await buildBoundaryApp('member');
+      const res = await app.inject({
+        method: 'GET',
+        url: '/admin-route',
+        headers: { cookie: 'switchyard_session=valid_secret' },
+      });
+      expect(res.statusCode).toBe(403);
+      expect(res.json().error).toBe('Forbidden');
+      await app.close();
     });
 
-    it('enforces role access matrix: admin -> admin is allow', () => {
-      expect(evaluateRoleAccess('admin', 'admin')).toBe(true);
+    it('enforces role access: admin -> admin is allow (200)', async () => {
+      const app = await buildBoundaryApp('admin');
+      const res = await app.inject({
+        method: 'GET',
+        url: '/admin-route',
+        headers: { cookie: 'switchyard_session=valid_secret' },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().principal.role).toBe('admin');
+      await app.close();
     });
 
-    it('enforces role access matrix: missing role is deny', () => {
-      expect(evaluateRoleAccess(undefined, 'member')).toBe(false);
-      expect(evaluateRoleAccess(null, 'admin')).toBe(false);
+    it('enforces role access: missing role is deny (403)', async () => {
+      const app = await buildBoundaryApp(undefined);
+      const res = await app.inject({
+        method: 'GET',
+        url: '/member-route',
+        headers: { cookie: 'switchyard_session=valid_secret' },
+      });
+      expect(res.statusCode).toBe(403);
+      expect(res.json().error).toBe('Forbidden');
+      await app.close();
     });
 
-    it('enforces role access matrix: unknown or spoofed role is deny', () => {
-      expect(evaluateRoleAccess('superadmin', 'member')).toBe(false);
-      expect(evaluateRoleAccess('operator', 'admin')).toBe(false);
-      expect(evaluateRoleAccess('root', 'admin')).toBe(false);
+    it('enforces role access: unknown or spoofed role is deny (403)', async () => {
+      const invalidRoles = ['superadmin', 'operator', 'root', 'guest', 'owner'];
+      for (const r of invalidRoles) {
+        const app = await buildBoundaryApp(r);
+        const res = await app.inject({
+          method: 'GET',
+          url: '/member-route',
+          headers: { cookie: 'switchyard_session=valid_secret' },
+        });
+        expect(res.statusCode).toBe(403);
+        expect(res.json().error).toBe('Forbidden');
+        await app.close();
+      }
     });
 
-    it('enforces principal separation: browser principal cannot satisfy virtual-key policy', () => {
-      const browserPrincipal: AuthorizedPrincipal = {
-        type: 'browser',
-        userId: 'u1',
-        orgId: 'org1',
-        role: 'admin',
-      };
-      const isVirtualKey = (browserPrincipal.type as string) === 'virtual_key';
-      expect(isVirtualKey).toBe(false);
+    it('enforces principal separation: browser cookie cannot satisfy virtual-key route (401)', async () => {
+      const app = await buildBoundaryApp('admin');
+      const res = await app.inject({
+        method: 'GET',
+        url: '/virtual-key-route',
+        headers: { cookie: 'switchyard_session=valid_secret' },
+      });
+      expect(res.statusCode).toBe(401);
+      expect(res.json().message).toBe('Authentication required');
+      await app.close();
     });
 
-    it('enforces principal separation: virtual-key principal cannot satisfy browser policy', () => {
-      const vkPrincipal: AuthorizedPrincipal = {
-        type: 'virtual_key',
-        keyId: 'k1',
-        orgId: 'org1',
-      };
-      const isBrowser = (vkPrincipal.type as string) === 'browser';
-      expect(isBrowser).toBe(false);
+    it('enforces principal separation: virtual-key bearer token cannot satisfy browser route (401)', async () => {
+      const app = await buildBoundaryApp('admin');
+      const res = await app.inject({
+        method: 'GET',
+        url: '/member-route',
+        headers: { authorization: 'Bearer test_key_123' },
+      });
+      expect(res.statusCode).toBe(401);
+      expect(res.json().message).toBe('Authentication required');
+      await app.close();
     });
 
-    it('enforces principal separation: anonymous principal cannot satisfy browser or virtual-key policy', () => {
-      const anonPrincipal: AuthorizedPrincipal = { type: 'anonymous' };
-      expect((anonPrincipal.type as string) === 'browser').toBe(false);
-      expect((anonPrincipal.type as string) === 'virtual_key').toBe(false);
+    it('enforces principal separation: anonymous request cannot satisfy browser or virtual-key route (401)', async () => {
+      const app = await buildBoundaryApp('admin');
+      const resBrowser = await app.inject({ method: 'GET', url: '/member-route' });
+      expect(resBrowser.statusCode).toBe(401);
+
+      const resVk = await app.inject({ method: 'GET', url: '/virtual-key-route' });
+      expect(resVk.statusCode).toBe(401);
+
+      const resAnon = await app.inject({ method: 'GET', url: '/anon-route' });
+      expect(resAnon.statusCode).toBe(200);
+      expect(resAnon.json().principal.type).toBe('anonymous');
+      await app.close();
     });
   });
 
-  describe('3. Fastify Registration Tests (Section 13)', () => {
+  describe('3. Fastify Registration & Route Helper Tests (AUTHZ-03)', () => {
     it('1. undeclared GET route fails registration', () => {
       const app = fastify();
       installAuthorizationBoundary(app, {
@@ -389,7 +515,6 @@ describe('SW-1.5.4: Route Authorization Policy & Registration Enforcement', () =
       installAuthorizationBoundary(app, {
         sessionService: createMockSessionService(),
         trustedOrigin: TRUSTED_ORIGIN,
-        // virtualKeyAuthenticator omitted (production buildApp behavior)
       });
 
       expect(() => {
@@ -512,7 +637,77 @@ describe('SW-1.5.4: Route Authorization Policy & Registration Enforcement', () =
       );
     });
 
-    it('13. route-registration helper without policy fails', () => {
+    it('13. route-registration helper registers valid anonymous route', async () => {
+      const app = fastify();
+      installAuthorizationBoundary(app, {
+        sessionService: createMockSessionService(),
+        trustedOrigin: TRUSTED_ORIGIN,
+      });
+
+      registerAuthorizedRoute(app, {
+        method: 'GET',
+        url: '/helper-anon',
+        config: { authz: { principal: 'anonymous' } },
+        handler: async () => ({ helper: true }),
+      });
+
+      await app.ready();
+      const res = await app.inject({ method: 'GET', url: '/helper-anon' });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({ helper: true });
+      await app.close();
+    });
+
+    it('14. route-registration helper registers valid browser member and admin routes', async () => {
+      const app = fastify();
+      installAuthorizationBoundary(app, {
+        sessionService: createMockSessionService(),
+        trustedOrigin: TRUSTED_ORIGIN,
+      });
+
+      registerAuthorizedRoute(app, {
+        method: 'GET',
+        url: '/helper-member',
+        config: { authz: { principal: 'browser', minRole: 'member' } },
+        handler: async () => ({ member: true }),
+      });
+
+      registerAuthorizedRoute(app, {
+        method: 'POST',
+        url: '/helper-admin',
+        config: { authz: { principal: 'browser', minRole: 'admin' } },
+        handler: async () => ({ admin: true }),
+      });
+
+      await app.ready();
+      await app.close();
+    });
+
+    it('15. route-registration helper registers valid virtual-key route with test authenticator', async () => {
+      const app = fastify();
+      installAuthorizationBoundary(app, {
+        sessionService: createMockSessionService(),
+        trustedOrigin: TRUSTED_ORIGIN,
+        virtualKeyAuthenticator: {
+          authenticateKey: async () => ({
+            valid: true,
+            principal: { type: 'virtual_key', keyId: 'k1', orgId: 'o1' },
+          }),
+        },
+      });
+
+      registerAuthorizedRoute(app, {
+        method: 'POST',
+        url: '/helper-vk',
+        config: { authz: { principal: 'virtual_key' } },
+        handler: async () => ({ vk: true }),
+      });
+
+      await app.ready();
+      await app.close();
+    });
+
+    it('16. route-registration helper rejects missing config.authz at runtime', () => {
       const app = fastify();
       installAuthorizationBoundary(app, {
         sessionService: createMockSessionService(),
@@ -524,7 +719,8 @@ describe('SW-1.5.4: Route Authorization Policy & Registration Enforcement', () =
           method: 'GET',
           url: '/helper-unprotected',
           handler: async () => ({ ok: true }),
-        } as unknown as Parameters<typeof registerAuthorizedRoute>[1]);
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any);
       }).toThrowError(
         expect.objectContaining({
           name: 'AuthorizationError',
@@ -533,28 +729,151 @@ describe('SW-1.5.4: Route Authorization Policy & Registration Enforcement', () =
       );
     });
 
-    it('13b. route-registration helper with explicit authz registers successfully', async () => {
+    it('17. route-registration helper rejects null policy at runtime', () => {
       const app = fastify();
       installAuthorizationBoundary(app, {
         sessionService: createMockSessionService(),
         trustedOrigin: TRUSTED_ORIGIN,
       });
 
-      registerAuthorizedRoute(app, {
-        method: 'GET',
-        url: '/helper-protected',
-        authz: { principal: 'anonymous' },
-        handler: async () => ({ helper: true }),
+      expect(() => {
+        registerAuthorizedRoute(app, {
+          method: 'GET',
+          url: '/helper-null-policy',
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          config: { authz: null as any },
+          handler: async () => ({ ok: true }),
+        });
+      }).toThrowError(
+        expect.objectContaining({
+          name: 'AuthorizationError',
+          code: 'AUTHZ_ROUTE_POLICY_INVALID',
+        }),
+      );
+    });
+
+    it('18. route-registration helper rejects invalid policy at runtime', () => {
+      const app = fastify();
+      installAuthorizationBoundary(app, {
+        sessionService: createMockSessionService(),
+        trustedOrigin: TRUSTED_ORIGIN,
       });
 
+      expect(() => {
+        registerAuthorizedRoute(app, {
+          method: 'GET',
+          url: '/helper-invalid-policy',
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          config: { authz: { principal: 'invalid' } as any },
+          handler: async () => ({ ok: true }),
+        });
+      }).toThrowError(
+        expect.objectContaining({
+          name: 'AuthorizationError',
+          code: 'AUTHZ_ROUTE_POLICY_INVALID',
+        }),
+      );
+    });
+
+    it('19. route-registration helper rejects conflicting top-level authz declaration at runtime', () => {
+      const app = fastify();
+      installAuthorizationBoundary(app, {
+        sessionService: createMockSessionService(),
+        trustedOrigin: TRUSTED_ORIGIN,
+      });
+
+      expect(() => {
+        registerAuthorizedRoute(app, {
+          method: 'GET',
+          url: '/helper-conflicting-authz',
+          config: { authz: { principal: 'anonymous' } },
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          authz: { principal: 'anonymous' } as any,
+          handler: async () => ({ ok: true }),
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any);
+      }).toThrowError(
+        expect.objectContaining({
+          name: 'AuthorizationError',
+          code: 'AUTHZ_ROUTE_POLICY_INVALID',
+        }),
+      );
+    });
+
+    it('20. route-registration helper preserves additional custom config without mutating options', async () => {
+      const app = fastify();
+      installAuthorizationBoundary(app, {
+        sessionService: createMockSessionService(),
+        trustedOrigin: TRUSTED_ORIGIN,
+      });
+
+      const inputOptions: AuthorizedRouteOptions<
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        any,
+        { customRateLimit: number; authz: RouteAuthorizationPolicy }
+      > = {
+        method: 'GET',
+        url: '/helper-custom-config',
+        config: {
+          customRateLimit: 42,
+          authz: { principal: 'anonymous' },
+        },
+        handler: async (req) => ({
+          rateLimit: (req.routeOptions.config as { customRateLimit: number }).customRateLimit,
+        }),
+      };
+
+      const originalConfigCopy = { ...inputOptions.config };
+      registerAuthorizedRoute(app, inputOptions);
+
+      // Verify input object was not mutated
+      expect(inputOptions.config).toEqual(originalConfigCopy);
+
       await app.ready();
-      const res = await app.inject({ method: 'GET', url: '/helper-protected' });
+      const res = await app.inject({ method: 'GET', url: '/helper-custom-config' });
       expect(res.statusCode).toBe(200);
-      expect(res.json()).toEqual({ helper: true });
+      expect(res.json()).toEqual({ rateLimit: 42 });
       await app.close();
     });
 
-    it('14. automatically generated HEAD routes inherit policy and cannot bypass authorization', async () => {
+    it('21. compile-time test: TypeScript rejects registerAuthorizedRoute without config.authz', () => {
+      const app = fastify();
+      installAuthorizationBoundary(app, {
+        sessionService: createMockSessionService(),
+        trustedOrigin: TRUSTED_ORIGIN,
+      });
+
+      expect(() => {
+        // @ts-expect-error - Compile-time assertion: options missing config.authz must fail typecheck
+        registerAuthorizedRoute(app, {
+          method: 'GET',
+          url: '/compile-fail-missing-config',
+          handler: async () => ({ ok: true }),
+        });
+      }).toThrowError(
+        expect.objectContaining({
+          name: 'AuthorizationError',
+          code: 'AUTHZ_ROUTE_POLICY_INVALID',
+        }),
+      );
+
+      expect(() => {
+        registerAuthorizedRoute(app, {
+          method: 'GET',
+          url: '/compile-fail-toplevel-authz',
+          // @ts-expect-error - Compile-time assertion: options with top-level authz must fail typecheck
+          authz: { principal: 'anonymous' },
+          handler: async () => ({ ok: true }),
+        });
+      }).toThrowError(
+        expect.objectContaining({
+          name: 'AuthorizationError',
+          code: 'AUTHZ_ROUTE_POLICY_INVALID',
+        }),
+      );
+    });
+
+    it('22. automatically generated HEAD routes inherit policy and cannot bypass authorization', async () => {
       const app = fastify();
       let sessionValidated = false;
 
@@ -594,7 +913,6 @@ describe('SW-1.5.4: Route Authorization Policy & Registration Enforcement', () =
         trustedOrigin: TRUSTED_ORIGIN,
       });
 
-      // Register GET browser route
       app.get(
         '/protected/resource',
         { config: { authz: { principal: 'browser', minRole: 'member' } } },
@@ -624,14 +942,13 @@ describe('SW-1.5.4: Route Authorization Policy & Registration Enforcement', () =
       await app.close();
     });
 
-    it('15. unknown or malformed authorization metadata cannot be interpreted as anonymous', async () => {
+    it('23. unknown or malformed authorization metadata cannot be interpreted as anonymous', async () => {
       const app = fastify();
       installAuthorizationBoundary(app, {
         sessionService: createMockSessionService(),
         trustedOrigin: TRUSTED_ORIGIN,
       });
 
-      // Attempting to declare arbitrary unknown metadata
       expect(() => {
         app.get(
           '/malformed-policy',
@@ -647,7 +964,7 @@ describe('SW-1.5.4: Route Authorization Policy & Registration Enforcement', () =
       );
     });
 
-    it('16. production startup fails completely on route registration error (cannot listen or ready)', async () => {
+    it('24. production startup fails completely on route registration error (cannot listen or ready)', async () => {
       const app = fastify();
       installAuthorizationBoundary(app, {
         sessionService: createMockSessionService(),
@@ -655,7 +972,6 @@ describe('SW-1.5.4: Route Authorization Policy & Registration Enforcement', () =
       });
 
       app.register(async (plugin) => {
-        // Invalid route inside plugin
         plugin.get('/invalid-startup', async () => ({ ok: true }));
       });
 
@@ -667,6 +983,353 @@ describe('SW-1.5.4: Route Authorization Policy & Registration Enforcement', () =
         expect((err as AuthorizationError).code).toBe('AUTHZ_ROUTE_POLICY_INVALID');
       }
       expect(startupFailed).toBe(true);
+      await app.close();
+    });
+  });
+
+  describe('4. Virtual-Key Principal Shape & Authentication Tests (AUTHZ-01)', () => {
+    async function buildVkApp(
+      authenticator: VirtualKeyAuthenticator,
+      onHandlerInvoked: () => void,
+    ): Promise<FastifyInstance> {
+      const app = fastify();
+      installAuthorizationBoundary(app, {
+        sessionService: createMockSessionService(),
+        trustedOrigin: TRUSTED_ORIGIN,
+        virtualKeyAuthenticator: authenticator,
+      });
+
+      app.post(
+        '/v1/inference',
+        { config: { authz: { principal: 'virtual_key' } } },
+        async (req) => {
+          onHandlerInvoked();
+          return { ok: true, principal: req.principal };
+        },
+      );
+
+      await app.ready();
+      return app;
+    }
+
+    it('1. correct virtual-key principal authorizes successfully and preserves keyPolicy', async () => {
+      let handlerCalled = false;
+      const authenticator: VirtualKeyAuthenticator = {
+        authenticateKey: async (rawKey: string): Promise<VirtualKeyVerificationResult> => {
+          if (rawKey === 'valid_key_secret') {
+            return {
+              valid: true,
+              principal: {
+                type: 'virtual_key',
+                keyId: 'vk_123',
+                orgId: 'org_abc',
+                keyPolicy: { allowedModels: ['model-1'] },
+              },
+            };
+          }
+          return { valid: false };
+        },
+      };
+
+      const app = await buildVkApp(authenticator, () => {
+        handlerCalled = true;
+      });
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/v1/inference',
+        headers: { authorization: 'Bearer valid_key_secret' },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(handlerCalled).toBe(true);
+      expect(res.json().principal).toEqual({
+        type: 'virtual_key',
+        keyId: 'vk_123',
+        orgId: 'org_abc',
+        keyPolicy: { allowedModels: ['model-1'] },
+      });
+      await app.close();
+    });
+
+    it('2. authenticator returns valid: false -> 401 Unauthorized, handler not invoked', async () => {
+      let handlerCalled = false;
+      const authenticator: VirtualKeyAuthenticator = {
+        authenticateKey: async () => ({
+          valid: false,
+          reason: 'KEY_NOT_FOUND',
+        }),
+      };
+
+      const app = await buildVkApp(authenticator, () => {
+        handlerCalled = true;
+      });
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/v1/inference',
+        headers: { authorization: 'Bearer invalid_key' },
+      });
+
+      expect(res.statusCode).toBe(401);
+      expect(res.json().message).toBe('Authentication required');
+      expect(handlerCalled).toBe(false);
+      await app.close();
+    });
+
+    it('3. authenticator returns valid: true with no principal -> 503, handler not invoked', async () => {
+      let handlerCalled = false;
+      const authenticator: VirtualKeyAuthenticator = {
+        authenticateKey: async () =>
+          ({
+            valid: true,
+            principal: undefined,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          }) as any,
+      };
+
+      const app = await buildVkApp(authenticator, () => {
+        handlerCalled = true;
+      });
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/v1/inference',
+        headers: { authorization: 'Bearer any_key' },
+      });
+
+      expect(res.statusCode).toBe(503);
+      expect(res.json().message).toBe('Authentication service unavailable');
+      expect(handlerCalled).toBe(false);
+      await app.close();
+    });
+
+    it('4. authenticator returns valid: true with a browser principal -> 503, handler not invoked', async () => {
+      let handlerCalled = false;
+      const authenticator: VirtualKeyAuthenticator = {
+        authenticateKey: async () => ({
+          valid: true,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          principal: { type: 'browser', userId: 'u1', orgId: 'o1', role: 'admin' } as any,
+        }),
+      };
+
+      const app = await buildVkApp(authenticator, () => {
+        handlerCalled = true;
+      });
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/v1/inference',
+        headers: { authorization: 'Bearer any_key' },
+      });
+
+      expect(res.statusCode).toBe(503);
+      expect(res.json().message).toBe('Authentication service unavailable');
+      expect(handlerCalled).toBe(false);
+      await app.close();
+    });
+
+    it('5. authenticator returns valid: true with an anonymous principal -> 503, handler not invoked', async () => {
+      let handlerCalled = false;
+      const authenticator: VirtualKeyAuthenticator = {
+        authenticateKey: async () => ({
+          valid: true,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          principal: { type: 'anonymous' } as any,
+        }),
+      };
+
+      const app = await buildVkApp(authenticator, () => {
+        handlerCalled = true;
+      });
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/v1/inference',
+        headers: { authorization: 'Bearer any_key' },
+      });
+
+      expect(res.statusCode).toBe(503);
+      expect(res.json().message).toBe('Authentication service unavailable');
+      expect(handlerCalled).toBe(false);
+      await app.close();
+    });
+
+    it('6. authenticator returns missing keyId -> 503, handler not invoked', async () => {
+      let handlerCalled = false;
+      const authenticator: VirtualKeyAuthenticator = {
+        authenticateKey: async () => ({
+          valid: true,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          principal: { type: 'virtual_key', orgId: 'o1' } as any,
+        }),
+      };
+
+      const app = await buildVkApp(authenticator, () => {
+        handlerCalled = true;
+      });
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/v1/inference',
+        headers: { authorization: 'Bearer any_key' },
+      });
+
+      expect(res.statusCode).toBe(503);
+      expect(res.json().message).toBe('Authentication service unavailable');
+      expect(handlerCalled).toBe(false);
+      await app.close();
+    });
+
+    it('7. authenticator returns empty keyId -> 503, handler not invoked', async () => {
+      let handlerCalled = false;
+      const authenticator: VirtualKeyAuthenticator = {
+        authenticateKey: async () => ({
+          valid: true,
+          principal: { type: 'virtual_key', keyId: '   ', orgId: 'o1' },
+        }),
+      };
+
+      const app = await buildVkApp(authenticator, () => {
+        handlerCalled = true;
+      });
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/v1/inference',
+        headers: { authorization: 'Bearer any_key' },
+      });
+
+      expect(res.statusCode).toBe(503);
+      expect(res.json().message).toBe('Authentication service unavailable');
+      expect(handlerCalled).toBe(false);
+      await app.close();
+    });
+
+    it('8. authenticator returns missing orgId -> 503, handler not invoked', async () => {
+      let handlerCalled = false;
+      const authenticator: VirtualKeyAuthenticator = {
+        authenticateKey: async () => ({
+          valid: true,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          principal: { type: 'virtual_key', keyId: 'k1' } as any,
+        }),
+      };
+
+      const app = await buildVkApp(authenticator, () => {
+        handlerCalled = true;
+      });
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/v1/inference',
+        headers: { authorization: 'Bearer any_key' },
+      });
+
+      expect(res.statusCode).toBe(503);
+      expect(res.json().message).toBe('Authentication service unavailable');
+      expect(handlerCalled).toBe(false);
+      await app.close();
+    });
+
+    it('9. authenticator returns empty orgId -> 503, handler not invoked', async () => {
+      let handlerCalled = false;
+      const authenticator: VirtualKeyAuthenticator = {
+        authenticateKey: async () => ({
+          valid: true,
+          principal: { type: 'virtual_key', keyId: 'k1', orgId: '' },
+        }),
+      };
+
+      const app = await buildVkApp(authenticator, () => {
+        handlerCalled = true;
+      });
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/v1/inference',
+        headers: { authorization: 'Bearer any_key' },
+      });
+
+      expect(res.statusCode).toBe(503);
+      expect(res.json().message).toBe('Authentication service unavailable');
+      expect(handlerCalled).toBe(false);
+      await app.close();
+    });
+
+    it('10. authenticator returns unexpected role/userId fields -> 503, handler not invoked', async () => {
+      let handlerCalled = false;
+      const authenticator: VirtualKeyAuthenticator = {
+        authenticateKey: async () => ({
+          valid: true,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          principal: { type: 'virtual_key', keyId: 'k1', orgId: 'o1', role: 'admin' } as any,
+        }),
+      };
+
+      const app = await buildVkApp(authenticator, () => {
+        handlerCalled = true;
+      });
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/v1/inference',
+        headers: { authorization: 'Bearer any_key' },
+      });
+
+      expect(res.statusCode).toBe(503);
+      expect(res.json().message).toBe('Authentication service unavailable');
+      expect(handlerCalled).toBe(false);
+      await app.close();
+
+      // Also check userId unexpected field
+      let handlerCalled2 = false;
+      const authenticator2: VirtualKeyAuthenticator = {
+        authenticateKey: async () => ({
+          valid: true,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          principal: { type: 'virtual_key', keyId: 'k1', orgId: 'o1', userId: 'u1' } as any,
+        }),
+      };
+
+      const app2 = await buildVkApp(authenticator2, () => {
+        handlerCalled2 = true;
+      });
+
+      const res2 = await app2.inject({
+        method: 'POST',
+        url: '/v1/inference',
+        headers: { authorization: 'Bearer any_key' },
+      });
+
+      expect(res2.statusCode).toBe(503);
+      expect(res2.json().message).toBe('Authentication service unavailable');
+      expect(handlerCalled2).toBe(false);
+      await app2.close();
+    });
+
+    it('11. authenticator throws an exception -> 503, handler not invoked', async () => {
+      let handlerCalled = false;
+      const authenticator: VirtualKeyAuthenticator = {
+        authenticateKey: async () => {
+          throw new Error('Database connection failed');
+        },
+      };
+
+      const app = await buildVkApp(authenticator, () => {
+        handlerCalled = true;
+      });
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/v1/inference',
+        headers: { authorization: 'Bearer any_key' },
+      });
+
+      expect(res.statusCode).toBe(503);
+      expect(res.json().message).toBe('Authentication service unavailable');
+      expect(handlerCalled).toBe(false);
       await app.close();
     });
   });
