@@ -28,14 +28,14 @@ The future provider-attempt admission service (Phase 2, Task SW-2.2.3) receives 
 1. **Trusted Authenticated Principal:** Immutable `VirtualKeyPrincipal` (`type: 'virtual_key'`) attached by the Gateway authorization boundary (`req.principal`).
 2. **Verified Organization UUID:** `principal.orgId`, established by restricted pre-tenant lookup.
 3. **Verified Virtual-Key UUID:** `principal.keyId`, established by restricted pre-tenant lookup.
-4. **Logical Request Identity:** `requestId` (UUID v7 / PostgreSQL `gateway_requests` primary key).
-5. **Validated Provider/Model Target:** Resolved against the verified capability registry and key allowlist (`principal.keyPolicy.allowedModels`).
-6. **Current Gateway Epoch:** Active gateway epoch integer held in memory and verified against `public.gateway_epoch`.
-7. **Durable Billing Period:** UTC calendar month string (`YYYY-MM`) established at logical request admission.
-8. **Estimated Maximum Cost:** Microdollar ceiling for the pending provider attempt.
+4. **Logical Request Identity:** `requestId` (UUID v7 / PostgreSQL `public.gateway_requests.request_id` primary key).
+5. **Validated Provider/Model Target:** Resolved against verified capability metadata (`SW-2.1.2`) and key allowlist (`principal.keyPolicy.allowedModels`, `SW-2.5.3`).
+6. **Current Gateway Epoch:** Active gateway epoch integer held in trusted Gateway process memory and verified against `public.gateway_control.gateway_epoch` where `id = 1` (`0002-org-tables.sql`).
+7. **Durable Billing Period:** UTC calendar month string (`YYYY-MM`) established at logical request admission (`SW-2.1.3`, `0007-financial-observability-tables.sql`, `0008-financial-integrity.sql`).
+8. **Estimated Maximum Cost:** Microdollar ceiling for the pending provider attempt (`SW-2.1.1`).
 
 ### Explicit Security Prohibition
-Under no circumstances may the admission engine accept a client-supplied `keyId`, `orgId`, or policy parameter as an authority substitute. The database check must bind strictly to the verified properties of `req.principal`.
+Under no circumstances may the admission engine accept a client-supplied `keyId`, `orgId`, or `gateway_epoch` as an authority substitute. The database check and epoch verification must bind strictly to verified Gateway process state and `req.principal`.
 
 ---
 
@@ -47,13 +47,18 @@ Every upstream provider attempt dispatched in Phase 2 must adhere strictly to th
 [Incoming Request]
        │
        ▼
-1. Pre-admission Validation & Capability Resolution (SW-2.1.2)
+1. Pre-admission Validation & Rate/Concurrency Guards
+   ├── Pre-key IP abuse throttling (SW-2.5.1)
+   ├── Per-key RPM/TPM token bucket check (SW-2.5.2)
+   ├── Model allowlist & in-flight concurrency bound check (SW-2.5.3)
+   └── Capability resolution & pricing verification (SW-2.1.2)
        │
        ▼
 2. Cost Estimation (Microdollars) (SW-2.1.1)
+   └── Compute maximum microdollar estimate for requested model/tokens
        │
        ▼
-3. Atomic Redis Budget Reservation (`RESERVE` Lua Script) (SW-2.3.1)
+3. Atomic Redis Budget Reservation (`RESERVE` Lua Script) (SW-2.4.1)
    ├── Denied / Insufficient Budget ──► Reject (402 Payment Required / 429)
    └── Approved ──► Proceed to PostgreSQL Durable Admission
        │
@@ -63,10 +68,12 @@ Every upstream provider attempt dispatched in Phase 2 must adhere strictly to th
    │
    ├──► 4a. Acquire shared Gateway epoch transaction advisory lock:
    │        SELECT pg_catalog.pg_advisory_xact_lock_shared(epoch_lock_key);
+   │        (Lock key defined in SW-2.2.1 registry)
    │
    ├──► 4b. Re-read and verify Gateway epoch:
-   │        SELECT epoch FROM public.gateway_epoch WHERE id = 1;
-   │        (Assert epoch === expectedGatewayEpoch; abort on mismatch)
+   │        SELECT gateway_epoch FROM public.gateway_control WHERE id = 1;
+   │        (Assert gateway_epoch === expectedProcessEpoch; fail closed on mismatch,
+   │         missing singleton row, or query error)
    │
    ├──► 4c. Row-lock virtual-key record & recheck revocation status:
    │        SELECT id, org_id, revoked_at
@@ -78,17 +85,63 @@ Every upstream provider attempt dispatched in Phase 2 must adhere strictly to th
    │        ├── Row missing or org_id != principal.orgId ──► DENY (fail closed)
    │        └── revoked_at IS NOT NULL ──► DENY (KEY_REVOKED)
    │
-   ├──► 4e. Insert durable attempt record:
+   ├──► 4e. Insert durable attempt record in reserved status:
    │        INSERT INTO public.provider_attempts (
-   │          id, request_id, org_id, virtual_key_id, provider_id, model_id,
-   │          status, reserved_cost_microdollars, ...
-   │        ) VALUES (..., 'reserved', ...);
+   │          attempt_id, request_id, org_id, virtual_key_id, attempt_number,
+   │          gateway_instance_id, gateway_epoch, billing_period, provider,
+   │          model, status, estimated_cost_microdollars, cost_status, hard_deadline_at
+   │        ) VALUES (..., 'reserved', ..., 'estimated', ...);
    │
    └──► 4f. COMMIT transaction (Releases advisory lock & virtual-key row lock)
        │
        ▼
-5. Final Pre-Dispatch Verification & Upstream Dispatch (SW-2.5.1)
-   └── Dispatch to provider adapter only after COMMIT confirmed
+5. Pre-Dispatch Verification & Upstream Dispatch (SW-2.6.2)
+   └── Dispatch to provider adapter only after COMMIT confirmed and pre-dispatch eligibility recheck succeeds
+```
+
+### Schema Contract: `public.gateway_control` (Migration `0002`)
+The epoch check queries the singleton control table:
+```sql
+SELECT gateway_epoch FROM public.gateway_control WHERE id = 1;
+```
+- **Fail-Closed Verification:** If `id = 1` is missing, if `gateway_epoch` does not match the active Gateway process epoch, if the query fails, or if process fencing authority is lost, the transaction must immediately roll back and deny admission.
+
+### Schema Contract: `public.provider_attempts` (Migrations `0007` & `0008`)
+The normative attempt-admission insert populates the exact migrated database schema:
+
+```sql
+-- Pseudocode illustration of durable attempt reservation (SW-2.2.3)
+INSERT INTO public.provider_attempts (
+  attempt_id,
+  request_id,
+  org_id,
+  virtual_key_id,
+  attempt_number,
+  gateway_instance_id,
+  gateway_epoch,
+  billing_period,
+  provider,
+  model,
+  status,
+  estimated_cost_microdollars,
+  cost_status,
+  hard_deadline_at
+) VALUES (
+  $1,                  -- attempt_id: UUID PRIMARY KEY
+  $2,                  -- request_id: UUID (foreign key to gateway_requests)
+  $3,                  -- org_id: UUID (tenant isolation)
+  $4,                  -- virtual_key_id: UUID (foreign key to virtual_keys)
+  $5,                  -- attempt_number: INT (CHECK >= 1)
+  $6,                  -- gateway_instance_id: UUID
+  $7,                  -- gateway_epoch: BIGINT (matches gateway_control.gateway_epoch)
+  $8,                  -- billing_period: TEXT ('YYYY-MM' matching admitted_at UTC)
+  $9,                  -- provider: TEXT (e.g. 'openai')
+  $10,                 -- model: TEXT (e.g. 'gpt-4o')
+  'reserved',          -- status: TEXT ('reserved')
+  $11,                 -- estimated_cost_microdollars: BIGINT (CHECK >= 0)
+  'estimated',         -- cost_status: TEXT ('estimated' when actual_cost is NULL)
+  $12                  -- hard_deadline_at: TIMESTAMPTZ
+);
 ```
 
 ### Invariant: Lock Confinement
@@ -122,34 +175,71 @@ PostgreSQL row-level locking enforces deterministic serialization between admini
 
 ## 5. Failure and Commit-Uncertainty Rules
 
-1. **Key Revoked at Admission:** Attempt admission fails immediately. The associated Redis reservation is released via the approved Redis cancellation script (`CANCEL`).
-2. **Missing Key or Tenant Mismatch:** Fails closed. The associated Redis reservation is cancelled.
-3. **PostgreSQL Network or Storage Failure:** Transaction rolls back. Redis reservation is cancelled.
-4. **Gateway Epoch Mismatch:** A newer Gateway has been elected. Transaction rolls back; fail closed.
-5. **Commit Uncertainty:** If a network failure occurs during `COMMIT` such that outcome is ambiguous, the Gateway must **never** cancel the Redis reservation speculatively. The reservation is retained until the Phase 2 reconciler (`SW-2.8.3`) verifies the canonical PostgreSQL state.
-6. **Already Admitted Attempts:** An attempt whose admission transaction durably committed before revocation commits is permitted to finish streaming within its bounded attempt deadline. Revocation does not retroactively corrupt durable ledger history.
+To maintain absolute accounting and ledger integrity, failures during admission are partitioned into four distinct categories:
+
+### Case A — Confirmed Failure Before Commit
+- **Trigger Conditions:** Pre-admission policy rejection, epoch mismatch in `gateway_control`, key revoked (`revoked_at IS NOT NULL`), key missing, tenant mismatch, or SQL execution/constraint error with confirmed transaction rollback.
+- **System Behavior:**
+  - Do not dispatch upstream.
+  - Release the associated Redis reservation via the approved `CANCEL_RESERVATION` protocol (`SW-2.4.4`).
+  - Return the appropriate structured error to the caller without leaking internal state.
+
+### Case B — Confirmed Commit Success
+- **Trigger Conditions:** Transaction `COMMIT` completion tag is confirmed by PostgreSQL.
+- **System Behavior:**
+  - Durable `public.provider_attempts` record exists with `status = 'reserved'` and `cost_status = 'estimated'`.
+  - Preserve the Redis reservation hold.
+  - Proceed to upstream dispatch under `SW-2.6.2` once final pre-dispatch eligibility checks pass.
+
+### Case C — Commit Outcome Uncertain
+- **Trigger Conditions:** Client-server connection drops during `COMMIT`, database connection resets while commit acknowledgment is pending, or network/statement timeout occurs before the command completion tag is received.
+- **System Behavior:**
+  - **Do not dispatch** upstream merely because commit was attempted.
+  - **Do not assume rollback.**
+  - **Do NOT cancel** the Redis reservation speculatively (never cancel based on uncertainty).
+  - Preserve the reservation hold in Redis.
+  - Leave recovery to the background persist-and-repair worker (`SW-2.7.2`) and accounting reconciler (`SW-2.8.3`), which determine the canonical PostgreSQL state and converge without unaccounted spend.
+
+### Case D — Unexpected Redis or Script Failure
+- **Trigger Conditions:** Redis unreachable, command timeout, or Lua script runtime error during reservation.
+- **System Behavior:**
+  - Fail closed immediately.
+  - Do not guess whether reservation succeeded.
+  - Do not manually adjust accounting counters.
+  - Follow accepted recovery rules (`SW-2.8.4`).
+
+### Policy on In-Flight Admitted Attempts
+An attempt whose admission transaction durably committed before a subsequent revocation committed is permitted to complete its execution within its bounded deadline (`hard_deadline_at`). Administrative revocation forbids new attempt admissions; it does not retroactively invalidate or corrupt durable ledger history.
 
 ---
 
 ## 6. Phase 2 Implementation Dependencies
 
-The following Phase 2 tasks are normative owners of this contract:
+The capabilities specified in this contract are owned by the following authoritative roadmap tasks:
 
 | Roadmap Task | Subphase | Capability Owned |
 | :--- | :--- | :--- |
-| **`SW-2.1.3`** | 2.1 | Logical request admission & immutable `billing_period` assignment |
-| **`SW-2.2.1`** | 2.2 | Advisory lock key registry for singleton gateway and epoch locks |
-| **`SW-2.2.2`** | 2.2 | Dedicated startup connection, exclusive epoch transaction lock & epoch bump |
-| **`SW-2.2.3`** | 2.2 | **Shared epoch lock, virtual-key row lock, and revocation recheck in attempt admission** |
-| **`SW-2.3.1`** | 2.3 | Atomic Redis `RESERVE` Lua script and microdollar reservation |
-| **`SW-2.5.1`** | 2.5 | Minimal pre-dispatch rate/concurrency guard and pre-dispatch eligibility check |
+| **`SW-2.1.1`** | 2.1 | Bigint microdollar types, decimal JSON codec, and price arithmetic |
+| **`SW-2.1.2`** | 2.1 | Capability/pricing contracts and verified model metadata |
+| **`SW-2.1.3`** | 2.1 | Logical request admission and immutable billing period |
+| **`SW-2.2.1`** | 2.2 | Advisory-lock key registry for singleton gateway and epoch locks |
+| **`SW-2.2.2`** | 2.2 | Gateway startup epoch increment and exclusive epoch transaction lock |
+| **`SW-2.2.3`** | 2.2 | **Shared epoch lock, virtual-key row lock, and revocation recheck inside attempt admission** |
+| **`SW-2.3.1`** | 2.3 | Redis client ACL, startup checks, and global recovering/ready gate |
+| **`SW-2.4.1`** | 2.4 | Redis `RESERVE` financial transition Lua script |
+| **`SW-2.4.4`** | 2.4 | Redis `CANCEL_RESERVATION` and `ACK_LEDGER` financial transitions |
+| **`SW-2.5.1`** | 2.5 | Pre-key IP abuse throttling and trusted-proxy controls |
+| **`SW-2.5.2`** | 2.5 | Per-key RPM/TPM token buckets |
+| **`SW-2.5.3`** | 2.5 | Model allowlists and concurrency/in-flight admission limits |
+| **`SW-2.6.2`** | 2.6 | End-to-end Redis reserve → durable SQL admission → safe dispatch integration |
 | **`SW-2.7.2`** | 2.7 | Persist-and-repair worker handling commit uncertainty & orphan cleanup |
-| **`SW-2.8.3`** | 2.8 | Accounting reconciler verifying Redis budget against PostgreSQL canonical ledger |
+| **`SW-2.8.3`** | 2.8 | Canonical PostgreSQL/Redis accounting reconciliation |
 
 ---
 
 ## 7. Cross-References
 
-- `docs/architecture/architecture-v1.2.md`: §5.3 (Security Invariants), §6.1–6.3 (Request Admission & Dispatch Sequence), §8.1–8.2 (Epoch Fencing), §12.5 (Advisory Locks).
-- `docs/SECURITY.md`: §11 (Virtual Key Architecture), §12.6 & §13.8 (Phase 2 Admission Notices).
-- `docs/roadmap/implementation-roadmap-v1.md`: Phase 2 Milestones and Subphases 2.1–2.8.
+- `docs/architecture/architecture-v1.2.md`: §5.3 (Security Invariants), §6.1–6.3 (Request Admission & Dispatch Sequence), §7.1–7.9 (Financial Transitions & Uncertainty), §8.1–8.2 (Epoch Fencing), §11.6–11.8 (Schema Contracts), §12.5 (Advisory Locks).
+- `docs/SECURITY.md`: §11 (Virtual Key Architecture), §12.6 & §13.8 (Phase 2 Admission Notices), §14 (Revocation & Admission Seam).
+- `docs/DEVELOPMENT.md`: §7.7 (Virtual Key Verification & Known Limitations).
+- `docs/roadmap/implementation-roadmap-v1.md`: Phase 2 Roadmap Tasks.

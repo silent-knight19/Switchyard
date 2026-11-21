@@ -15,7 +15,7 @@ import {
   type DisposableDatabase,
 } from '../db/test/disposable-pg.js';
 import { registerVirtualKeyRoutes } from '../routes/virtual-keys.js';
-import { installAuthorizationBoundary } from './authorization.js';
+import { installAuthorizationBoundary, type VirtualKeyAuthenticator } from './authorization.js';
 import { SessionService } from './session.js';
 import { startDisposableRedis, type DisposableRedisCluster } from './test/disposable-redis.js';
 import { VirtualKeyService } from './virtual-key.js';
@@ -39,6 +39,7 @@ describe('SW-1.6.4: Real HTTP Virtual Key Security, Error Equivalence & Secret S
   let managementService: VirtualKeyManagementService;
   let vkRateLimiter: VirtualKeyRateLimiter;
   let vkAuthenticator: VirtualKeyAuthenticatorService;
+  let activeAuthenticator: VirtualKeyAuthenticator;
 
   let app: ReturnType<typeof fastify>;
   let inferenceExecutionCount = 0;
@@ -139,6 +140,11 @@ describe('SW-1.6.4: Real HTTP Virtual Key Security, Error Equivalence & Secret S
       pool: appPool,
       rateLimiter: vkRateLimiter,
     });
+    activeAuthenticator = vkAuthenticator;
+    const delegatingAuthenticator: VirtualKeyAuthenticator = {
+      authenticateKey: (rawKey: string, clientIp?: string) =>
+        activeAuthenticator.authenticateKey(rawKey, clientIp),
+    };
 
     // 4. Fastify Server Setup with Logging Stream Capture
     const logStream = {
@@ -153,7 +159,7 @@ describe('SW-1.6.4: Real HTTP Virtual Key Security, Error Equivalence & Secret S
     installAuthorizationBoundary(app, {
       sessionService,
       trustedOrigin: ALLOWED_ORIGIN,
-      virtualKeyAuthenticator: vkAuthenticator,
+      virtualKeyAuthenticator: delegatingAuthenticator,
     });
 
     // Data-plane virtual-key test route
@@ -744,7 +750,9 @@ describe('SW-1.6.4: Real HTTP Virtual Key Security, Error Equivalence & Secret S
       const canaryMemberSession = await sessionService.createSession(ORG_A_ID, USER_A_MEMBER_ID);
       const canaryOrgBAdminSession = await sessionService.createSession(ORG_B_ID, USER_B_ADMIN_ID);
 
-      // Op 1: Key Creation (discloses rawKey once)
+      const canaryUniqueToken = crypto.randomBytes(8).toString('hex');
+
+      // Op 1: Key Creation (discloses rawKey once, sets no-store/no-cache, zero verifier disclosure)
       const createRes = await app.inject({
         method: 'POST',
         url: '/api/keys',
@@ -761,11 +769,13 @@ describe('SW-1.6.4: Real HTTP Virtual Key Security, Error Equivalence & Secret S
       const canaryKeyId: string = createJson.id;
       const canarySecret: string = canaryRawKey.slice(20);
 
-      // Assert creation response: contains rawKey, but NEVER key_hash
+      // Assert creation response: contains rawKey, Cache-Control: no-store, Pragma: no-cache, but NEVER key_hash
       expect(canaryRawKey).toMatch(/^gw_live_[A-Za-z0-9_-]{11}_[A-Za-z0-9_-]{43}$/);
       expect(canarySecret.length).toBe(43);
       expect(createJson.keyHash).toBeUndefined();
       expect(createJson.key_hash).toBeUndefined();
+      expect(createRes.headers['cache-control']).toBe('no-store');
+      expect(createRes.headers['pragma']).toBe('no-cache');
 
       // Op 2: Metadata Listing
       const listRes = await app.inject({
@@ -898,22 +908,83 @@ describe('SW-1.6.4: Real HTTP Virtual Key Security, Error Equivalence & Secret S
       });
       expect(crossTenantRes.statusCode).toBe(404);
 
-      // Op 12: Database exception handling (invalid cursor input)
-      const dbExceptionRes = await app.inject({
-        method: 'GET',
-        url: '/api/keys?cursor=invalid_cursor_payload',
-        headers: { cookie: makeCookie(canaryAdminSession.secret) },
-      });
-      expect(dbExceptionRes.statusCode).toBe(400);
+      // Op 12: Database failure canary (injected deterministic failure routed through real authenticator)
+      const canaryDbError = `CANARY_SQL_SYNTHETIC_DRIVER_ERROR_${canaryUniqueToken}`;
+      const dbFailurePool = {
+        query: async () => {
+          throw new Error(canaryDbError);
+        },
+      } as unknown as pg.Pool;
 
-      // Op 13: Redis exception handling (direct test via mock/broken client in distinct failure section)
-      // Covered above in Section 4 test
+      const dbFailureAuthenticator = new VirtualKeyAuthenticatorService({
+        pool: dbFailurePool,
+        rateLimiter: vkRateLimiter,
+      });
+
+      const initialExecCountBeforeDbCanary = inferenceExecutionCount;
+      activeAuthenticator = dbFailureAuthenticator;
+      let dbExceptionRes: Awaited<ReturnType<typeof app.inject>>;
+      try {
+        dbExceptionRes = await app.inject({
+          method: 'POST',
+          url: '/v1/test-inference',
+          remoteAddress: MATRIX_TEST_IP,
+          headers: { authorization: `Bearer ${freshKey.rawKey}` },
+        });
+      } finally {
+        activeAuthenticator = vkAuthenticator;
+      }
+
+      expect(dbExceptionRes.statusCode).toBe(503);
+      expect(dbExceptionRes.json()).toEqual({
+        statusCode: 503,
+        error: 'Service Unavailable',
+        message: 'Authentication service unavailable',
+      });
+      expect(inferenceExecutionCount).toBe(initialExecCountBeforeDbCanary);
+
+      // Op 13: Redis failure canary (injected deterministic limiter failure routed through real authenticator)
+      const canaryRedisError = `CANARY_REDIS_SYNTHETIC_CONNECTION_ERROR_${canaryUniqueToken}`;
+      const brokenRedisLimiter = {
+        assertNotRateLimited: async () => {
+          throw new Error(canaryRedisError);
+        },
+      } as unknown as VirtualKeyRateLimiter;
+
+      const redisFailureAuthenticator = new VirtualKeyAuthenticatorService({
+        pool: appPool,
+        rateLimiter: brokenRedisLimiter,
+      });
+
+      const initialExecCountBeforeRedisCanary = inferenceExecutionCount;
+      activeAuthenticator = redisFailureAuthenticator;
+      let redisExceptionRes: Awaited<ReturnType<typeof app.inject>>;
+      try {
+        redisExceptionRes = await app.inject({
+          method: 'POST',
+          url: '/v1/test-inference',
+          remoteAddress: MATRIX_TEST_IP,
+          headers: { authorization: `Bearer ${freshKey.rawKey}` },
+        });
+      } finally {
+        activeAuthenticator = vkAuthenticator;
+      }
+
+      expect(redisExceptionRes.statusCode).toBe(503);
+      expect(redisExceptionRes.json()).toEqual({
+        statusCode: 503,
+        error: 'Service Unavailable',
+        message: 'Authentication service unavailable',
+      });
+      expect(inferenceExecutionCount).toBe(initialExecCountBeforeRedisCanary);
 
       // Op 14: Authentication abuse-rate rejection
       // Trigger 429 on test IP
       const abuseIp = '198.51.100.188';
+      let rateLimitedRes: Awaited<ReturnType<typeof app.inject>> | undefined;
+      const initialExecCountBeforeAbuse = inferenceExecutionCount;
       for (let i = 0; i < 31; i++) {
-        await app.inject({
+        const res = await app.inject({
           method: 'POST',
           url: '/v1/test-inference',
           remoteAddress: abuseIp,
@@ -921,7 +992,21 @@ describe('SW-1.6.4: Real HTTP Virtual Key Security, Error Equivalence & Secret S
             authorization: `Bearer ${unknownKey}`,
           },
         });
+        if (i < 30) {
+          expect(res.statusCode).toBe(401);
+        } else {
+          rateLimitedRes = res;
+        }
       }
+
+      expect(rateLimitedRes).toBeDefined();
+      expect(rateLimitedRes!.statusCode).toBe(429);
+      expect(rateLimitedRes!.json()).toEqual({
+        statusCode: 429,
+        error: 'Too Many Requests',
+        message: 'Too many authentication attempts from this IP address. Please try again later.',
+      });
+      expect(inferenceExecutionCount).toBe(initialExecCountBeforeAbuse);
 
       // --- Assertions on Captured Surfaces ---
 
@@ -938,6 +1023,8 @@ describe('SW-1.6.4: Real HTTP Virtual Key Security, Error Equivalence & Secret S
         memberRes.body,
         crossTenantRes.body,
         dbExceptionRes.body,
+        redisExceptionRes.body,
+        rateLimitedRes!.body,
       ];
 
       for (const body of postCreationResponses) {
@@ -947,6 +1034,10 @@ describe('SW-1.6.4: Real HTTP Virtual Key Security, Error Equivalence & Secret S
         expect(body).not.toContain(canaryAdminSession.csrfToken);
         expect(body).not.toContain('keyHash');
         expect(body).not.toContain('key_hash');
+        expect(body).not.toContain(canaryDbError);
+        expect(body).not.toContain(canaryRedisError);
+        expect(body).not.toContain('CANARY_SQL_SYNTHETIC_DRIVER_ERROR');
+        expect(body).not.toContain('CANARY_REDIS_SYNTHETIC_CONNECTION_ERROR');
       }
 
       // 2. Structured Application Logs:
@@ -957,6 +1048,10 @@ describe('SW-1.6.4: Real HTTP Virtual Key Security, Error Equivalence & Secret S
       expect(allLogs).not.toContain(canaryAdminSession.csrfToken);
       expect(allLogs).not.toContain(passwords.gateway_app);
       expect(allLogs).not.toContain('postgres://');
+      expect(allLogs).not.toContain(canaryDbError);
+      expect(allLogs).not.toContain(canaryRedisError);
+      expect(allLogs).not.toContain('CANARY_SQL_SYNTHETIC_DRIVER_ERROR');
+      expect(allLogs).not.toContain('CANARY_REDIS_SYNTHETIC_CONNECTION_ERROR');
 
       // 3. Redis State:
       // Assert Redis contains ONLY abuse-limiter keys (auth:ratelimit:vk:ip:*)

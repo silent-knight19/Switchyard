@@ -478,14 +478,32 @@ Real PostgreSQL 16 row-locking (`SELECT ... FOR UPDATE`) tests verify serializat
 - **Scenario C (Stale Principal):** An in-memory `VirtualKeyPrincipal` retained from a prior valid authentication fails admission once revocation commits, proving that authentication-time principals cannot substitute for admission-time PostgreSQL row checks.
 
 ### 14.4 Secret Secrecy Matrix & Canary Verification
-Capturing structured application logs (Pino), HTTP response bodies, Redis keys, and PostgreSQL rows across 14 lifecycle operations confirms:
-- **One-Time Disclosure:** Only the initial successful `POST /api/keys` response discloses `rawKey`; that response never contains `key_hash`.
-- **Zero Secret Propagation:** Subsequent responses (`GET`, `PUT`, `DELETE`, errors) contain neither `rawKey`, `secret`, `key_hash`, nor session secrets.
-- **Clean Telemetry:** Structured application logs contain no API keys, secrets, session tokens, CSRF tokens, or database passwords.
-- **Redis Hygiene:** Redis contains only normalized IP rate limiter keys (`auth:ratelimit:vk:ip:<ip>`), never raw keys, verifiers, or authorization caches.
-- **Database Hygiene:** PostgreSQL stores only the 32-byte SHA-256 verifier (`key_hash BYTEA UNIQUE`), never raw keys.
+Capturing structured application logs (Pino), HTTP response bodies, Redis keys, and PostgreSQL rows across 14 lifecycle operations within a single unified test stream confirms:
+1. **Key Creation (Op 1):** Discloses `rawKey` once, sets `Cache-Control: no-store` and `Pragma: no-cache`, and discloses neither `key_hash` nor verifier bytes.
+2. **Key Listing (Op 2):** Discloses non-secret metadata only.
+3. **Policy Replacement (Op 3):** Modifies policy without disclosing secret credentials.
+4. **Key Revocation (Op 4):** Revokes key logically (HTTP 204) without sensitive disclosure.
+5. **Repeat Revocation (Op 5):** Idempotent repeat returns HTTP 204 without leaking state.
+6. **Active Key Authentication (Op 6):** Authenticates data plane route (HTTP 200) cleanly.
+7. **Unknown Key Authentication (Op 7):** Returns uniform HTTP 401 without detail leakage.
+8. **Malformed Key Authentication (Op 8):** Returns uniform HTTP 401 without detail leakage.
+9. **Revoked Key Authentication (Op 9):** Returns uniform HTTP 401 without detail leakage.
+10. **Unauthorized Member Management (Op 10):** Enforces RBAC (HTTP 403) with zero secret leakage.
+11. **Cross-Tenant Management (Op 11):** Enforces tenant isolation (HTTP 404) with zero leakage.
+12. **Database Failure Canary (Op 12):** Deterministic database lookup failure routed through real authenticator returns controlled HTTP 503 with zero protected handler executions and zero driver error/connection leaks.
+13. **Redis Limiter Failure Canary (Op 13):** Deterministic limiter failure routed through real authenticator returns controlled HTTP 503 with zero protected handler executions and zero connection leaks.
+14. **Authentication Abuse Rejection (Op 14):** 31st request triggers rate limiting (HTTP 429) with zero handler executions.
+
+All 13 post-creation response bodies and the comprehensive application log stream are verified to contain zero raw keys, zero secrets, zero session secrets, zero CSRF tokens, zero database credentials, zero connection URIs, and zero synthetic error canaries. Redis contains only normalized IP rate limiter keys (`auth:ratelimit:vk:ip:<ip>`), and PostgreSQL persists only the 32-byte SHA-256 verifier (`key_hash BYTEA UNIQUE`).
 
 ### 14.5 Normative Phase 2 Handoff Reference
 The full architectural handoff document is committed at:
 [`docs/architecture/phase2-admission-key-recheck.md`](./architecture/phase2-admission-key-recheck.md)
-tracking the mandatory implementation dependencies owned by Phase 2 Task `SW-2.2.3` and Architecture v1.2 §6.3.
+tracking the mandatory implementation dependencies across Phase 2:
+- **SW-2.1.1 & SW-2.1.2:** Single-pass streaming proxy & request-dispatch state machine.
+- **SW-2.2.3:** Gateway-instance epoch validation & provider-attempt pre-dispatch admission checks (`SELECT ... FOR UPDATE` with `gateway_control` epoch fence).
+- **SW-2.4.1:** Multi-tier rate limiting & speculative Redis reservation (`RESERVE`).
+- **SW-2.4.4:** Two-phase financial settlement, fail-closed reconciliation, and reservation cancellation (`CANCEL_RESERVATION`).
+- **SW-2.5.1 – SW-2.5.3:** Upstream dispatch guards & hard deadline enforcement.
+- **SW-2.6.2:** Upstream dispatch pipeline integration.
+- **SW-2.8.3:** Reconciliation worker for unsettled reservations under commit uncertainty.

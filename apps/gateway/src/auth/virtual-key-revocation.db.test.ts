@@ -346,9 +346,23 @@ describe('SW-1.6.4: PostgreSQL 16 Virtual Key Revocation, Tenant Isolation & Con
       const clientR = await appPool.connect();
       const clientA = await appPool.connect();
 
+      let clientRInTx = false;
+      let clientAInTx = false;
+      let admissionCompleted = false;
+      let admissionResult: SimulatedAdmissionResult | null = null;
+      let admissionError: unknown = null;
+      let admissionPromise: Promise<void> | null = null;
+
       try {
-        // 1. Transaction R begins and acquires exclusive row lock
+        // 1. Identify backend PIDs
+        const pidResR = await clientR.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+        const pidR = pidResR.rows[0]!.pid;
+        const pidResA = await clientA.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+        const pidA = pidResA.rows[0]!.pid;
+
+        // 2. Transaction R begins and acquires exclusive row lock
         await clientR.query('BEGIN');
+        clientRInTx = true;
         await clientR.query(`SET LOCAL app.current_org_id = '${ORG_A_ID}'`);
         const lockR = await clientR.query<{ id: string }>(
           'SELECT id FROM public.virtual_keys WHERE id = $1 FOR UPDATE',
@@ -356,21 +370,18 @@ describe('SW-1.6.4: PostgreSQL 16 Virtual Key Revocation, Tenant Isolation & Con
         );
         expect(lockR.rows.length).toBe(1);
 
-        // 2. Transaction R updates revoked_at (not yet committed)
+        // 3. Transaction R updates revoked_at (not yet committed)
         await clientR.query(
           'UPDATE public.virtual_keys SET revoked_at = clock_timestamp() WHERE id = $1',
           [key.id],
         );
 
-        // 3. Transaction A starts admission check in tenant context, attempting SELECT ... FOR UPDATE
-        let admissionCompleted = false;
-        let admissionResult: SimulatedAdmissionResult | null = null;
-        let admissionError: unknown = null;
-
+        // 4. Transaction A starts admission check in tenant context, attempting SELECT ... FOR UPDATE
         await clientA.query('BEGIN');
+        clientAInTx = true;
         await clientA.query(`SET LOCAL app.current_org_id = '${ORG_A_ID}'`);
 
-        const admissionPromise = (async () => {
+        admissionPromise = (async () => {
           try {
             admissionResult = await simulateProviderAttemptAdmissionLock(clientA, key.id);
           } catch (err) {
@@ -380,40 +391,57 @@ describe('SW-1.6.4: PostgreSQL 16 Virtual Key Revocation, Tenant Isolation & Con
           }
         })();
 
-        // 4. Poll pg_locks deterministically to verify clientA is blocked waiting for clientR's row lock
-        let blocked = false;
-        for (let i = 0; i < 50; i++) {
-          const locksRes = await adminClient.query<{ count: number }>(`
-            SELECT count(*)::int as count
-            FROM pg_locks
-            WHERE NOT granted
-          `);
-          if (locksRes.rows[0]!.count > 0) {
-            blocked = true;
+        // 5. Poll pg_blocking_pids(pidA) deterministically from adminClient to verify clientA is specifically blocked by clientR
+        let blockedByR = false;
+        const maxWaitMs = 2000;
+        const pollIntervalMs = 25;
+        const deadline = Date.now() + maxWaitMs;
+
+        while (Date.now() < deadline) {
+          const blockersRes = await adminClient.query<{ blockers: number[] }>(
+            'SELECT pg_blocking_pids($1::int) AS blockers',
+            [pidA],
+          );
+          if (blockersRes.rows[0]?.blockers?.includes(pidR)) {
+            blockedByR = true;
             break;
           }
-          await new Promise((resolve) => setTimeout(resolve, 20));
+          await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
         }
 
-        expect(blocked).toBe(true);
+        expect(blockedByR).toBe(true);
         expect(admissionCompleted).toBe(false);
 
-        // 5. Transaction R commits
+        // 6. Transaction R commits, releasing the row lock
         await clientR.query('COMMIT');
+        clientRInTx = false;
 
-        // 6. Transaction A unblocks and receives the updated row
+        // 7. Transaction A unblocks and receives the updated row
         await admissionPromise;
         expect(admissionCompleted).toBe(true);
         expect(admissionError).toBeNull();
         expect(admissionResult).not.toBeNull();
 
-        // 7. Admission decision rejects because revoked_at IS NOT NULL
+        // 8. Admission decision rejects because revoked_at IS NOT NULL
         expect(admissionResult!.admitted).toBe(false);
         expect(admissionResult!.reason).toBe('KEY_REVOKED');
 
-        // 8. Rollback admission transaction without inserting provider attempt
+        // 9. Rollback admission transaction without inserting provider attempt
         await clientA.query('ROLLBACK');
+        clientAInTx = false;
       } finally {
+        if (clientRInTx) {
+          await clientR.query('ROLLBACK').catch(() => undefined);
+        }
+        if (clientAInTx) {
+          await clientA.query('ROLLBACK').catch(() => undefined);
+        }
+        if (admissionPromise) {
+          await Promise.race([
+            admissionPromise.catch(() => undefined),
+            new Promise((resolve) => setTimeout(resolve, 500)),
+          ]);
+        }
         clientR.release();
         clientA.release();
       }
@@ -425,24 +453,35 @@ describe('SW-1.6.4: PostgreSQL 16 Virtual Key Revocation, Tenant Isolation & Con
       const clientA = await appPool.connect();
       const clientR = await appPool.connect();
 
+      let clientAInTx = false;
+      let clientRInTx = false;
+      let revocationCompleted = false;
+      let revocationError: unknown = null;
+      let revocationPromise: Promise<void> | null = null;
+
       try {
-        // 1. Transaction A begins and acquires admission row lock
+        // 1. Identify backend PIDs
+        const pidResA = await clientA.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+        const pidA = pidResA.rows[0]!.pid;
+        const pidResR = await clientR.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+        const pidR = pidResR.rows[0]!.pid;
+
+        // 2. Transaction A begins and acquires admission row lock
         await clientA.query('BEGIN');
+        clientAInTx = true;
         await clientA.query(`SET LOCAL app.current_org_id = '${ORG_A_ID}'`);
         const admissionResult = await simulateProviderAttemptAdmissionLock(clientA, key.id);
 
-        // 2. Admission confirms key is active while holding lock
+        // 3. Admission confirms key is active while holding lock
         expect(admissionResult.admitted).toBe(true);
         expect(admissionResult.reason).toBe('ACTIVE');
 
-        // 3. Transaction R begins revocation attempt, attempting SELECT ... FOR UPDATE
-        let revocationCompleted = false;
-        let revocationError: unknown = null;
-
+        // 4. Transaction R begins revocation attempt, attempting SELECT ... FOR UPDATE
         await clientR.query('BEGIN');
+        clientRInTx = true;
         await clientR.query(`SET LOCAL app.current_org_id = '${ORG_A_ID}'`);
 
-        const revocationPromise = (async () => {
+        revocationPromise = (async () => {
           try {
             await clientR.query('SELECT id FROM public.virtual_keys WHERE id = $1 FOR UPDATE', [
               key.id,
@@ -452,56 +491,169 @@ describe('SW-1.6.4: PostgreSQL 16 Virtual Key Revocation, Tenant Isolation & Con
               [key.id],
             );
             await clientR.query('COMMIT');
+            clientRInTx = false;
           } catch (err) {
             revocationError = err;
             await clientR.query('ROLLBACK').catch(() => undefined);
+            clientRInTx = false;
           } finally {
             revocationCompleted = true;
           }
         })();
 
-        // 4. Poll pg_locks deterministically to verify clientR is blocked by clientA
-        let blocked = false;
-        for (let i = 0; i < 50; i++) {
-          const locksRes = await adminClient.query<{ count: number }>(`
-            SELECT count(*)::int as count
-            FROM pg_locks
-            WHERE NOT granted
-          `);
-          if (locksRes.rows[0]!.count > 0) {
-            blocked = true;
+        // 5. Poll pg_blocking_pids(pidR) deterministically from adminClient to verify clientR is specifically blocked by clientA
+        let blockedByA = false;
+        const maxWaitMs = 2000;
+        const pollIntervalMs = 25;
+        const deadline = Date.now() + maxWaitMs;
+
+        while (Date.now() < deadline) {
+          const blockersRes = await adminClient.query<{ blockers: number[] }>(
+            'SELECT pg_blocking_pids($1::int) AS blockers',
+            [pidR],
+          );
+          if (blockersRes.rows[0]?.blockers?.includes(pidA)) {
+            blockedByA = true;
             break;
           }
-          await new Promise((resolve) => setTimeout(resolve, 20));
+          await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
         }
 
-        expect(blocked).toBe(true);
+        expect(blockedByA).toBe(true);
         expect(revocationCompleted).toBe(false);
 
-        // 5. Transaction A commits its admission (simulating attempt insertion commitment)
+        // 6. Transaction A commits its admission (simulating attempt insertion commitment)
         await clientA.query('COMMIT');
+        clientAInTx = false;
 
-        // 6. Transaction R unblocks, revokes key, and commits
+        // 7. Transaction R unblocks, revokes key, and commits
         await revocationPromise;
         expect(revocationCompleted).toBe(true);
         expect(revocationError).toBeNull();
 
-        // 7. Verify the key is now revoked in PostgreSQL
+        // 8. Verify the key is now revoked in PostgreSQL
         const dbRow = await adminClient.query<{ revoked_at: Date }>(
           'SELECT revoked_at FROM public.virtual_keys WHERE id = $1',
           [key.id],
         );
         expect(dbRow.rows[0]!.revoked_at).not.toBeNull();
 
-        // 8. Subsequent admission transaction (Transaction A2) sees revoked state and rejects
+        // 9. Subsequent admission transaction (Transaction A2) sees revoked state and rejects
         await withTenant(appPool, ORG_A_ID, async (clientA2) => {
           const recheck = await simulateProviderAttemptAdmissionLock(clientA2, key.id);
           expect(recheck.admitted).toBe(false);
           expect(recheck.reason).toBe('KEY_REVOKED');
         });
       } finally {
+        if (clientAInTx) {
+          await clientA.query('ROLLBACK').catch(() => undefined);
+        }
+        if (clientRInTx) {
+          await clientR.query('ROLLBACK').catch(() => undefined);
+        }
+        if (revocationPromise) {
+          await Promise.race([
+            revocationPromise.catch(() => undefined),
+            new Promise((resolve) => setTimeout(resolve, 500)),
+          ]);
+        }
         clientA.release();
         clientR.release();
+      }
+    });
+
+    it('Cleanup Safety: aborted or failed transactions release locks and do not leak transaction state into pool', async () => {
+      const key = await managementService.createKey(ORG_A_ID, 'Cleanup Safety Key');
+
+      const client1 = await appPool.connect();
+      const client2 = await appPool.connect();
+
+      let client1InTx = false;
+      let client2InTx = false;
+      let client2Acquired = false;
+      let client2Promise: Promise<void> | null = null;
+
+      try {
+        const pid1 = (await client1.query<{ pid: number }>('SELECT pg_backend_pid() AS pid'))
+          .rows[0]!.pid;
+        const pid2 = (await client2.query<{ pid: number }>('SELECT pg_backend_pid() AS pid'))
+          .rows[0]!.pid;
+
+        // Client 1 begins and holds row lock
+        await client1.query('BEGIN');
+        client1InTx = true;
+        await client1.query(`SET LOCAL app.current_org_id = '${ORG_A_ID}'`);
+        await client1.query('SELECT id FROM public.virtual_keys WHERE id = $1 FOR UPDATE', [
+          key.id,
+        ]);
+
+        // Client 2 begins and attempts to acquire lock on same row
+        await client2.query('BEGIN');
+        client2InTx = true;
+        await client2.query(`SET LOCAL app.current_org_id = '${ORG_A_ID}'`);
+
+        client2Promise = (async () => {
+          await client2.query('SELECT id FROM public.virtual_keys WHERE id = $1 FOR UPDATE', [
+            key.id,
+          ]);
+          client2Acquired = true;
+        })();
+
+        // Assert Client 2 is specifically blocked by Client 1
+        let blocked = false;
+        const deadline = Date.now() + 2000;
+        while (Date.now() < deadline) {
+          const res = await adminClient.query<{ blockers: number[] }>(
+            'SELECT pg_blocking_pids($1::int) AS blockers',
+            [pid2],
+          );
+          if (res.rows[0]?.blockers?.includes(pid1)) {
+            blocked = true;
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        expect(blocked).toBe(true);
+        expect(client2Acquired).toBe(false);
+
+        // Simulate Client 1 error / abort: rollback client 1
+        await client1.query('ROLLBACK');
+        client1InTx = false;
+
+        // Client 2 unblocks immediately
+        await client2Promise;
+        expect(client2Acquired).toBe(true);
+
+        await client2.query('ROLLBACK');
+        client2InTx = false;
+      } finally {
+        if (client1InTx) await client1.query('ROLLBACK').catch(() => undefined);
+        if (client2InTx) await client2.query('ROLLBACK').catch(() => undefined);
+        if (client2Promise) {
+          await Promise.race([
+            client2Promise.catch(() => undefined),
+            new Promise((r) => setTimeout(r, 500)),
+          ]);
+        }
+        client1.release();
+        client2.release();
+      }
+
+      // Verify a newly acquired connection from the pool has no open transaction or residual context
+      const freshClient = await appPool.connect();
+      try {
+        const txStatusRes = await freshClient.query<{ in_tx: boolean }>(
+          'SELECT pg_current_xact_id_if_assigned() IS NOT NULL AS in_tx',
+        );
+        expect(txStatusRes.rows[0]!.in_tx).toBe(false);
+
+        const lockCheck = await freshClient.query<{ id: string }>(
+          'SELECT id FROM public.virtual_keys WHERE id = $1',
+          [key.id],
+        );
+        expect(lockCheck.rows.length).toBe(0); // RLS active, no leaked context
+      } finally {
+        freshClient.release();
       }
     });
 
@@ -535,55 +687,75 @@ describe('SW-1.6.4: PostgreSQL 16 Virtual Key Revocation, Tenant Isolation & Con
   });
 
   describe('Section 10 & 11: Worker Role Least-Privilege Verification', () => {
-    it('proves gateway_worker role is denied INSERT, UPDATE, REVOKE, DELETE, and lookup_virtual_key_by_hash', async () => {
+    it('proves gateway_worker role is denied INSERT, UPDATE, REVOKE, DELETE, and lookup_virtual_key_by_hash with transaction-local tenant context', async () => {
       const key = await managementService.createKey(ORG_A_ID, 'Worker Privilege Audit Key');
 
       const workerClient = await workerPool.connect();
       try {
-        // Can read non-secret virtual key attribution columns under tenant context
-        await workerClient.query(`SET app.current_org_id = '${ORG_A_ID}'`);
+        // 1. Can read non-secret virtual key attribution columns under transaction-local tenant context
+        await workerClient.query('BEGIN');
+        await workerClient.query(`SET LOCAL app.current_org_id = '${ORG_A_ID}'`);
         const selectRes = await workerClient.query(
           'SELECT id, org_id, name, key_prefix, created_at, revoked_at FROM public.virtual_keys WHERE id = $1',
           [key.id],
         );
         expect(selectRes.rows.length).toBe(1);
+        await workerClient.query('COMMIT');
 
-        // Cannot INSERT (SQLSTATE 42501)
-        await expect(
-          workerClient.query(
-            `INSERT INTO public.virtual_keys (id, org_id, name, key_prefix, key_hash, allowed_models, rpm_limit, tpm_limit, concurrent_stream_limit)
-             VALUES ('${crypto.randomUUID()}', '${ORG_A_ID}', 'Worker Fake Key', 'gw_live_00000000000', '\\x01', '{}', 1, 1, 1)`,
-          ),
-        ).rejects.toThrow(/permission denied for table virtual_keys/);
+        // Helper to assert that a statement fails with 42501 in its own transaction block
+        const assertWorkerDenied = async (queryText: string, values?: unknown[]) => {
+          await workerClient.query('BEGIN');
+          await workerClient.query(`SET LOCAL app.current_org_id = '${ORG_A_ID}'`);
+          try {
+            await workerClient.query(queryText, values);
+            expect.unreachable('Expected permission denied error');
+          } catch (err: unknown) {
+            const pgErr = err as { code?: string; message?: string };
+            expect(pgErr.code).toBe('42501');
+            expect(pgErr.message).toMatch(/permission denied/);
+          } finally {
+            await workerClient.query('ROLLBACK');
+          }
+        };
 
-        // Cannot UPDATE policy columns (SQLSTATE 42501)
-        await expect(
-          workerClient.query('UPDATE public.virtual_keys SET rpm_limit = 50 WHERE id = $1', [
-            key.id,
-          ]),
-        ).rejects.toThrow(/permission denied for table virtual_keys/);
+        // 2. Cannot INSERT (SQLSTATE 42501)
+        await assertWorkerDenied(
+          `INSERT INTO public.virtual_keys (id, org_id, name, key_prefix, key_hash, allowed_models, rpm_limit, tpm_limit, concurrent_stream_limit)
+           VALUES ('${crypto.randomUUID()}', '${ORG_A_ID}', 'Worker Fake Key', 'gw_live_00000000000', '\\x01', '{}', 1, 1, 1)`,
+        );
 
-        // Cannot revoke key (UPDATE revoked_at) (SQLSTATE 42501)
-        await expect(
-          workerClient.query(
-            'UPDATE public.virtual_keys SET revoked_at = clock_timestamp() WHERE id = $1',
-            [key.id],
-          ),
-        ).rejects.toThrow(/permission denied for table virtual_keys/);
+        // 3. Cannot UPDATE policy columns (SQLSTATE 42501)
+        await assertWorkerDenied('UPDATE public.virtual_keys SET rpm_limit = 50 WHERE id = $1', [
+          key.id,
+        ]);
 
-        // Cannot DELETE row (SQLSTATE 42501)
-        await expect(
-          workerClient.query('DELETE FROM public.virtual_keys WHERE id = $1', [key.id]),
-        ).rejects.toThrow(/permission denied for table virtual_keys/);
+        // 4. Cannot revoke key (UPDATE revoked_at) (SQLSTATE 42501)
+        await assertWorkerDenied(
+          'UPDATE public.virtual_keys SET revoked_at = clock_timestamp() WHERE id = $1',
+          [key.id],
+        );
 
-        // Cannot execute restricted pre-tenant lookup app_private.lookup_virtual_key_by_hash (SQLSTATE 42501)
-        await expect(
-          workerClient.query('SELECT * FROM app_private.lookup_virtual_key_by_hash($1::bytea)', [
-            Buffer.alloc(32),
-          ]),
-        ).rejects.toThrow(/permission denied for function lookup_virtual_key_by_hash/);
+        // 5. Cannot DELETE row (SQLSTATE 42501)
+        await assertWorkerDenied('DELETE FROM public.virtual_keys WHERE id = $1', [key.id]);
+
+        // 6. Cannot execute restricted pre-tenant lookup app_private.lookup_virtual_key_by_hash (SQLSTATE 42501)
+        await assertWorkerDenied(
+          'SELECT * FROM app_private.lookup_virtual_key_by_hash($1::bytea)',
+          [Buffer.alloc(32)],
+        );
       } finally {
         workerClient.release();
+      }
+
+      // 7. Verify a subsequently acquired connection from workerPool has no residual tenant GUC context
+      const freshWorkerClient = await workerPool.connect();
+      try {
+        const gucRes = await freshWorkerClient.query<{ val: string | null }>(
+          "SELECT NULLIF(current_setting('app.current_org_id', true), '') AS val",
+        );
+        expect(gucRes.rows[0]?.val).toBeNull();
+      } finally {
+        freshWorkerClient.release();
       }
     });
   });
