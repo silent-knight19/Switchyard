@@ -343,13 +343,22 @@ describe('SW-1.6.1: Virtual Key Issuance Unit Tests (Section 13)', () => {
     });
 
     it('Valid key containing underscores in segments parses successfully', () => {
-      // Craft a valid 8-byte prefix and 32-byte secret where base64url contains underscores
-      // 0x3e in 6-bit index corresponds to '_' in base64url
-      const prefixBytes = Buffer.from([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8]);
+      // In base64url, index 63 (binary 111111) encodes to '_'.
+      // Placing 0xFC (binary 11111100) at byte 0 and byte 3 aligns 6-bit groups to produce '_'
+      const prefixBytes = Buffer.alloc(8, 0);
+      prefixBytes[0] = 0xfc;
+      prefixBytes[3] = 0xfc;
       const prefix = prefixBytes.toString('base64url'); // exactly 11 chars
+      expect(prefix.length).toBe(11);
+      expect(prefix).toContain('_');
+
       const secretBytes = Buffer.alloc(32, 0);
-      secretBytes[31] = 0xf8;
+      secretBytes[0] = 0xfc;
+      secretBytes[3] = 0xfc;
       const secret = secretBytes.toString('base64url'); // exactly 43 chars
+      expect(secret.length).toBe(43);
+      expect(secret).toContain('_');
+
       const rawKey = `gw_live_${prefix}_${secret}`;
       expect(rawKey.length).toBe(63);
 
@@ -360,12 +369,22 @@ describe('SW-1.6.1: Virtual Key Issuance Unit Tests (Section 13)', () => {
     });
 
     it('Valid key containing hyphens in segments parses successfully', () => {
-      // 0x3f in 6-bit index corresponds to '-' in base64url
-      const prefixBytes = Buffer.from([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfc]);
-      const prefix = prefixBytes.toString('base64url');
+      // In base64url, index 62 (binary 111110) encodes to '-'.
+      // Placing 0xF8 (binary 11111000) at byte 0 and byte 3 aligns 6-bit groups to produce '-'
+      const prefixBytes = Buffer.alloc(8, 0);
+      prefixBytes[0] = 0xf8;
+      prefixBytes[3] = 0xf8;
+      const prefix = prefixBytes.toString('base64url'); // exactly 11 chars
+      expect(prefix.length).toBe(11);
+      expect(prefix).toContain('-');
+
       const secretBytes = Buffer.alloc(32, 0);
-      secretBytes[31] = 0xfc;
-      const secret = secretBytes.toString('base64url');
+      secretBytes[0] = 0xf8;
+      secretBytes[3] = 0xf8;
+      const secret = secretBytes.toString('base64url'); // exactly 43 chars
+      expect(secret.length).toBe(43);
+      expect(secret).toContain('-');
+
       const rawKey = `gw_live_${prefix}_${secret}`;
       expect(rawKey.length).toBe(63);
 
