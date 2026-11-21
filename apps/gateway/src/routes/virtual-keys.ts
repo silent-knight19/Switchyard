@@ -115,6 +115,16 @@ export async function registerVirtualKeyRoutes(
         const principal = req.principal as BrowserPrincipal;
         const orgId = principal.orgId;
 
+        // Disallow unsupported query parameters
+        const query = req.query as Record<string, unknown> | undefined;
+        if (query && Object.keys(query).length > 0) {
+          return reply.status(400).send({
+            statusCode: 400,
+            error: 'Bad Request',
+            message: 'Query parameters are not permitted on this endpoint',
+          });
+        }
+
         // Strict request body validation: must be object with exactly 'name'
         const body = req.body;
         if (!body || typeof body !== 'object' || Array.isArray(body)) {
@@ -196,6 +206,19 @@ export async function registerVirtualKeyRoutes(
         const orgId = principal.orgId;
 
         const query = req.query as Record<string, unknown> | undefined;
+        if (query) {
+          const allowedQueryParams = new Set(['limit', 'cursor']);
+          for (const qKey of Object.keys(query)) {
+            if (!allowedQueryParams.has(qKey)) {
+              return reply.status(400).send({
+                statusCode: 400,
+                error: 'Bad Request',
+                message: `Unexpected query parameter "${qKey}" is not permitted`,
+              });
+            }
+          }
+        }
+
         let limit: number | undefined;
         let cursor: string | undefined;
 
@@ -244,6 +267,7 @@ export async function registerVirtualKeyRoutes(
         }
 
         const result = await service.listKeys(orgId, listOptions);
+        reply.header('Cache-Control', 'no-store');
         return reply.status(200).send(result);
       } catch (err) {
         sendErrorReply(reply, err);
@@ -267,6 +291,16 @@ export async function registerVirtualKeyRoutes(
         const principal = req.principal as BrowserPrincipal;
         const orgId = principal.orgId;
 
+        // Disallow unsupported query parameters
+        const query = req.query as Record<string, unknown> | undefined;
+        if (query && Object.keys(query).length > 0) {
+          return reply.status(400).send({
+            statusCode: 400,
+            error: 'Bad Request',
+            message: 'Query parameters are not permitted on this endpoint',
+          });
+        }
+
         const params = req.params as { id?: unknown };
         if (!isValidUuid(params.id)) {
           return reply.status(400).send({
@@ -278,6 +312,7 @@ export async function registerVirtualKeyRoutes(
         const keyId = (params.id as string).trim();
 
         const result = await service.replacePolicy(orgId, keyId, req.body);
+        reply.header('Cache-Control', 'no-store');
         return reply.status(200).send(result);
       } catch (err) {
         sendErrorReply(reply, err);
@@ -301,6 +336,16 @@ export async function registerVirtualKeyRoutes(
         const principal = req.principal as BrowserPrincipal;
         const orgId = principal.orgId;
 
+        // Disallow unsupported query parameters
+        const query = req.query as Record<string, unknown> | undefined;
+        if (query && Object.keys(query).length > 0) {
+          return reply.status(400).send({
+            statusCode: 400,
+            error: 'Bad Request',
+            message: 'Query parameters are not permitted on this endpoint',
+          });
+        }
+
         const params = req.params as { id?: unknown };
         if (!isValidUuid(params.id)) {
           return reply.status(400).send({
@@ -312,6 +357,7 @@ export async function registerVirtualKeyRoutes(
         const keyId = (params.id as string).trim();
 
         await service.revokeKey(orgId, keyId);
+        reply.header('Cache-Control', 'no-store');
         return reply.status(204).send();
       } catch (err) {
         sendErrorReply(reply, err);

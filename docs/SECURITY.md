@@ -406,25 +406,25 @@ All management routes require a verified browser session and an administrative t
 ### 13.3 CSRF & Canonical Origin Enforcement
 - Mutating endpoints (`POST`, `PUT`, `DELETE`) require:
   - Exact match of the `Origin` header against the canonical gateway origin (`BROWSER_ORIGIN`).
-  - Valid, unexpired browser session cookie (`switchyard_session`).
-  - Valid `x-csrf-token` header whose HMAC-SHA-256 digest matches the session record.
+  - Valid, unexpired browser session cookie: `__Host-session` in production (`Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/`, no `Domain`), or `switchyard_session` in development/test.
+  - Valid `x-csrf-token` header containing a cryptographically random session-bound synchronizer token whose SHA-256 digest is stored server-side in `web_sessions` and compared in constant time.
 - CSRF tokens from other sessions or organizations are rejected with HTTP 403.
 - Mutating handlers never execute if CSRF or origin validation fails.
 
 ### 13.4 One-Time Key Disclosure & Browser Secret Boundary
 - **Plaintext Disclosure:** The raw API key (`gw_live_<11>_<43>`) is disclosed exactly once in the `POST /api/keys` response body upon confirmed PostgreSQL transaction commit.
-- **Cache Prevention:** The creation response includes mandatory non-cacheable headers:
-  - `Cache-Control: no-store`
-  - `Pragma: no-cache`
+- **Cache Prevention:** All sensitive virtual-key management endpoints (`POST /api/keys`, `GET /api/keys`, `PUT /api/keys/:id/policy`, `DELETE /api/keys/:id`) return mandatory non-cacheable headers:
+  - `Cache-Control: no-store` on all management responses
+  - `Pragma: no-cache` additionally on key creation responses
 - **Zero Raw Key Recovery:** Raw keys and verifier hashes (`key_hash`) are never stored in plaintext, never returned in list/update/revoke responses, and cannot be retrieved or recovered by administrators. If a key is lost, it must be revoked and replaced.
 - **Browser-JavaScript Secret Exposure Constraint:** Browser JavaScript consuming the gateway API must not retain virtual keys long-term, and keys must never be stored in `localStorage`, `sessionStorage`, browser cookies, SSR hydration bundles, or analytics payloads.
 
 ### 13.5 Keyset Pagination & Tenant Isolation
-- **Tenant Filter:** All database operations run inside `withTenant(pool, authenticatedOrgId)`. PostgreSQL's `FORCE ROW LEVEL SECURITY` policy on `virtual_keys` guarantees Tenant A cannot read, update, or revoke Tenant B keys. Cross-tenant lookups return HTTP 404 with identical generic error messages to non-existent keys.
+- **Tenant Filter:** All database operations run inside `withTenant(pool, authenticatedOrgId)`. PostgreSQL's `FORCE ROW LEVEL SECURITY` policy on `virtual_keys` guarantees Tenant A cannot read, update, or revoke Tenant B keys. Cross-tenant lookups return generic external HTTP 404 responses identical to nonexistent keys, preserving tenant confidentiality.
 - **Deterministic Ordering:** Keys are ordered by `created_at DESC, id DESC`.
-- **Keyset Pagination:** Next pages are requested via an opaque base64url cursor containing `{ createdAt, id }`. If multiple keys share the exact same `created_at` timestamp, the composite tie-breaker `id DESC` guarantees stable pagination with zero duplicate or skipped keys.
+- **Keyset Pagination:** Next pages are requested via an opaque base64url cursor containing `{ createdAt, id }`, where `createdAt` preserves exact microsecond UTC precision (`YYYY-MM-DDTHH:mm:ss.ffffffZ`). Keyset comparison `(created_at, id) < ($1::timestamptz, $2::uuid)` alongside composite tie-breaker `id DESC` guarantees stable pagination with zero duplicate or skipped keys across identical milliseconds or timestamps.
 - **Bounded Page Size:** Query limit defaults to 20, with a strict maximum of 100. Arbitrary `OFFSET` queries and unbounded scans are prohibited.
-- **Fail-Closed Cursors:** Malformed or tampered cursors return HTTP 400 validation errors rather than falling back to unbounded table scans.
+- **Fail-Closed Cursors:** Malformed, tampered, non-canonical, or non-microsecond cursors return HTTP 400 validation errors rather than falling back to unbounded table scans.
 
 ### 13.6 Full-Replacement Policy Validation
 The `PUT /api/keys/:id/policy` endpoint implements strict full-replacement semantics to prevent partial policy inheritance:

@@ -62,6 +62,9 @@ export interface VirtualKeyManagementServiceOptions {
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const CONTROL_CHARS_REGEX = /[\u0000-\u001F\u007F-\u009F]/;
+const CURSOR_TIMESTAMP_REGEX = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/;
+const BASE64URL_REGEX = /^[A-Za-z0-9_-]+$/;
+const MAX_CURSOR_LENGTH = 256;
 const MAX_ALLOWED_MODELS = 100;
 const MAX_MODEL_ID_LENGTH = 128;
 const MAX_PG_INTEGER = 2147483647;
@@ -99,8 +102,28 @@ export function decodeCursor(cursor: unknown): DecodedCursor {
     throw new VirtualKeyManagementError('INVALID_INPUT', 'Invalid cursor: malformed cursor');
   }
 
+  if (cursor.length > MAX_CURSOR_LENGTH) {
+    throw new VirtualKeyManagementError('INVALID_INPUT', 'Invalid cursor: malformed cursor');
+  }
+
+  if (!BASE64URL_REGEX.test(cursor)) {
+    throw new VirtualKeyManagementError('INVALID_INPUT', 'Invalid cursor: malformed cursor');
+  }
+
+  let rawJson: string;
   try {
-    const rawJson = Buffer.from(cursor, 'base64url').toString('utf8');
+    const buf = Buffer.from(cursor, 'base64url');
+    if (buf.toString('base64url') !== cursor) {
+      throw new Error('Non-canonical base64url encoding');
+    }
+    rawJson = buf.toString('utf8');
+  } catch (err) {
+    throw new VirtualKeyManagementError('INVALID_INPUT', 'Invalid cursor: malformed cursor', {
+      cause: err,
+    });
+  }
+
+  try {
     const parsed = JSON.parse(rawJson) as unknown;
 
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -113,7 +136,11 @@ export function decodeCursor(cursor: unknown): DecodedCursor {
       throw new Error('Unexpected cursor keys');
     }
 
-    if (typeof rec.createdAt !== 'string' || isNaN(Date.parse(rec.createdAt))) {
+    if (
+      typeof rec.createdAt !== 'string' ||
+      !CURSOR_TIMESTAMP_REGEX.test(rec.createdAt) ||
+      isNaN(Date.parse(rec.createdAt))
+    ) {
       throw new Error('Invalid cursor createdAt timestamp');
     }
 
@@ -122,7 +149,7 @@ export function decodeCursor(cursor: unknown): DecodedCursor {
     }
 
     return {
-      createdAt: new Date(rec.createdAt).toISOString(),
+      createdAt: rec.createdAt,
       id: rec.id.trim(),
     };
   } catch (err) {
@@ -132,12 +159,26 @@ export function decodeCursor(cursor: unknown): DecodedCursor {
   }
 }
 
-export function encodeCursor(createdAt: Date, id: string): string {
+export function encodeCursor(cursorCreatedAt: string, id: string): string {
+  if (
+    typeof cursorCreatedAt !== 'string' ||
+    !CURSOR_TIMESTAMP_REGEX.test(cursorCreatedAt) ||
+    isNaN(Date.parse(cursorCreatedAt))
+  ) {
+    throw new VirtualKeyManagementError(
+      'INVALID_INPUT',
+      'Invalid cursor timestamp: must be microsecond UTC format YYYY-MM-DDTHH:mm:ss.ffffffZ',
+    );
+  }
+
+  const trimmedId = validateKeyId(id);
+
   return Buffer.from(
     JSON.stringify({
-      createdAt: createdAt.toISOString(),
-      id,
+      createdAt: cursorCreatedAt,
+      id: trimmedId,
     }),
+    'utf8',
   ).toString('base64url');
 }
 
@@ -433,6 +474,7 @@ export class VirtualKeyManagementService {
             name,
             key_prefix,
             created_at,
+            to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_created_at,
             revoked_at,
             allowed_models,
             rpm_limit,
@@ -443,7 +485,7 @@ export class VirtualKeyManagementService {
             pii_redaction_enabled,
             store_payloads
           FROM virtual_keys
-          WHERE (created_at < $1::timestamptz) OR (created_at = $1::timestamptz AND id < $2::uuid)
+          WHERE (created_at, id) < ($1::timestamptz, $2::uuid)
           ORDER BY created_at DESC, id DESC
           LIMIT $3
         `;
@@ -455,6 +497,7 @@ export class VirtualKeyManagementService {
             name,
             key_prefix,
             created_at,
+            to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_created_at,
             revoked_at,
             allowed_models,
             rpm_limit,
@@ -476,6 +519,7 @@ export class VirtualKeyManagementService {
         name: string;
         key_prefix: string;
         created_at: Date;
+        cursor_created_at: string;
         revoked_at: Date | null;
         allowed_models: string[];
         rpm_limit: number;
@@ -494,7 +538,7 @@ export class VirtualKeyManagementService {
       let nextCursor: string | null = null;
       if (hasMore && resultRows.length > 0) {
         const lastRow = resultRows[resultRows.length - 1]!;
-        nextCursor = encodeCursor(lastRow.created_at, lastRow.id);
+        nextCursor = encodeCursor(lastRow.cursor_created_at, lastRow.id);
       }
 
       const items: KeyMetadataDto[] = resultRows.map((r) => ({

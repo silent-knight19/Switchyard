@@ -156,6 +156,8 @@ describe('SW-1.6.3: HTTP Authorization, CSRF, RBAC & Secret Canary Suite', () =>
         payload: { name: 'Alpha Matrix Key' },
       });
       expect(createRes.statusCode).toBe(201);
+      expect(createRes.headers['cache-control']).toBe('no-store');
+      expect(createRes.headers['pragma']).toBe('no-cache');
       const keyId = createRes.json().id;
 
       // 2. List
@@ -167,6 +169,7 @@ describe('SW-1.6.3: HTTP Authorization, CSRF, RBAC & Secret Canary Suite', () =>
         },
       });
       expect(listRes.statusCode).toBe(200);
+      expect(listRes.headers['cache-control']).toBe('no-store');
       expect(listRes.json().items.some((k: { id: string }) => k.id === keyId)).toBe(true);
 
       // 3. Update Policy
@@ -190,6 +193,7 @@ describe('SW-1.6.3: HTTP Authorization, CSRF, RBAC & Secret Canary Suite', () =>
         },
       });
       expect(updateRes.statusCode).toBe(200);
+      expect(updateRes.headers['cache-control']).toBe('no-store');
       expect(updateRes.json().rpmLimit).toBe(120);
 
       // 4. Revoke
@@ -203,6 +207,7 @@ describe('SW-1.6.3: HTTP Authorization, CSRF, RBAC & Secret Canary Suite', () =>
         },
       });
       expect(revokeRes.statusCode).toBe(204);
+      expect(revokeRes.headers['cache-control']).toBe('no-store');
     });
 
     it('Tenant B admin on Tenant A key: 404 on policy update, 404 on revoke, own-tenant only on list', async () => {
@@ -434,6 +439,93 @@ describe('SW-1.6.3: HTTP Authorization, CSRF, RBAC & Secret Canary Suite', () =>
         },
       });
       expect(res.statusCode).toBe(401);
+    });
+
+    it('rejects unsupported query parameters across all 4 endpoints (400 Bad Request)', async () => {
+      const queryTestAdminSession = await sessionService.createSession(ORG_A_ID, USER_A_ADMIN_ID);
+
+      // 1. POST /api/keys?orgId=... -> 400
+      const postRes = await app.inject({
+        method: 'POST',
+        url: '/api/keys?orgId=' + ORG_B_ID,
+        headers: {
+          origin: ALLOWED_ORIGIN,
+          cookie: makeCookie(queryTestAdminSession.secret),
+          'x-csrf-token': queryTestAdminSession.csrfToken,
+        },
+        payload: { name: 'Query Param Attempt' },
+      });
+      expect(postRes.statusCode).toBe(400);
+      expect(postRes.json().message).toContain('Query parameters are not permitted');
+
+      // 2. GET /api/keys?orgId=... -> 400
+      const getOrgIdRes = await app.inject({
+        method: 'GET',
+        url: '/api/keys?orgId=' + ORG_B_ID,
+        headers: {
+          cookie: makeCookie(queryTestAdminSession.secret),
+        },
+      });
+      expect(getOrgIdRes.statusCode).toBe(400);
+      expect(getOrgIdRes.json().message).toContain('Unexpected query parameter "orgId"');
+
+      // GET /api/keys?tenantId=... -> 400
+      const getTenantIdRes = await app.inject({
+        method: 'GET',
+        url: '/api/keys?tenantId=' + ORG_B_ID,
+        headers: {
+          cookie: makeCookie(queryTestAdminSession.secret),
+        },
+      });
+      expect(getTenantIdRes.statusCode).toBe(400);
+      expect(getTenantIdRes.json().message).toContain('Unexpected query parameter "tenantId"');
+
+      // GET /api/keys?role=admin -> 400
+      const getRoleRes = await app.inject({
+        method: 'GET',
+        url: '/api/keys?role=admin',
+        headers: {
+          cookie: makeCookie(queryTestAdminSession.secret),
+        },
+      });
+      expect(getRoleRes.statusCode).toBe(400);
+      expect(getRoleRes.json().message).toContain('Unexpected query parameter "role"');
+
+      // 3. PUT /api/keys/:id/policy?orgId=... -> 400
+      const putRes = await app.inject({
+        method: 'PUT',
+        url: `/api/keys/${activeKeyAId}/policy?orgId=${ORG_B_ID}`,
+        headers: {
+          origin: ALLOWED_ORIGIN,
+          cookie: makeCookie(queryTestAdminSession.secret),
+          'x-csrf-token': queryTestAdminSession.csrfToken,
+        },
+        payload: {
+          allowedModels: ['gpt-4o'],
+          rpmLimit: 120,
+          tpmLimit: 12000,
+          concurrentStreamLimit: 5,
+          exactCacheEnabled: false,
+          semanticCacheEnabled: false,
+          piiRedactionEnabled: true,
+          storePayloads: false,
+        },
+      });
+      expect(putRes.statusCode).toBe(400);
+      expect(putRes.json().message).toContain('Query parameters are not permitted');
+
+      // 4. DELETE /api/keys/:id?foo=bar -> 400
+      const deleteRes = await app.inject({
+        method: 'DELETE',
+        url: `/api/keys/${activeKeyAId}?foo=bar`,
+        headers: {
+          origin: ALLOWED_ORIGIN,
+          cookie: makeCookie(queryTestAdminSession.secret),
+          'x-csrf-token': queryTestAdminSession.csrfToken,
+        },
+      });
+      expect(deleteRes.statusCode).toBe(400);
+      expect(deleteRes.json().message).toContain('Query parameters are not permitted');
     });
   });
 

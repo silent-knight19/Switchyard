@@ -269,6 +269,344 @@ describe('SW-1.6.3: PostgreSQL 16 Virtual Key Management & Policy Integration Su
       const allIds = [...page1.items.map((i) => i.id), ...page2.items.map((i) => i.id)];
       expect(allIds).toEqual([keyId3, keyId2, keyId1]);
     });
+
+    it('Test A: microsecond timestamp roundtrip preserves exact 6 decimal digits in cursor', async () => {
+      const orgId = crypto.randomUUID();
+      await adminClient.query(`
+        INSERT INTO public.organizations (id, name, monthly_budget_microdollars, kek_version, wrapped_dek, dek_iv, dek_auth_tag)
+        VALUES ('${orgId}', 'Microsecond Roundtrip Org', 1000000, 1, '\\x01', '\\x02', '\\x03');
+      `);
+
+      const keyId1 = '44444444-4444-4444-8444-444444444441';
+      const keyId2 = '44444444-4444-4444-8444-444444444442';
+      const exactMicrosecondStr = '2026-11-21 12:34:56.123456+00';
+
+      await adminClient.query(
+        `
+        INSERT INTO public.virtual_keys (id, org_id, name, key_prefix, key_hash, allowed_models, rpm_limit, tpm_limit, concurrent_stream_limit, created_at)
+        VALUES
+          ($1, $2, 'Micro Key 1', 'gw_live_11111111111', $3, '{}', 1, 1, 1, $4),
+          ($5, $2, 'Micro Key 2', 'gw_live_22222222222', $6, '{}', 1, 1, 1, '2026-11-21 12:34:55.000000+00');
+        `,
+        [
+          keyId1,
+          orgId,
+          crypto.randomBytes(32),
+          exactMicrosecondStr,
+          keyId2,
+          crypto.randomBytes(32),
+        ],
+      );
+
+      // Page with limit 1 should yield keyId1 and nextCursor containing .123456Z
+      const page1 = await managementService.listKeys(orgId, { limit: 1 });
+      expect(page1.items.length).toBe(1);
+      expect(page1.items[0]!.id).toBe(keyId1);
+      expect(page1.nextCursor).not.toBeNull();
+
+      const decoded = JSON.parse(Buffer.from(page1.nextCursor!, 'base64url').toString('utf8')) as {
+        createdAt: string;
+        id: string;
+      };
+      expect(decoded.createdAt).toBe('2026-11-21T12:34:56.123456Z');
+      expect(decoded.id).toBe(keyId1);
+
+      // Using this cursor fetches keyId2
+      const page2 = await managementService.listKeys(orgId, {
+        limit: 1,
+        cursor: page1.nextCursor!,
+      });
+      expect(page2.items.length).toBe(1);
+      expect(page2.items[0]!.id).toBe(keyId2);
+      expect(page2.nextCursor).toBeNull();
+    });
+
+    it('Test B: paginates >= 5 keys sharing exact same microsecond timestamp without skips or duplicates', async () => {
+      const orgId = crypto.randomUUID();
+      await adminClient.query(`
+        INSERT INTO public.organizations (id, name, monthly_budget_microdollars, kek_version, wrapped_dek, dek_iv, dek_auth_tag)
+        VALUES ('${orgId}', 'Identical Microseconds Org', 1000000, 1, '\\x01', '\\x02', '\\x03');
+      `);
+
+      const exactMicrosecondStr = '2026-11-21 15:00:00.654321+00';
+      const keyIds = [
+        '55555555-5555-4555-8555-555555555551',
+        '55555555-5555-4555-8555-555555555552',
+        '55555555-5555-4555-8555-555555555553',
+        '55555555-5555-4555-8555-555555555554',
+        '55555555-5555-4555-8555-555555555555',
+      ];
+
+      for (let i = 0; i < keyIds.length; i++) {
+        await adminClient.query(
+          `
+          INSERT INTO public.virtual_keys (id, org_id, name, key_prefix, key_hash, allowed_models, rpm_limit, tpm_limit, concurrent_stream_limit, created_at)
+          VALUES ($1, $2, $3, $4, $5, '{}', 1, 1, 1, $6);
+        `,
+          [
+            keyIds[i],
+            orgId,
+            `Identical TS Key ${i}`,
+            `gw_live_${i}1111111111`,
+            crypto.randomBytes(32),
+            exactMicrosecondStr,
+          ],
+        );
+      }
+
+      // Paginate in pages of 2
+      const page1 = await managementService.listKeys(orgId, { limit: 2 });
+      expect(page1.items.length).toBe(2);
+      expect(page1.nextCursor).not.toBeNull();
+
+      const page2 = await managementService.listKeys(orgId, {
+        limit: 2,
+        cursor: page1.nextCursor!,
+      });
+      expect(page2.items.length).toBe(2);
+      expect(page2.nextCursor).not.toBeNull();
+
+      const page3 = await managementService.listKeys(orgId, {
+        limit: 2,
+        cursor: page2.nextCursor!,
+      });
+      expect(page3.items.length).toBe(1);
+      expect(page3.nextCursor).toBeNull();
+
+      const retrievedIds = [
+        ...page1.items.map((k) => k.id),
+        ...page2.items.map((k) => k.id),
+        ...page3.items.map((k) => k.id),
+      ];
+
+      // Ordered strictly by id DESC since created_at are identical
+      const expectedIds = [...keyIds].sort().reverse();
+      expect(retrievedIds).toEqual(expectedIds);
+    });
+
+    it('Test C: paginates distinct timestamps within one millisecond without skipping rows', async () => {
+      const orgId = crypto.randomUUID();
+      await adminClient.query(`
+        INSERT INTO public.organizations (id, name, monthly_budget_microdollars, kek_version, wrapped_dek, dek_iv, dek_auth_tag)
+        VALUES ('${orgId}', 'Sub-Millisecond Org', 1000000, 1, '\\x01', '\\x02', '\\x03');
+      `);
+
+      const timestamps = [
+        '2026-11-21 12:00:00.123999+00',
+        '2026-11-21 12:00:00.123750+00',
+        '2026-11-21 12:00:00.123456+00',
+        '2026-11-21 12:00:00.123250+00',
+        '2026-11-21 12:00:00.123001+00',
+      ];
+
+      const keyIds = [
+        '66666666-6666-4666-8666-666666666661',
+        '66666666-6666-4666-8666-666666666662',
+        '66666666-6666-4666-8666-666666666663',
+        '66666666-6666-4666-8666-666666666664',
+        '66666666-6666-4666-8666-666666666665',
+      ];
+
+      for (let i = 0; i < keyIds.length; i++) {
+        await adminClient.query(
+          `
+          INSERT INTO public.virtual_keys (id, org_id, name, key_prefix, key_hash, allowed_models, rpm_limit, tpm_limit, concurrent_stream_limit, created_at)
+          VALUES ($1, $2, $3, $4, $5, '{}', 1, 1, 1, $6);
+        `,
+          [
+            keyIds[i],
+            orgId,
+            `Sub-ms Key ${i}`,
+            `gw_live_${i}2222222222`,
+            crypto.randomBytes(32),
+            timestamps[i],
+          ],
+        );
+      }
+
+      // Page with limit 2
+      const page1 = await managementService.listKeys(orgId, { limit: 2 });
+      expect(page1.items.length).toBe(2);
+      expect(page1.items.map((k) => k.id)).toEqual([keyIds[0], keyIds[1]]);
+      expect(page1.nextCursor).not.toBeNull();
+
+      // Page 2: with millisecond truncation, this would skip rows or fail
+      const page2 = await managementService.listKeys(orgId, {
+        limit: 2,
+        cursor: page1.nextCursor!,
+      });
+      expect(page2.items.length).toBe(2);
+      expect(page2.items.map((k) => k.id)).toEqual([keyIds[2], keyIds[3]]);
+      expect(page2.nextCursor).not.toBeNull();
+
+      // Page 3
+      const page3 = await managementService.listKeys(orgId, {
+        limit: 2,
+        cursor: page2.nextCursor!,
+      });
+      expect(page3.items.length).toBe(1);
+      expect(page3.items.map((k) => k.id)).toEqual([keyIds[4]]);
+      expect(page3.nextCursor).toBeNull();
+    });
+
+    it('Test D: paginates mixed timestamp groups accurately', async () => {
+      const orgId = crypto.randomUUID();
+      await adminClient.query(`
+        INSERT INTO public.organizations (id, name, monthly_budget_microdollars, kek_version, wrapped_dek, dek_iv, dek_auth_tag)
+        VALUES ('${orgId}', 'Mixed Groups Org', 1000000, 1, '\\x01', '\\x02', '\\x03');
+      `);
+
+      // Two keys at T1, two at T2, two at T3
+      const t1 = '2026-11-21 16:00:00.300000+00';
+      const t2 = '2026-11-21 16:00:00.200000+00';
+      const t3 = '2026-11-21 16:00:00.100000+00';
+
+      const keys = [
+        { id: '77777777-7777-4777-8777-777777777771', ts: t1 },
+        { id: '77777777-7777-4777-8777-777777777772', ts: t1 },
+        { id: '77777777-7777-4777-8777-777777777773', ts: t2 },
+        { id: '77777777-7777-4777-8777-777777777774', ts: t2 },
+        { id: '77777777-7777-4777-8777-777777777775', ts: t3 },
+        { id: '77777777-7777-4777-8777-777777777776', ts: t3 },
+      ];
+
+      for (let i = 0; i < keys.length; i++) {
+        await adminClient.query(
+          `
+          INSERT INTO public.virtual_keys (id, org_id, name, key_prefix, key_hash, allowed_models, rpm_limit, tpm_limit, concurrent_stream_limit, created_at)
+          VALUES ($1, $2, $3, $4, $5, '{}', 1, 1, 1, $6);
+        `,
+          [
+            keys[i]!.id,
+            orgId,
+            `Mixed Key ${i}`,
+            `gw_live_${i}3333333333`,
+            crypto.randomBytes(32),
+            keys[i]!.ts,
+          ],
+        );
+      }
+
+      const allItems: string[] = [];
+      let cursor: string | undefined;
+
+      for (let p = 0; p < 3; p++) {
+        const listOpts: { limit: number; cursor?: string } = { limit: 2 };
+        if (cursor !== undefined) {
+          listOpts.cursor = cursor;
+        }
+        const page = await managementService.listKeys(orgId, listOpts);
+        allItems.push(...page.items.map((k) => k.id));
+        cursor = page.nextCursor ?? undefined;
+      }
+
+      expect(allItems.length).toBe(6);
+      expect(cursor).toBeUndefined();
+      // Group T1 sorted by id DESC
+      expect(allItems[0]).toBe('77777777-7777-4777-8777-777777777772');
+      expect(allItems[1]).toBe('77777777-7777-4777-8777-777777777771');
+      // Group T2 sorted by id DESC
+      expect(allItems[2]).toBe('77777777-7777-4777-8777-777777777774');
+      expect(allItems[3]).toBe('77777777-7777-4777-8777-777777777773');
+      // Group T3 sorted by id DESC
+      expect(allItems[4]).toBe('77777777-7777-4777-8777-777777777776');
+      expect(allItems[5]).toBe('77777777-7777-4777-8777-777777777775');
+    });
+
+    it('Test E: rejects malformed, truncated, oversized, noncanonical cursors fail-closed', async () => {
+      // 1. Truncated millisecond timestamp
+      const msCursor = Buffer.from(
+        JSON.stringify({
+          createdAt: '2026-11-21T12:00:00.123Z',
+          id: '11111111-1111-4111-8111-111111111111',
+        }),
+      ).toString('base64url');
+
+      await expect(
+        managementService.listKeys(ORG_A_ID, { cursor: msCursor }),
+      ).rejects.toMatchObject({
+        reason: 'INVALID_INPUT',
+      });
+
+      // 2. Oversized cursor (> 256 chars)
+      const oversizedCursor = 'A'.repeat(257);
+      await expect(
+        managementService.listKeys(ORG_A_ID, { cursor: oversizedCursor }),
+      ).rejects.toMatchObject({
+        reason: 'INVALID_INPUT',
+      });
+
+      // 3. Non-canonical base64url padding
+      const validCursor = Buffer.from(
+        JSON.stringify({
+          createdAt: '2026-11-21T12:00:00.123456Z',
+          id: '11111111-1111-4111-8111-111111111111',
+        }),
+      ).toString('base64url');
+
+      await expect(
+        managementService.listKeys(ORG_A_ID, { cursor: validCursor + '=' }),
+      ).rejects.toMatchObject({
+        reason: 'INVALID_INPUT',
+      });
+
+      // 4. Malformed JSON
+      const malformedJsonCursor = Buffer.from('{not json}').toString('base64url');
+      await expect(
+        managementService.listKeys(ORG_A_ID, { cursor: malformedJsonCursor }),
+      ).rejects.toMatchObject({
+        reason: 'INVALID_INPUT',
+      });
+    });
+
+    it('Test F: preserves strict tenant isolation across cursors without cross-tenant leakage', async () => {
+      // Create a key in Org A and obtain its cursor
+      const keyA = await managementService.createKey(ORG_A_ID, 'Org A Cursor Key');
+      const listA = await managementService.listKeys(ORG_A_ID, { limit: 1 });
+      expect(listA.items[0]!.id).toBe(keyA.id);
+
+      // Now pass Org A cursor to Org B listKeys
+      // It must execute strictly under Org B RLS context and return only Org B keys (never Org A keys)
+      const listOptsB: { limit: number; cursor?: string } = { limit: 10 };
+      if (listA.nextCursor !== null) {
+        listOptsB.cursor = listA.nextCursor;
+      }
+      const listB = await managementService.listKeys(ORG_B_ID, listOptsB);
+
+      for (const item of listB.items) {
+        expect(item.id).not.toBe(keyA.id);
+      }
+    });
+
+    it('Test G: enforces limit bounds (default 20, max 100, rejects invalid)', async () => {
+      // Default limit is 20
+      const defaultPage = await managementService.listKeys(ORG_A_ID);
+      expect(defaultPage.items.length).toBeLessThanOrEqual(20);
+
+      // Max limit 100 accepted
+      const maxPage = await managementService.listKeys(ORG_A_ID, { limit: 100 });
+      expect(maxPage.items.length).toBeLessThanOrEqual(100);
+
+      // Limit 101 rejected
+      await expect(managementService.listKeys(ORG_A_ID, { limit: 101 })).rejects.toMatchObject({
+        reason: 'INVALID_INPUT',
+      });
+
+      // Limit 0 rejected
+      await expect(managementService.listKeys(ORG_A_ID, { limit: 0 })).rejects.toMatchObject({
+        reason: 'INVALID_INPUT',
+      });
+
+      // Negative limit rejected
+      await expect(managementService.listKeys(ORG_A_ID, { limit: -1 })).rejects.toMatchObject({
+        reason: 'INVALID_INPUT',
+      });
+
+      // Fractional limit rejected
+      await expect(managementService.listKeys(ORG_A_ID, { limit: 1.5 })).rejects.toMatchObject({
+        reason: 'INVALID_INPUT',
+      });
+    });
   });
 
   describe('Section 11.3: Atomic Policy Replacement', () => {

@@ -40,14 +40,34 @@ describe('SW-1.6.3: Virtual Key Management & Policy Unit Tests', () => {
   });
 
   describe('Cursor Encoding & Keyset Pagination Parsing', () => {
-    it('encodes and decodes cursor round-trip faithfully', () => {
-      const now = new Date();
-      const cursor = encodeCursor(now, VALID_UUID);
+    const validMicrosecondTs = '2026-11-21T12:34:56.123456Z';
+
+    it('encodes and decodes microsecond cursor round-trip faithfully', () => {
+      const cursor = encodeCursor(validMicrosecondTs, VALID_UUID);
       expect(typeof cursor).toBe('string');
 
       const decoded = decodeCursor(cursor);
-      expect(decoded.createdAt).toBe(now.toISOString());
+      expect(decoded.createdAt).toBe(validMicrosecondTs);
       expect(decoded.id).toBe(VALID_UUID);
+    });
+
+    it('rejects invalid inputs to encodeCursor', () => {
+      // Millisecond timestamp (3 decimal places) rejected
+      expect(() => encodeCursor('2026-11-21T12:34:56.123Z', VALID_UUID)).toThrow(
+        VirtualKeyManagementError,
+      );
+      // No decimal places rejected
+      expect(() => encodeCursor('2026-11-21T12:34:56Z', VALID_UUID)).toThrow(
+        VirtualKeyManagementError,
+      );
+      // Invalid date string
+      expect(() => encodeCursor('invalid-timestamp', VALID_UUID)).toThrow(
+        VirtualKeyManagementError,
+      );
+      // Invalid UUID
+      expect(() => encodeCursor(validMicrosecondTs, 'not-a-uuid')).toThrow(
+        VirtualKeyManagementError,
+      );
     });
 
     it('rejects malformed cursor inputs fail-closed', () => {
@@ -57,41 +77,55 @@ describe('SW-1.6.3: Virtual Key Management & Policy Unit Tests', () => {
       expect(() => decodeCursor(123)).toThrow(VirtualKeyManagementError);
       expect(() => decodeCursor('not-base64url!@#$')).toThrow(VirtualKeyManagementError);
 
+      // Oversized cursor (> 256 chars)
+      const oversized = 'A'.repeat(257);
+      expect(() => decodeCursor(oversized)).toThrow(VirtualKeyManagementError);
+
+      // Non-canonical base64url encoding (e.g. padding characters '=')
+      const canonicalCursor = encodeCursor(validMicrosecondTs, VALID_UUID);
+      expect(() => decodeCursor(canonicalCursor + '=')).toThrow(VirtualKeyManagementError);
+
       // JSON that is not an object
       const invalidJson1 = Buffer.from(JSON.stringify([1, 2, 3])).toString('base64url');
       expect(() => decodeCursor(invalidJson1)).toThrow(VirtualKeyManagementError);
 
       // JSON missing id
-      const invalidJson2 = Buffer.from(
-        JSON.stringify({ createdAt: new Date().toISOString() }),
-      ).toString('base64url');
+      const invalidJson2 = Buffer.from(JSON.stringify({ createdAt: validMicrosecondTs })).toString(
+        'base64url',
+      );
       expect(() => decodeCursor(invalidJson2)).toThrow(VirtualKeyManagementError);
 
       // JSON missing createdAt
       const invalidJson3 = Buffer.from(JSON.stringify({ id: VALID_UUID })).toString('base64url');
       expect(() => decodeCursor(invalidJson3)).toThrow(VirtualKeyManagementError);
 
-      // JSON with invalid date
+      // JSON with millisecond-only date (3 decimal digits instead of 6)
       const invalidJson4 = Buffer.from(
-        JSON.stringify({ createdAt: 'invalid-date', id: VALID_UUID }),
+        JSON.stringify({ createdAt: '2026-11-21T12:34:56.123Z', id: VALID_UUID }),
       ).toString('base64url');
       expect(() => decodeCursor(invalidJson4)).toThrow(VirtualKeyManagementError);
 
-      // JSON with invalid UUID id
+      // JSON with invalid date
       const invalidJson5 = Buffer.from(
-        JSON.stringify({ createdAt: new Date().toISOString(), id: 'not-a-uuid' }),
+        JSON.stringify({ createdAt: 'invalid-date', id: VALID_UUID }),
       ).toString('base64url');
       expect(() => decodeCursor(invalidJson5)).toThrow(VirtualKeyManagementError);
 
-      // JSON with unexpected extra properties
+      // JSON with invalid UUID id
       const invalidJson6 = Buffer.from(
+        JSON.stringify({ createdAt: validMicrosecondTs, id: 'not-a-uuid' }),
+      ).toString('base64url');
+      expect(() => decodeCursor(invalidJson6)).toThrow(VirtualKeyManagementError);
+
+      // JSON with unexpected extra properties
+      const invalidJson7 = Buffer.from(
         JSON.stringify({
-          createdAt: new Date().toISOString(),
+          createdAt: validMicrosecondTs,
           id: VALID_UUID,
           extra: 'malicious',
         }),
       ).toString('base64url');
-      expect(() => decodeCursor(invalidJson6)).toThrow(VirtualKeyManagementError);
+      expect(() => decodeCursor(invalidJson7)).toThrow(VirtualKeyManagementError);
     });
   });
 
