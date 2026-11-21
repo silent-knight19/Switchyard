@@ -407,7 +407,7 @@ describe('SW-1.6.1: Real PostgreSQL 16 Virtual Key Database & Security Suite (Se
            VALUES ($1, $2, 'k2', 'gw_live_hint_c02', $3, '{}', 1, 1, 1)`,
           [id2, ORG_A_ID, fixedHash],
         ),
-      ).rejects.toMatchObject({ code: '23505' });
+      ).rejects.toMatchObject({ code: '23505', constraint: 'virtual_keys_key_hash_key' });
     });
 
     it('22. Concurrent inserts of the same verifier allow at most one committed row', async () => {
@@ -522,6 +522,67 @@ describe('SW-1.6.1: Real PostgreSQL 16 Virtual Key Database & Security Suite (Se
       const hashes = rows.map((r: { key_hash: Buffer }) => r.key_hash.toString('hex'));
       const uniqueHashes = new Set(hashes);
       expect(uniqueHashes.size).toBe(3);
+    });
+
+    it('27b. Concurrent VirtualKeyService.createKey() issuances across tenants succeed without collisions or cross-tenant contamination', async () => {
+      // Execute 10 concurrent service issuances (5 for Org A and 5 for Org B)
+      const ops = [
+        service.createKey({ orgId: ORG_A_ID, name: 'Conc A 1' }),
+        service.createKey({ orgId: ORG_A_ID, name: 'Conc A 2' }),
+        service.createKey({ orgId: ORG_A_ID, name: 'Conc A 3' }),
+        service.createKey({ orgId: ORG_A_ID, name: 'Conc A 4' }),
+        service.createKey({ orgId: ORG_A_ID, name: 'Conc A 5' }),
+        service.createKey({ orgId: ORG_B_ID, name: 'Conc B 1' }),
+        service.createKey({ orgId: ORG_B_ID, name: 'Conc B 2' }),
+        service.createKey({ orgId: ORG_B_ID, name: 'Conc B 3' }),
+        service.createKey({ orgId: ORG_B_ID, name: 'Conc B 4' }),
+        service.createKey({ orgId: ORG_B_ID, name: 'Conc B 5' }),
+      ];
+
+      const results = await Promise.all(ops);
+      expect(results.length).toBe(10);
+
+      const allIds = new Set(results.map((r) => r.id));
+      expect(allIds.size).toBe(10);
+
+      const allRawKeys = new Set(results.map((r) => r.rawKey));
+      expect(allRawKeys.size).toBe(10);
+
+      const allPrefixes = new Set(results.map((r) => r.keyPrefix));
+      expect(allPrefixes.size).toBe(10);
+
+      // Verify tenant isolation: querying Org A under tenant context sees exactly Org A's 5 keys
+      const orgAKeys = await withTenant(appPool, ORG_A_ID, async (client) => {
+        const { rows } = await client.query<{ id: string; org_id: string }>(
+          'SELECT id, org_id FROM virtual_keys WHERE name LIKE $1',
+          ['Conc A %'],
+        );
+        return rows;
+      });
+      expect(orgAKeys.length).toBe(5);
+      expect(orgAKeys.every((k) => k.org_id === ORG_A_ID)).toBe(true);
+
+      // Verify cross-tenant isolation: querying Org A under tenant context sees 0 keys of Org B
+      const leakedBKeys = await withTenant(appPool, ORG_A_ID, async (client) => {
+        const { rows } = await client.query<{ id: string; org_id: string }>(
+          'SELECT id, org_id FROM virtual_keys WHERE name LIKE $1',
+          ['Conc B %'],
+        );
+        return rows;
+      });
+      expect(leakedBKeys.length).toBe(0);
+
+      // Verify all 10 verifier hashes in the database are distinct
+      const ids = results.map((r) => r.id);
+      const { rows } = await adminClient.query(
+        'SELECT key_hash FROM virtual_keys WHERE id = ANY($1)',
+        [ids],
+      );
+      expect(rows.length).toBe(10);
+      const uniqueHashes = new Set(
+        rows.map((r: { key_hash: Buffer }) => r.key_hash.toString('hex')),
+      );
+      expect(uniqueHashes.size).toBe(10);
     });
 
     it('28. The service uses no Redis authorization cache', () => {

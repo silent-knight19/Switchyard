@@ -284,10 +284,11 @@ No production business or management endpoints are exposed in SW-1.5.4. Test end
 Switchyard implements cryptographic virtual API key issuance as an internal Gateway service (`VirtualKeyService`), enforcing SHA-256 verifier persistence, tenant isolation, restrictive initial policy, and one-time plaintext disclosure (Architecture v1.2 §13.1, §14.3).
 
 ### 11.1 Key Representation & Cryptographic Entropy
-- **Entropy Sources:** Generated using Node.js built-in `crypto.randomBytes()`. No deterministic PRNG, predictable seeds, timestamps, user IDs, or organization IDs are used.
+- **Entropy Sources:** Generated using Node.js built-in `crypto.randomBytes()`, which draws from system CSPRNG entropy (`/dev/urandom` / `getrandom(2)` on Unix/Linux). While empirical test suites confirm non-collision across sample runs, formal randomness independence and unpredictability rely on the underlying OS kernel entropy pool and CSPRNG design rather than finite statistical sampling. No deterministic PRNG, predictable seeds, timestamps, user IDs, or organization IDs are used.
 - **Public Prefix:** 8 random bytes encoded as unpadded base64url (exactly 11 characters). Stored in `virtual_keys.key_prefix` as `gw_live_<11>`. The prefix is public metadata for listings, disambiguated by row UUID; it is never treated as authentication evidence.
 - **Secret Material:** 32 random bytes (256-bit entropy) encoded as unpadded base64url (exactly 43 characters).
 - **Canonical Envelope:** `gw_live_<11-char-public-prefix>_<43-char-secret>` (exactly 63 ASCII characters).
+- **Canonical Base64url Parsing (VK-01):** Key envelopes are strictly validated using `parseRawKey()`. Keys must be exactly 63 ASCII characters matching `^gw_live_([A-Za-z0-9_-]{11})_([A-Za-z0-9_-]{43})$`. The parser decodes both segments and immediately re-encodes them to verify that the original strings match canonical unpadded base64url representations, fail-closed against noncanonical trailing padding bits (such as 42 `A`s followed by `B`).
 - **Verifier Computation:** Computed as `SHA-256(secretBytes)` over the 32 raw secret bytes. The resulting 32-byte digest is stored in `virtual_keys.key_hash` as binary `BYTEA UNIQUE`. The printable key string, prefix, and base64url secret are never hashed or stored.
 
 ### 11.2 One-Time Disclosure & Secrecy Invariants
@@ -295,7 +296,7 @@ Switchyard implements cryptographic virtual API key issuance as an internal Gate
 - **Zero Raw Key Persistence:** Raw keys and secret bytes are never stored in PostgreSQL, Redis, cookies, browser storage, background queues, or application caches.
 - **Zero Logging:** Raw keys, secrets, hashes, SQL parameters, and connection strings are excluded from Pino logs, error messages, and exception serialization.
 - **No Recovery Mechanism:** No `getRawKey()` or secret retrieval method exists. Plaintext cannot be recovered from the 32-byte SHA-256 verifier.
-- **Memory Hygiene:** Mutable secret and prefix byte buffers are zeroed out (`buffer.fill(0)`) immediately following digest computation.
+- **Memory Hygiene:** Mutable byte buffers (`Buffer`) allocated for prefix and secret generation or parsing are explicitly cleared using `.fill(0)`. However, zeroization is strictly best-effort for mutable buffers; immutable V8 JavaScript strings (`rawKey`, `secret`, `publicPrefix`) retain representations in process heap memory until garbage collected.
 
 ### 11.3 Database Integrity & Deny-All Initial Policy
 - **Transaction Scope:** All insertions execute within `withTenant(pool, orgId)` using the runtime role `gateway_app`. Direct insertion without tenant context and cross-tenant insertion are strictly denied by RLS (`FORCE ROW LEVEL SECURITY`).
@@ -306,7 +307,7 @@ Switchyard implements cryptographic virtual API key issuance as an internal Gate
   - `pii_redaction_enabled = true`, `store_payloads = false`.
   - `revoked_at = NULL`.
 - **Commit Confirmation:** The raw key is returned to the caller only after PostgreSQL confirms durable transaction commit (`COMMIT`). Failed or rolled-back transactions never return a key.
-- **Bounded Collision Handling:** Qualifying unique constraint violations on `virtual_keys_key_hash_key` or `virtual_keys_pkey` trigger regeneration of all key material up to a maximum of 3 total attempts before failing closed with `KEY_COLLISION_EXHAUSTED`. Non-collision errors fail closed without retry.
+- **Bounded Collision Handling (VK-02):** Retry is strictly limited to SQLSTATE `23505` (`unique_violation`) matching explicitly confirmed unique constraints on `public.virtual_keys`: `virtual_keys_key_hash_key`, `virtual_keys_pkey`, and `virtual_keys_id_org_id_key`. If the constraint name is missing or unrecognized, or if any other database error occurs (foreign-key, check constraint, RLS, permission, connection), the service fails closed immediately without retry. A maximum of 3 attempts are permitted before raising `KEY_COLLISION_EXHAUSTED`.
 - **Role Isolation:** `gateway_worker` is strictly denied `INSERT` and `UPDATE` on `virtual_keys` (42501).
 
 ### 11.4 Future Integration Contracts

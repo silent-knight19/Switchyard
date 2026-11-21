@@ -66,9 +66,9 @@ const CONTROL_CHARS_REGEX = /[\u0000-\u001F\u007F-\u009F]/;
 
 /**
  * Qualifying unique constraint names on the public.virtual_keys table that
- * justify collision regeneration and retry.
+ * justify collision regeneration and retry (confirmed against PostgreSQL catalog).
  */
-const QUALIFYING_COLLISION_CONSTRAINTS = new Set([
+export const QUALIFYING_COLLISION_CONSTRAINTS = new Set([
   'virtual_keys_key_hash_key',
   'virtual_keys_pkey',
   'virtual_keys_id_org_id_key',
@@ -77,20 +77,20 @@ const QUALIFYING_COLLISION_CONSTRAINTS = new Set([
 /**
  * Inspects an error or wrapped error cause to extract PostgreSQL SQLSTATE and constraint name.
  */
-function extractDbError(err: unknown): { code: string; constraint?: string } | undefined {
+export function extractDbError(err: unknown): { code: string; constraint?: string } | undefined {
   if (!err || typeof err !== 'object') {
     return undefined;
   }
   const e = err as { code?: unknown; constraint?: unknown; cause?: unknown };
   if (typeof e.code === 'string') {
-    return typeof e.constraint === 'string'
+    return typeof e.constraint === 'string' && e.constraint.length > 0
       ? { code: e.code, constraint: e.constraint }
       : { code: e.code };
   }
   if (e.cause && typeof e.cause === 'object') {
     const c = e.cause as { code?: unknown; constraint?: unknown };
     if (typeof c.code === 'string') {
-      return typeof c.constraint === 'string'
+      return typeof c.constraint === 'string' && c.constraint.length > 0
         ? { code: c.code, constraint: c.constraint }
         : { code: c.code };
     }
@@ -100,14 +100,24 @@ function extractDbError(err: unknown): { code: string; constraint?: string } | u
 
 /**
  * Determines whether a database error is a qualifying uniqueness collision on virtual_keys.
+ *
+ * Strict Collision Classification (VK-02):
+ * 1. Requires exact SQLSTATE '23505' (unique_violation).
+ * 2. Requires an explicit, non-empty constraint name.
+ * 3. Restricts eligible constraints strictly to confirmed unique constraints on virtual_keys:
+ *    - virtual_keys_key_hash_key
+ *    - virtual_keys_pkey
+ *    - virtual_keys_id_org_id_key
+ * 4. Missing, empty, or unrecognized constraint names fail closed (returns false).
+ * 5. Foreign-key, RLS, permission, serialization, or network errors return false.
  */
-function isQualifyingCollision(err: unknown): boolean {
+export function isQualifyingCollision(err: unknown): boolean {
   const dbErr = extractDbError(err);
   if (!dbErr || dbErr.code !== '23505') {
     return false;
   }
-  // If constraint name is reported, verify it matches virtual_keys unique constraints
-  if (dbErr.constraint && !QUALIFYING_COLLISION_CONSTRAINTS.has(dbErr.constraint)) {
+  // Require explicit recognized unique constraint name; fail closed if missing or unrecognized
+  if (!dbErr.constraint || !QUALIFYING_COLLISION_CONSTRAINTS.has(dbErr.constraint)) {
     return false;
   }
   return true;
@@ -116,7 +126,7 @@ function isQualifyingCollision(err: unknown): boolean {
 /**
  * Determines whether a database error is a foreign key violation (e.g. non-existent organization).
  */
-function isForeignKeyViolation(err: unknown): boolean {
+export function isForeignKeyViolation(err: unknown): boolean {
   const dbErr = extractDbError(err);
   return dbErr?.code === '23503';
 }
@@ -157,19 +167,68 @@ export function generateKeyMaterial(): {
 }
 
 /**
- * Canonical virtual API key format parser.
- * Extracts the 11-character public prefix and 43-character base64url secret.
- * Returns null if the key envelope does not match gw_live_<11>_<43>.
+ * Canonical virtual API key format parser (VK-01).
+ *
+ * Strict Canonical Validation Rules:
+ * 1. Checks exact length of 63 ASCII characters.
+ * 2. Matches exact envelope: starts with "gw_live_", followed by exactly 11 base64url chars,
+ *    an underscore separator, and exactly 43 base64url chars.
+ * 3. Enforces standard base64url alphabet [A-Za-z0-9_-]; rejects whitespace, padding ('='), '+', '/'.
+ * 4. Decodes public-prefix segment into exactly 8 bytes.
+ * 5. Decodes secret segment into exactly 32 bytes.
+ * 6. Re-encodes decoded byte buffers back to canonical unpadded base64url.
+ * 7. Requires re-encoded strings to strictly equal the original segments, rejecting any
+ *    noncanonical trailing padding bits.
+ * 8. Best-effort zeroization: clears mutable decoded byte buffers before returning.
+ * 9. Returns { publicPrefix, secret } on success, or null on any validation failure.
  */
 export function parseRawKey(rawKey: string): { publicPrefix: string; secret: string } | null {
+  if (typeof rawKey !== 'string' || rawKey.length !== 63) {
+    return null;
+  }
+
   const match = /^gw_live_([A-Za-z0-9_-]{11})_([A-Za-z0-9_-]{43})$/.exec(rawKey);
   if (!match) {
     return null;
   }
-  return {
-    publicPrefix: match[1]!,
-    secret: match[2]!,
-  };
+
+  const publicPrefix = match[1]!;
+  const secret = match[2]!;
+
+  let prefixBytes: Buffer | undefined;
+  let secretBytes: Buffer | undefined;
+
+  try {
+    prefixBytes = Buffer.from(publicPrefix, 'base64url');
+    if (prefixBytes.length !== 8) {
+      return null;
+    }
+    if (prefixBytes.toString('base64url') !== publicPrefix) {
+      return null;
+    }
+
+    secretBytes = Buffer.from(secret, 'base64url');
+    if (secretBytes.length !== 32) {
+      return null;
+    }
+    if (secretBytes.toString('base64url') !== secret) {
+      return null;
+    }
+
+    return {
+      publicPrefix,
+      secret,
+    };
+  } catch {
+    return null;
+  } finally {
+    if (prefixBytes) {
+      prefixBytes.fill(0);
+    }
+    if (secretBytes) {
+      secretBytes.fill(0);
+    }
+  }
 }
 
 /**

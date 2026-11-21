@@ -2,8 +2,11 @@ import crypto from 'node:crypto';
 import type pg from 'pg';
 import { describe, expect, it, vi } from 'vitest';
 import {
+  extractDbError,
   generateKeyMaterial,
+  isQualifyingCollision,
   parseRawKey,
+  QUALIFYING_COLLISION_CONSTRAINTS,
   VirtualKeyError,
   VirtualKeyService,
 } from './virtual-key.js';
@@ -329,6 +332,259 @@ describe('SW-1.6.1: Virtual Key Issuance Unit Tests (Section 13)', () => {
     });
   });
 
+  describe('Canonical Raw-Key Parsing & Regression Tests (VK-01)', () => {
+    it('Generated valid key parses successfully', () => {
+      const material = generateKeyMaterial();
+      const parsed = parseRawKey(material.rawKey);
+      expect(parsed).not.toBeNull();
+      expect(parsed!.publicPrefix).toBe(material.publicPrefix);
+      expect(parsed!.publicPrefix.length).toBe(11);
+      expect(parsed!.secret.length).toBe(43);
+    });
+
+    it('Valid key containing underscores in segments parses successfully', () => {
+      // Craft a valid 8-byte prefix and 32-byte secret where base64url contains underscores
+      // 0x3e in 6-bit index corresponds to '_' in base64url
+      const prefixBytes = Buffer.from([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8]);
+      const prefix = prefixBytes.toString('base64url'); // exactly 11 chars
+      const secretBytes = Buffer.alloc(32, 0);
+      secretBytes[31] = 0xf8;
+      const secret = secretBytes.toString('base64url'); // exactly 43 chars
+      const rawKey = `gw_live_${prefix}_${secret}`;
+      expect(rawKey.length).toBe(63);
+
+      const parsed = parseRawKey(rawKey);
+      expect(parsed).not.toBeNull();
+      expect(parsed!.publicPrefix).toBe(prefix);
+      expect(parsed!.secret).toBe(secret);
+    });
+
+    it('Valid key containing hyphens in segments parses successfully', () => {
+      // 0x3f in 6-bit index corresponds to '-' in base64url
+      const prefixBytes = Buffer.from([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfc]);
+      const prefix = prefixBytes.toString('base64url');
+      const secretBytes = Buffer.alloc(32, 0);
+      secretBytes[31] = 0xfc;
+      const secret = secretBytes.toString('base64url');
+      const rawKey = `gw_live_${prefix}_${secret}`;
+      expect(rawKey.length).toBe(63);
+
+      const parsed = parseRawKey(rawKey);
+      expect(parsed).not.toBeNull();
+      expect(parsed!.publicPrefix).toBe(prefix);
+      expect(parsed!.secret).toBe(secret);
+    });
+
+    it('Valid independent 8-byte public prefix decodes to exactly 8 bytes', () => {
+      const material = generateKeyMaterial();
+      const parsed = parseRawKey(material.rawKey);
+      expect(parsed).not.toBeNull();
+      const prefixBuf = Buffer.from(parsed!.publicPrefix, 'base64url');
+      expect(prefixBuf.length).toBe(8);
+    });
+
+    it('Valid independent 32-byte secret decodes to exactly 32 bytes', () => {
+      const material = generateKeyMaterial();
+      const parsed = parseRawKey(material.rawKey);
+      expect(parsed).not.toBeNull();
+      const secretBuf = Buffer.from(parsed!.secret, 'base64url');
+      expect(secretBuf.length).toBe(32);
+    });
+
+    it('Noncanonical secret final padding bits rejected (42 As followed by B)', () => {
+      // 43 chars of 'A' represents 32 zero bytes with 00 padding bits.
+      // 42 As followed by 'B' has non-zero padding bits that decode to the same 32 zero bytes
+      // under a permissive decoder, but must be rejected by canonical validation.
+      const validPrefix = 'A'.repeat(11);
+      const noncanonicalSecret = 'A'.repeat(42) + 'B';
+      const rawKey = `gw_live_${validPrefix}_${noncanonicalSecret}`;
+      expect(rawKey.length).toBe(63);
+
+      const parsed = parseRawKey(rawKey);
+      expect(parsed).toBeNull();
+    });
+
+    it('Noncanonical secret final padding bits rejected for other invalid trailing chars', () => {
+      const validPrefix = 'A'.repeat(11);
+      // In base64url, characters with non-zero trailing 2 padding bits:
+      // 'B' (01), 'C' (10), 'D' (11) for data bits 0000 (re-encode to 'A')
+      // 'F' (01), 'G' (10), 'H' (11) for data bits 0001 (re-encode to 'E')
+      for (const trailing of ['B', 'C', 'D', 'F', 'G', 'H']) {
+        const noncanonicalSecret = 'A'.repeat(42) + trailing;
+        const rawKey = `gw_live_${validPrefix}_${noncanonicalSecret}`;
+        const parsed = parseRawKey(rawKey);
+        expect(parsed).toBeNull();
+      }
+    });
+
+    it('Noncanonical public-prefix final padding bits rejected (10 As followed by B)', () => {
+      // 11 chars of 'A' represents 8 zero bytes with 00 padding bits.
+      // 10 As followed by 'B' has non-zero padding bits.
+      const noncanonicalPrefix = 'A'.repeat(10) + 'B';
+      const validSecret = 'A'.repeat(43);
+      const rawKey = `gw_live_${noncanonicalPrefix}_${validSecret}`;
+      expect(rawKey.length).toBe(63);
+
+      const parsed = parseRawKey(rawKey);
+      expect(parsed).toBeNull();
+    });
+
+    it('Invalid total length rejected (too short or too long)', () => {
+      const validKey = `gw_live_${'A'.repeat(11)}_${'A'.repeat(43)}`; // length 63
+      expect(parseRawKey(validKey)).not.toBeNull();
+
+      expect(parseRawKey(validKey.slice(0, 62))).toBeNull(); // 62 chars
+      expect(parseRawKey(`${validKey}A`)).toBeNull(); // 64 chars
+      expect(parseRawKey('')).toBeNull();
+      expect(parseRawKey('gw_live_')).toBeNull();
+    });
+
+    it('Invalid segment lengths rejected even when total length is 63', () => {
+      // 10-char prefix and 44-char secret: total length is 8 + 10 + 1 + 44 = 63
+      const key1 = `gw_live_${'A'.repeat(10)}_${'A'.repeat(44)}`;
+      expect(key1.length).toBe(63);
+      expect(parseRawKey(key1)).toBeNull();
+
+      // 12-char prefix and 42-char secret: total length is 8 + 12 + 1 + 42 = 63
+      const key2 = `gw_live_${'A'.repeat(12)}_${'A'.repeat(42)}`;
+      expect(key2.length).toBe(63);
+      expect(parseRawKey(key2)).toBeNull();
+    });
+
+    it('Base64 padding rejected', () => {
+      // Replaces characters with '=' padding
+      const keyWithPad = `gw_live_${'A'.repeat(10)}=_${'A'.repeat(42)}=`;
+      expect(parseRawKey(keyWithPad)).toBeNull();
+    });
+
+    it('Standard base64 alphabet rejected (+ and /)', () => {
+      const keyWithPlus = `gw_live_${'A'.repeat(10)}+_${'A'.repeat(43)}`;
+      expect(parseRawKey(keyWithPlus)).toBeNull();
+
+      const keyWithSlash = `gw_live_${'A'.repeat(11)}_${'A'.repeat(42)}/`;
+      expect(parseRawKey(keyWithSlash)).toBeNull();
+    });
+
+    it('Whitespace rejected (leading, trailing, or internal)', () => {
+      const validKey = `gw_live_${'A'.repeat(11)}_${'A'.repeat(43)}`;
+      expect(parseRawKey(` ${validKey}`)).toBeNull();
+      expect(parseRawKey(`${validKey} `)).toBeNull();
+      expect(parseRawKey(validKey.replace('_', ' '))).toBeNull();
+      expect(parseRawKey(validKey.replace('A', '\t'))).toBeNull();
+      expect(parseRawKey(validKey.replace('A', '\n'))).toBeNull();
+    });
+
+    it('Invalid characters rejected', () => {
+      const validKey = `gw_live_${'A'.repeat(11)}_${'A'.repeat(43)}`;
+      for (const char of ['!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '.', ':', ';']) {
+        const corrupted = validKey.slice(0, 10) + char + validKey.slice(11);
+        expect(parseRawKey(corrupted)).toBeNull();
+      }
+    });
+
+    it('Canonical encode/decode round-trip succeeds for all valid generated keys', () => {
+      for (let i = 0; i < 25; i++) {
+        const material = generateKeyMaterial();
+        const parsed = parseRawKey(material.rawKey);
+        expect(parsed).not.toBeNull();
+
+        const prefixBuf = Buffer.from(parsed!.publicPrefix, 'base64url');
+        expect(prefixBuf.toString('base64url')).toBe(parsed!.publicPrefix);
+
+        const secretBuf = Buffer.from(parsed!.secret, 'base64url');
+        expect(secretBuf.toString('base64url')).toBe(parsed!.secret);
+      }
+    });
+
+    it('Generated keys continue to produce the exact existing SHA-256 verifier', () => {
+      const material = generateKeyMaterial();
+      const parsed = parseRawKey(material.rawKey);
+      expect(parsed).not.toBeNull();
+
+      const secretBytes = Buffer.from(parsed!.secret, 'base64url');
+      const expectedDigest = crypto.createHash('sha256').update(secretBytes).digest();
+      expect(material.keyHash.equals(expectedDigest)).toBe(true);
+    });
+  });
+
+  describe('Strict Collision Classification Matrix (VK-02)', () => {
+    it('Recognizes known unique key-hash constraint (virtual_keys_key_hash_key)', () => {
+      expect(QUALIFYING_COLLISION_CONSTRAINTS.has('virtual_keys_key_hash_key')).toBe(true);
+      expect(
+        isQualifyingCollision({ code: '23505', constraint: 'virtual_keys_key_hash_key' }),
+      ).toBe(true);
+    });
+
+    it('Recognizes known primary key constraint (virtual_keys_pkey)', () => {
+      expect(QUALIFYING_COLLISION_CONSTRAINTS.has('virtual_keys_pkey')).toBe(true);
+      expect(isQualifyingCollision({ code: '23505', constraint: 'virtual_keys_pkey' })).toBe(true);
+    });
+
+    it('Recognizes known composite tenant unique constraint (virtual_keys_id_org_id_key)', () => {
+      expect(QUALIFYING_COLLISION_CONSTRAINTS.has('virtual_keys_id_org_id_key')).toBe(true);
+      expect(
+        isQualifyingCollision({ code: '23505', constraint: 'virtual_keys_id_org_id_key' }),
+      ).toBe(true);
+    });
+
+    it('Rejects unknown unique constraint names fail-closed', () => {
+      expect(isQualifyingCollision({ code: '23505', constraint: 'users_email_key' })).toBe(false);
+      expect(isQualifyingCollision({ code: '23505', constraint: 'organizations_name_key' })).toBe(
+        false,
+      );
+      expect(isQualifyingCollision({ code: '23505', constraint: 'unknown_constraint' })).toBe(
+        false,
+      );
+    });
+
+    it('Rejects missing constraint name fail-closed', () => {
+      expect(isQualifyingCollision({ code: '23505' })).toBe(false);
+      expect(isQualifyingCollision({ code: '23505', constraint: undefined })).toBe(false);
+      expect(isQualifyingCollision({ code: '23505', constraint: '' })).toBe(false);
+    });
+
+    it('Rejects non-23505 SQLSTATE codes even with recognized constraint names', () => {
+      // Foreign key (23503)
+      expect(
+        isQualifyingCollision({ code: '23503', constraint: 'virtual_keys_key_hash_key' }),
+      ).toBe(false);
+      // Not null (23502)
+      expect(
+        isQualifyingCollision({ code: '23502', constraint: 'virtual_keys_key_hash_key' }),
+      ).toBe(false);
+      // Check violation (23514)
+      expect(
+        isQualifyingCollision({ code: '23514', constraint: 'virtual_keys_key_hash_key' }),
+      ).toBe(false);
+      // Permission denied (42501)
+      expect(isQualifyingCollision({ code: '42501' })).toBe(false);
+      // Serialization failure (40001)
+      expect(isQualifyingCollision({ code: '40001' })).toBe(false);
+      // Connection failure (08006)
+      expect(isQualifyingCollision({ code: '08006' })).toBe(false);
+    });
+
+    it('Extracts SQLSTATE and constraint from wrapped error causes', () => {
+      const wrapped = new Error('wrapped query failure', {
+        cause: { code: '23505', constraint: 'virtual_keys_key_hash_key' },
+      });
+      expect(isQualifyingCollision(wrapped)).toBe(true);
+
+      const extracted = extractDbError(wrapped);
+      expect(extracted).toEqual({
+        code: '23505',
+        constraint: 'virtual_keys_key_hash_key',
+      });
+    });
+
+    it('extractDbError handles null, undefined, and non-object errors safely', () => {
+      expect(extractDbError(null)).toBeUndefined();
+      expect(extractDbError(undefined)).toBeUndefined();
+      expect(extractDbError('string error')).toBeUndefined();
+      expect(extractDbError(42)).toBeUndefined();
+    });
+  });
+
   describe('Failure Behavior & Collision Handling (Tests 23–30)', () => {
     function createMockPool() {
       const client = {
@@ -388,6 +644,168 @@ describe('SW-1.6.1: Virtual Key Issuance Unit Tests (Section 13)', () => {
       const res = await service.createKey({ orgId: VALID_ORG_ID, name: VALID_NAME });
       expect(insertAttempts).toBe(2);
       expect(res.id).toBe('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb');
+    });
+
+    it('23b. Known generated-ID primary key violation triggers regeneration', async () => {
+      const { pool, client } = createMockPool();
+      let insertAttempts = 0;
+
+      client.query.mockImplementation(
+        async (sql: string | { text: string; values?: unknown[] }, values?: unknown[]) => {
+          const text = typeof sql === 'string' ? sql : sql.text;
+          const vals = typeof sql === 'object' && sql.values ? sql.values : values;
+          if (text === 'BEGIN') return { command: 'BEGIN' };
+          if (text.includes('set_config')) return { rows: [] };
+          if (text.includes('INSERT INTO virtual_keys')) {
+            insertAttempts++;
+            if (insertAttempts === 1) {
+              const err = new Error('duplicate key on pkey') as Error & {
+                code: string;
+                constraint: string;
+              };
+              err.code = '23505';
+              err.constraint = 'virtual_keys_pkey';
+              throw err;
+            }
+            return {
+              rows: [
+                {
+                  id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbc',
+                  org_id: VALID_ORG_ID,
+                  name: VALID_NAME,
+                  key_prefix: (vals?.[3] as string) ?? 'hint',
+                  created_at: new Date(),
+                },
+              ],
+            };
+          }
+          if (text === 'ROLLBACK') return { command: 'ROLLBACK' };
+          if (text === 'COMMIT') return { command: 'COMMIT' };
+          if (text === 'RESET ALL' || text === 'DISCARD TEMP') return { rows: [] };
+          if (text.includes('current_setting')) return { rows: [{ cur_org: null }] };
+          return { rows: [] };
+        },
+      );
+
+      const service = new VirtualKeyService(pool);
+      const res = await service.createKey({ orgId: VALID_ORG_ID, name: VALID_NAME });
+      expect(insertAttempts).toBe(2);
+      expect(res.id).toBe('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbc');
+    });
+
+    it('23c. Known composite tenant unique violation triggers regeneration', async () => {
+      const { pool, client } = createMockPool();
+      let insertAttempts = 0;
+
+      client.query.mockImplementation(
+        async (sql: string | { text: string; values?: unknown[] }, values?: unknown[]) => {
+          const text = typeof sql === 'string' ? sql : sql.text;
+          const vals = typeof sql === 'object' && sql.values ? sql.values : values;
+          if (text === 'BEGIN') return { command: 'BEGIN' };
+          if (text.includes('set_config')) return { rows: [] };
+          if (text.includes('INSERT INTO virtual_keys')) {
+            insertAttempts++;
+            if (insertAttempts === 1) {
+              const err = new Error('duplicate key on id_org_id') as Error & {
+                code: string;
+                constraint: string;
+              };
+              err.code = '23505';
+              err.constraint = 'virtual_keys_id_org_id_key';
+              throw err;
+            }
+            return {
+              rows: [
+                {
+                  id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbd',
+                  org_id: VALID_ORG_ID,
+                  name: VALID_NAME,
+                  key_prefix: (vals?.[3] as string) ?? 'hint',
+                  created_at: new Date(),
+                },
+              ],
+            };
+          }
+          if (text === 'ROLLBACK') return { command: 'ROLLBACK' };
+          if (text === 'COMMIT') return { command: 'COMMIT' };
+          if (text === 'RESET ALL' || text === 'DISCARD TEMP') return { rows: [] };
+          if (text.includes('current_setting')) return { rows: [{ cur_org: null }] };
+          return { rows: [] };
+        },
+      );
+
+      const service = new VirtualKeyService(pool);
+      const res = await service.createKey({ orgId: VALID_ORG_ID, name: VALID_NAME });
+      expect(insertAttempts).toBe(2);
+      expect(res.id).toBe('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbd');
+    });
+
+    it('23d. Unknown unique constraint does NOT retry and fails closed with DATABASE_ERROR', async () => {
+      const { pool, client } = createMockPool();
+      let insertAttempts = 0;
+
+      client.query.mockImplementation(async (sql: string | { text: string }) => {
+        const text = typeof sql === 'string' ? sql : sql.text;
+        if (text === 'BEGIN') return { command: 'BEGIN' };
+        if (text.includes('set_config')) return { rows: [] };
+        if (text.includes('INSERT INTO virtual_keys')) {
+          insertAttempts++;
+          const err = new Error('duplicate key on unrelated table') as Error & {
+            code: string;
+            constraint: string;
+          };
+          err.code = '23505';
+          err.constraint = 'users_email_key';
+          throw err;
+        }
+        if (text === 'ROLLBACK') return { command: 'ROLLBACK' };
+        if (text === 'RESET ALL' || text === 'DISCARD TEMP') return { rows: [] };
+        if (text.includes('current_setting')) return { rows: [{ cur_org: null }] };
+        return { rows: [] };
+      });
+
+      const service = new VirtualKeyService(pool);
+      await expect(
+        service.createKey({ orgId: VALID_ORG_ID, name: VALID_NAME }),
+      ).rejects.toMatchObject({
+        name: 'VirtualKeyError',
+        reason: 'DATABASE_ERROR',
+      });
+
+      expect(insertAttempts).toBe(1);
+    });
+
+    it('23e. Missing constraint name on 23505 does NOT retry and fails closed with DATABASE_ERROR', async () => {
+      const { pool, client } = createMockPool();
+      let insertAttempts = 0;
+
+      client.query.mockImplementation(async (sql: string | { text: string }) => {
+        const text = typeof sql === 'string' ? sql : sql.text;
+        if (text === 'BEGIN') return { command: 'BEGIN' };
+        if (text.includes('set_config')) return { rows: [] };
+        if (text.includes('INSERT INTO virtual_keys')) {
+          insertAttempts++;
+          const err = new Error('duplicate key without constraint name') as Error & {
+            code: string;
+          };
+          err.code = '23505';
+          throw err;
+        }
+        if (text === 'ROLLBACK') return { command: 'ROLLBACK' };
+        if (text === 'RESET ALL' || text === 'DISCARD TEMP') return { rows: [] };
+        if (text.includes('current_setting')) return { rows: [{ cur_org: null }] };
+        return { rows: [] };
+      });
+
+      const service = new VirtualKeyService(pool);
+      await expect(
+        service.createKey({ orgId: VALID_ORG_ID, name: VALID_NAME }),
+      ).rejects.toMatchObject({
+        name: 'VirtualKeyError',
+        reason: 'DATABASE_ERROR',
+      });
+
+      expect(insertAttempts).toBe(1);
     });
 
     it('24. New material differs after a simulated collision', async () => {
