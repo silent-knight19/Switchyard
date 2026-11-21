@@ -12,7 +12,7 @@ import {
   PROHIBITED_REDIS_COMMANDS,
   type RedisClient,
 } from './infrastructure/redis.js';
-import type { GatewayConfig } from './config/index.js';
+import { loadConfig, type GatewayConfig } from './config/index.js';
 import type { Redis } from 'ioredis';
 
 const VALID_DEV_ENV: Record<string, string> = {
@@ -34,7 +34,10 @@ const VALID_DEV_ENV: Record<string, string> = {
   TLS_VERIFY: 'true',
   MOCK_PROVIDER_ENABLED: 'false',
   DEMO_SEEDING_ENABLED: 'false',
+  BROWSER_ORIGIN: 'http://127.0.0.1:3000',
 };
+
+const validTestConfig = loadConfig(VALID_DEV_ENV);
 
 function createMockPostgres(overrides?: Partial<PostgresClient>): PostgresClient {
   return {
@@ -274,6 +277,7 @@ describe('SW-1.2.4 Gateway Boot, Health, and Shutdown Lifecycle', () => {
       redis: mockRedis,
       lifecycle,
       logger,
+      config: validTestConfig,
     });
 
     const resFail = await app.inject({
@@ -310,6 +314,7 @@ describe('SW-1.2.4 Gateway Boot, Health, and Shutdown Lifecycle', () => {
       redis: mockRedis,
       lifecycle,
       logger,
+      config: validTestConfig,
     });
 
     const startTime = Date.now();
@@ -362,6 +367,7 @@ describe('SW-1.2.4 Gateway Boot, Health, and Shutdown Lifecycle', () => {
       redis: mockRedis,
       lifecycle,
       logger,
+      config: validTestConfig,
     });
 
     for (let i = 0; i < 20; i++) {
@@ -521,6 +527,7 @@ describe('SW-1.2.4 Gateway Boot, Health, and Shutdown Lifecycle', () => {
       redis: mockRedis,
       lifecycle,
       logger,
+      config: validTestConfig,
     });
 
     const res = await app.inject({
@@ -554,6 +561,7 @@ describe('SW-1.2.4 Gateway Boot, Health, and Shutdown Lifecycle', () => {
       redis: createMockRedis(),
       lifecycle: new LifecycleCoordinator(),
       logger: customLogger,
+      config: validTestConfig,
     });
 
     const sensitiveQueryToken = 'synthetic_url_query_secret_token_abc999';
@@ -591,6 +599,7 @@ describe('SW-1.2.4 Gateway Boot, Health, and Shutdown Lifecycle', () => {
       redis: createMockRedis(),
       lifecycle: new LifecycleCoordinator(),
       logger: customLogger,
+      config: validTestConfig,
     });
 
     const pathSecret = 'sk_live_untrusted_secret_path_segment_445566';

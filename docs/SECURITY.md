@@ -194,7 +194,8 @@ To allow deployment role `gateway_migrator` to install executor-owned functions 
 | **Batch A: Secure Authentication (SW-1.5.1)** | ACCEPTED | PR #11 (merge commit `2fbe6080919e20dee18af2a94da7f046e6fff20c`) | 128-byte password cap, real Argon2id hashing (`m=19456, t=2, p=1`), dummy verify on unknown accounts, canonical email normalization, Redis IP/account rate limits |
 | **Batch A: Server-Side Web Sessions (SW-1.5.2)** | ACCEPTED | PR #11 (merge commit `2fbe6080919e20dee18af2a94da7f046e6fff20c`) | 256-bit opaque secret (`__Host-session`), SHA-256 verifier persistence, atomic rotation, idle/absolute expiry, revocation, RLS cross-tenant isolation |
 | **Batch A: Pre-Tenant Session Lookup (ADR 0001)** | ACCEPTED | PR #11 (merge commit `2fbe6080919e20dee18af2a94da7f046e6fff20c`) | `app_private.lookup_session_org_by_hash(BYTEA)` owned by `gateway_auth_executor`, UUID-only return, granted strictly to `gateway_app` |
-| **Batch B: Session-Bound CSRF & Strict Origin (SW-1.5.3)** | IMPLEMENTED | `src/auth/csrf.ts`, `src/auth/session.ts`, `src/config/schema.ts` | 256-bit synchronizer token, constant-time `timingSafeEqual`, exact `Origin` matching against `BROWSER_ORIGIN`, atomic row serialization under RLS, Fastify preHandler boundary |
+| **Batch B: Session-Bound CSRF & Strict Origin (SW-1.5.3)** | ACCEPTED | PR #12 (merge commit `639e0d276a72be0f52b239bda5b69e68080d0565`) | 256-bit synchronizer token, constant-time `timingSafeEqual`, exact `Origin` matching against `BROWSER_ORIGIN`, atomic row serialization under RLS, Fastify preHandler boundary |
+| **Batch B: Default-Deny Route Authorization, Principal Separation & RBAC (SW-1.5.4)** | IMPLEMENTED | `src/auth/authorization.ts`, `src/app.ts`, `src/routes/health.ts` | Default-deny Fastify `onRoute` registration guard (`AUTHZ_ROUTE_POLICY_INVALID`), request-time principal separation (`browser`, `virtual_key`, `anonymous`), admin/member RBAC hierarchy, CSRF/RBAC composition on mutations |
 
 ---
 
@@ -224,7 +225,46 @@ Switchyard implements the server-side synchronizer token pattern bound to authen
 - Revoked, idle-expired, or absolute-expired sessions cannot issue or verify tokens.
 - Transaction rollback on token issuance leaves prior committed verifiers intact.
 
-### 8.4 Deferred SW-1.5.4 Default-Deny Integration
-- SW-1.5.3 provides the reusable Fastify preHandler hook `createCsrfProtectionPreHandler`.
-- No incomplete authenticated production endpoints are registered in SW-1.5.3.
-- Subphase 1.5 Task SW-1.5.4 will integrate default-deny route metadata (`principal: 'browser' | 'virtual_key' | 'anonymous'`) and role-based access control.
+### 8.4 Integration with Default-Deny Authorization (SW-1.5.4)
+- SW-1.5.3 CSRF and Origin verification is unified directly into the central authorization boundary in `apps/gateway/src/auth/authorization.ts`.
+- Browser state-changing mutations (`POST`, `PUT`, `PATCH`, `DELETE`) compose strict Origin checking, CSRF validation, session validation, and RBAC enforcement into a single atomic preHandler gate.
+
+---
+
+## 9. Default-Deny Route Authorization, Principal Separation & RBAC (SW-1.5.4)
+
+Switchyard enforces default-deny route authorization across all HTTP entry points (Architecture v1.2 §13.5).
+
+### 9.1 Default-Deny Route Registration Assertion
+- Every application route must explicitly declare its authorized principal metadata under `config.authz`.
+- Fastify `onRoute` assertion executes at route registration time, before application startup completes.
+- Any undeclared route, malformed policy, empty object, unknown principal, or invalid browser role immediately throws `AuthorizationError` with code `AUTHZ_ROUTE_POLICY_INVALID` and prevents application startup.
+- Applies to all route registration mechanisms: direct methods (`app.get`, `app.post`, `app.route`), nested plugins, prefixed plugins, and typed helper `registerAuthorizedRoute`.
+- Fastify automatically exposed `HEAD` routes inherit their corresponding `GET` route's policy; `HEAD` requests never bypass authorization.
+
+### 9.2 Route Metadata Contract
+The accepted shapes of `config.authz` are:
+1. **Anonymous route:** `{ principal: 'anonymous' }` (no `minRole` permitted).
+2. **Browser route:** `{ principal: 'browser', minRole: 'member' | 'admin' }`.
+3. **Virtual-key route:** `{ principal: 'virtual_key' }` (no `minRole` permitted).
+
+Additional undeclared properties on `config.authz` are rejected at runtime.
+
+### 9.3 Strict Principal Separation
+- **Browser Routes:** Accept only valid browser sessions (via configured session cookie). Bearer credentials, API keys, and mixed credentials fail closed with 401 Unauthorized.
+- **Virtual-Key Routes:** Reserved for data-plane API requests. Require an approved verified-key authenticator dependency. Registration fails closed if no verified authenticator is installed. Session cookies on virtual-key routes fail closed with 401 Unauthorized.
+- **Anonymous Routes:** Accessible without credentials. Handlers receive `{ type: 'anonymous' }` principal context. Session cookies or Authorization headers never upgrade an anonymous route.
+
+### 9.4 Role-Based Access Control (RBAC)
+- Only two browser roles are supported: `admin` and `member`.
+- `admin` satisfies routes requiring `member` or `admin`.
+- `member` is rejected (403 Forbidden) on routes requiring `admin`.
+- Roles are evaluated fresh from PostgreSQL user state on every request via `public.web_sessions JOIN public.users`; no stale roles are cached in JWTs, Redis, or process memory.
+- Privilege changes and session revocations immediately invalidate prior active sessions.
+
+### 9.5 Production Route Inventory (SW-1.5.4)
+The production Gateway exposes only:
+- `/health/live`: Explicitly authorized with `{ principal: 'anonymous' }`.
+- `/health/ready`: Explicitly authorized with `{ principal: 'anonymous' }`.
+
+No production business or management endpoints are exposed in SW-1.5.4. Test endpoints exist strictly inside isolated test harnesses.

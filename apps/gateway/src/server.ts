@@ -125,6 +125,7 @@ export async function createServer(
       redis,
       lifecycle,
       logger,
+      config,
     });
 
     const shutdownManager = new GracefulShutdownManager({
