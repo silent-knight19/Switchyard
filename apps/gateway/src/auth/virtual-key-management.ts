@@ -62,7 +62,7 @@ export interface VirtualKeyManagementServiceOptions {
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const CONTROL_CHARS_REGEX = /[\u0000-\u001F\u007F-\u009F]/;
-const CURSOR_TIMESTAMP_REGEX = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/;
+const CURSOR_TIMESTAMP_REGEX = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})\.(\d{6})Z$/;
 const BASE64URL_REGEX = /^[A-Za-z0-9_-]+$/;
 const MAX_CURSOR_LENGTH = 256;
 const MAX_ALLOWED_MODELS = 100;
@@ -90,6 +90,102 @@ export function validateKeyId(keyId: unknown): string {
     );
   }
   return trimmed;
+}
+
+/**
+ * Shared private validator for canonical UTC microsecond timestamps (VKMGMT-05).
+ * Format: YYYY-MM-DDTHH:mm:ss.ffffffZ
+ *
+ * Strict Gregorian calendar validation rules:
+ * 1. Require exactly four digits for year (0001 through 9999).
+ * 2. Require two digits for month (01 through 12).
+ * 3. Validate day ranges against the actual month.
+ * 4. Apply Gregorian leap-year rules for February:
+ *    - Year divisible by 4 -> leap year (29 days)
+ *    - Year divisible by 100 -> not leap year (28 days)
+ *    - Year divisible by 400 -> leap year (29 days)
+ * 5. Require hours 00 through 23.
+ * 6. Require minutes 00 through 59.
+ * 7. Require seconds 00 through 59.
+ * 8. Require exactly six fractional-second digits.
+ * 9. Require literal uppercase 'T' and 'Z'.
+ * 10. Reject timezone offsets (+/-HH:MM), whitespace, and local time representations.
+ * 11. Preserves the exact original microsecond string without JavaScript Date normalization.
+ */
+function validateCanonicalTimestamp(ts: unknown): string {
+  if (typeof ts !== 'string') {
+    throw new VirtualKeyManagementError(
+      'INVALID_INPUT',
+      'Invalid cursor timestamp: expected string',
+    );
+  }
+
+  const match = CURSOR_TIMESTAMP_REGEX.exec(ts);
+  if (!match) {
+    throw new VirtualKeyManagementError(
+      'INVALID_INPUT',
+      'Invalid cursor timestamp: must match canonical format YYYY-MM-DDTHH:mm:ss.ffffffZ',
+    );
+  }
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+
+  if (year < 1 || year > 9999) {
+    throw new VirtualKeyManagementError(
+      'INVALID_INPUT',
+      'Invalid cursor timestamp: year out of range (0001-9999)',
+    );
+  }
+
+  if (month < 1 || month > 12) {
+    throw new VirtualKeyManagementError(
+      'INVALID_INPUT',
+      'Invalid cursor timestamp: month out of range (01-12)',
+    );
+  }
+
+  let maxDays = 31;
+  if (month === 4 || month === 6 || month === 9 || month === 11) {
+    maxDays = 30;
+  } else if (month === 2) {
+    const isLeapYear = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+    maxDays = isLeapYear ? 29 : 28;
+  }
+
+  if (day < 1 || day > maxDays) {
+    throw new VirtualKeyManagementError(
+      'INVALID_INPUT',
+      `Invalid cursor timestamp: day ${day} out of range for month ${month} in year ${year}`,
+    );
+  }
+
+  if (hour < 0 || hour > 23) {
+    throw new VirtualKeyManagementError(
+      'INVALID_INPUT',
+      'Invalid cursor timestamp: hour out of range (00-23)',
+    );
+  }
+
+  if (minute < 0 || minute > 59) {
+    throw new VirtualKeyManagementError(
+      'INVALID_INPUT',
+      'Invalid cursor timestamp: minute out of range (00-59)',
+    );
+  }
+
+  if (second < 0 || second > 59) {
+    throw new VirtualKeyManagementError(
+      'INVALID_INPUT',
+      'Invalid cursor timestamp: second out of range (00-59)',
+    );
+  }
+
+  return ts;
 }
 
 interface DecodedCursor {
@@ -136,20 +232,14 @@ export function decodeCursor(cursor: unknown): DecodedCursor {
       throw new Error('Unexpected cursor keys');
     }
 
-    if (
-      typeof rec.createdAt !== 'string' ||
-      !CURSOR_TIMESTAMP_REGEX.test(rec.createdAt) ||
-      isNaN(Date.parse(rec.createdAt))
-    ) {
-      throw new Error('Invalid cursor createdAt timestamp');
-    }
+    const validatedCreatedAt = validateCanonicalTimestamp(rec.createdAt);
 
     if (typeof rec.id !== 'string' || !UUID_REGEX.test(rec.id.trim())) {
       throw new Error('Invalid cursor key id');
     }
 
     return {
-      createdAt: rec.createdAt,
+      createdAt: validatedCreatedAt,
       id: rec.id.trim(),
     };
   } catch (err) {
@@ -160,22 +250,12 @@ export function decodeCursor(cursor: unknown): DecodedCursor {
 }
 
 export function encodeCursor(cursorCreatedAt: string, id: string): string {
-  if (
-    typeof cursorCreatedAt !== 'string' ||
-    !CURSOR_TIMESTAMP_REGEX.test(cursorCreatedAt) ||
-    isNaN(Date.parse(cursorCreatedAt))
-  ) {
-    throw new VirtualKeyManagementError(
-      'INVALID_INPUT',
-      'Invalid cursor timestamp: must be microsecond UTC format YYYY-MM-DDTHH:mm:ss.ffffffZ',
-    );
-  }
-
+  const validatedCreatedAt = validateCanonicalTimestamp(cursorCreatedAt);
   const trimmedId = validateKeyId(id);
 
   return Buffer.from(
     JSON.stringify({
-      createdAt: cursorCreatedAt,
+      createdAt: validatedCreatedAt,
       id: trimmedId,
     }),
     'utf8',

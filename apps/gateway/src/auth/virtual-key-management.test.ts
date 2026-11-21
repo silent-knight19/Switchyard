@@ -127,6 +127,71 @@ describe('SW-1.6.3: Virtual Key Management & Policy Unit Tests', () => {
       ).toString('base64url');
       expect(() => decodeCursor(invalidJson7)).toThrow(VirtualKeyManagementError);
     });
+
+    describe('Strict Gregorian calendar timestamp validation (VKMGMT-05)', () => {
+      const acceptedCases = [
+        '2024-02-29T12:00:00.123456Z', // Leap year divisible by 4
+        '2000-02-29T12:00:00.123456Z', // Century leap year divisible by 400
+      ];
+
+      const rejectedCases = [
+        '2026-02-30T12:00:00.123456Z', // February 30 impossible
+        '2026-04-31T12:00:00.123456Z', // April has only 30 days
+        '2025-02-29T12:00:00.123456Z', // Non-leap year February 29
+        '1900-02-29T12:00:00.123456Z', // Century year divisible by 100 but not 400
+        '2026-13-01T12:00:00.123456Z', // Month 13 out of range
+        '2026-00-01T12:00:00.123456Z', // Month 00 out of range
+        '2026-11-00T12:00:00.123456Z', // Day 00 out of range
+        '2026-11-21T24:00:00.123456Z', // Hour 24 out of range (must be 00-23)
+        '2026-11-21T12:60:00.123456Z', // Minute 60 out of range (must be 00-59)
+        '2026-11-21T12:00:60.123456Z', // Second 60 out of range (must be 00-59)
+        '0000-01-01T12:00:00.123456Z', // Year 0000 out of range (must be 0001-9999)
+        '2026-11-21T12:00:00.123Z', // Milliseconds (3 fractional digits instead of 6)
+        '2026-11-21T12:00:00.123456+00:00', // Timezone offset prohibited (must be literal uppercase Z)
+      ];
+
+      it('accepts valid Gregorian timestamps for both encoding and decoding', () => {
+        for (const ts of acceptedCases) {
+          // Encoding
+          const encoded = encodeCursor(ts, VALID_UUID);
+          expect(typeof encoded).toBe('string');
+
+          // Decoding
+          const decoded = decodeCursor(encoded);
+          expect(decoded.createdAt).toBe(ts);
+          expect(decoded.id).toBe(VALID_UUID);
+        }
+      });
+
+      it('rejects invalid Gregorian timestamps for encodeCursor with reason INVALID_INPUT', () => {
+        for (const ts of rejectedCases) {
+          try {
+            encodeCursor(ts, VALID_UUID);
+            expect.unreachable(`Expected encodeCursor to reject "${ts}"`);
+          } catch (err) {
+            expect(err).toBeInstanceOf(VirtualKeyManagementError);
+            expect((err as VirtualKeyManagementError).reason).toBe('INVALID_INPUT');
+          }
+        }
+      });
+
+      it('rejects invalid Gregorian timestamps for decodeCursor with reason INVALID_INPUT', () => {
+        for (const ts of rejectedCases) {
+          const rawCursor = Buffer.from(
+            JSON.stringify({ createdAt: ts, id: VALID_UUID }),
+            'utf8',
+          ).toString('base64url');
+
+          try {
+            decodeCursor(rawCursor);
+            expect.unreachable(`Expected decodeCursor to reject "${ts}"`);
+          } catch (err) {
+            expect(err).toBeInstanceOf(VirtualKeyManagementError);
+            expect((err as VirtualKeyManagementError).reason).toBe('INVALID_INPUT');
+          }
+        }
+      });
+    });
   });
 
   describe('Policy Input Validation (PUT /api/keys/:id/policy)', () => {

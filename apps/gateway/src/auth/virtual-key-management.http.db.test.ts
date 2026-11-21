@@ -527,6 +527,80 @@ describe('SW-1.6.3: HTTP Authorization, CSRF, RBAC & Secret Canary Suite', () =>
       expect(deleteRes.statusCode).toBe(400);
       expect(deleteRes.json().message).toContain('Query parameters are not permitted');
     });
+
+    it('rejects invalid Gregorian calendar cursors with generic 400 before query execution (VKMGMT-05)', async () => {
+      const calendarTestAdminSession = await sessionService.createSession(
+        ORG_A_ID,
+        USER_A_ADMIN_ID,
+      );
+
+      // 1. February 30 impossible date cursor
+      const feb30Cursor = Buffer.from(
+        JSON.stringify({
+          createdAt: '2026-02-30T12:00:00.123456Z',
+          id: '11111111-1111-4111-8111-111111111111',
+        }),
+        'utf8',
+      ).toString('base64url');
+
+      const feb30Res = await app.inject({
+        method: 'GET',
+        url: `/api/keys?cursor=${feb30Cursor}`,
+        headers: {
+          cookie: makeCookie(calendarTestAdminSession.secret),
+        },
+      });
+      expect(feb30Res.statusCode).toBe(400);
+      const feb30Body = feb30Res.json();
+      expect(feb30Body.error).toBe('Bad Request');
+      expect(feb30Body.message).toBe('Invalid cursor: malformed cursor');
+      expect(JSON.stringify(feb30Body)).not.toContain('syntax error');
+      expect(JSON.stringify(feb30Body)).not.toContain('PostgreSQL');
+      expect(JSON.stringify(feb30Body)).not.toContain('SELECT');
+
+      // 2. April 31 impossible date cursor
+      const apr31Cursor = Buffer.from(
+        JSON.stringify({
+          createdAt: '2026-04-31T12:00:00.123456Z',
+          id: '11111111-1111-4111-8111-111111111111',
+        }),
+        'utf8',
+      ).toString('base64url');
+
+      const apr31Res = await app.inject({
+        method: 'GET',
+        url: `/api/keys?cursor=${apr31Cursor}`,
+        headers: {
+          cookie: makeCookie(calendarTestAdminSession.secret),
+        },
+      });
+      expect(apr31Res.statusCode).toBe(400);
+      const apr31Body = apr31Res.json();
+      expect(apr31Body.error).toBe('Bad Request');
+      expect(apr31Body.message).toBe('Invalid cursor: malformed cursor');
+      expect(JSON.stringify(apr31Body)).not.toContain('syntax error');
+      expect(JSON.stringify(apr31Body)).not.toContain('PostgreSQL');
+      expect(JSON.stringify(apr31Body)).not.toContain('SELECT');
+
+      // 3. Valid leap-day cursor accepted and processed normally
+      const validLeapDayCursor = Buffer.from(
+        JSON.stringify({
+          createdAt: '2024-02-29T12:00:00.123456Z',
+          id: '11111111-1111-4111-8111-111111111111',
+        }),
+        'utf8',
+      ).toString('base64url');
+
+      const leapDayRes = await app.inject({
+        method: 'GET',
+        url: `/api/keys?cursor=${validLeapDayCursor}`,
+        headers: {
+          cookie: makeCookie(calendarTestAdminSession.secret),
+        },
+      });
+      expect(leapDayRes.statusCode).toBe(200);
+      expect(Array.isArray(leapDayRes.json().items)).toBe(true);
+    });
   });
 
   describe('Section 12.2: CSRF & Origin Enforcement on Mutations', () => {
