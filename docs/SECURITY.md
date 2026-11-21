@@ -313,7 +313,8 @@ Switchyard implements cryptographic virtual API key issuance as an internal Gate
 
 ### 11.4 Future Integration Contracts & Status
 - **SW-1.6.2 (Authentication):** ACCEPTED (PR #15, merge commit `c5cde0aac18ddc288d6c1d85a7f6e9c5bea36880`). Implemented in `src/auth/virtual-key-authenticator.ts` and `src/auth/virtual-key-rate-limiter.ts`.
-- **SW-1.6.3 (Management & Policy):** IMPLEMENTED. Implemented in `src/auth/virtual-key-management.ts` and `src/routes/virtual-keys.ts`.
+- **SW-1.6.3 (Management & Policy):** ACCEPTED (PR #16, merge commit `061a3b86aa9091569f7a84863fa8acc90b8e16b1`, CI `44908260283`). Implemented in `src/auth/virtual-key-management.ts` and `src/routes/virtual-keys.ts`.
+- **SW-1.6.4 (Revocation & Security Gates):** IMPLEMENTED. Implemented in `src/auth/virtual-key-revocation.db.test.ts`, `src/auth/virtual-key-security.http.db.test.ts`, and `docs/architecture/phase2-admission-key-recheck.md`.
 
 ---
 
@@ -443,3 +444,66 @@ The `PUT /api/keys/:id/policy` endpoint implements strict full-replacement seman
 ### 13.8 Architectural Limitation Notices
 - **Deferred Model Capability Verification:** Syntactic validation of model identifiers does not verify that a model exists in provider pricing tables or is eligible for dispatch. Request admission in Phase 2 independently validates requested models against the capability registry.
 - **Phase 2 Admission Recheck:** Revocation marks the database record. Phase 2 provider-attempt admission must acquire a row lock on `public.virtual_keys` and re-verify the key's revocation status at request dispatch time.
+
+---
+
+## 14. Virtual Key Revocation, Secret Secrecy & Phase 2 Integration Seam (SW-1.6.4)
+
+Switchyard establishes comprehensive regression test suites, secret containment verification, and the normative Phase 2 provider-attempt admission integration seam (Architecture v1.2 §5.3, §6.1–6.3, §8.1–8.2, §11.6–11.8, §12.5, §13.1, §13.5, §14.3, §21).
+
+### 14.1 Uniform External 401 Authentication Error Equivalence
+Across twelve distinct invalid or revoked credential cases (missing header, empty header, unsupported schemes, missing bearer value, incorrect prefix, incorrect length, invalid base64url characters, noncanonical padding bits, well-formed unknown key, revoked key, browser session cookie on virtual-key route, conflicting cookie and bearer token), the Gateway returns the exact same external HTTP 401 response:
+```json
+{
+  "statusCode": 401,
+  "error": "Unauthorized",
+  "message": "Authentication required"
+}
+```
+- **Zero Protected Handler Executions:** Protected handlers never execute on invalid credentials.
+- **No Principal Attaching:** Requests are terminated immediately at the preHandler stage without attaching a principal.
+- **Zero Detail Leakage:** Internal failure causes (`KEY_REVOKED`, `KEY_NOT_FOUND`, `MALFORMED_KEY`, UUIDs, hints, or verifiers) are never exposed to external callers.
+
+### 14.2 Permanent, Idempotent Revocation & Tenant Isolation
+- **Logical Deletion:** Revocation updates `revoked_at` under an exclusive PostgreSQL row lock. Keys are never physically deleted, preserving audit and financial attribution.
+- **Idempotency:** Repeated revocation succeeds (HTTP 204) without altering the original timestamp.
+- **Immutability of Revocation:** Revoked keys reject policy replacement (HTTP 409) and cannot be reactivated through the public API.
+- **Tenant Isolation:** Cross-tenant revocation returns generic HTTP 404 identical to nonexistent keys, and zero rows are affected.
+- **Worker Isolation:** The runtime `gateway_worker` role is strictly denied `INSERT`, `UPDATE`, `REVOKE`, `DELETE`, and `lookup_virtual_key_by_hash` (SQLSTATE 42501).
+
+### 14.3 Concurrency Serialization & Admission-Locking Protocol
+Real PostgreSQL 16 row-locking (`SELECT ... FOR UPDATE`) tests verify serialization between revocation and simulated provider-attempt admission:
+- **Scenario A (Revocation wins):** Transaction R locks and updates `revoked_at`. In-flight admission Transaction A blocks on the row lock, unblocks after commit, observes non-null `revoked_at`, and rejects admission fail-closed.
+- **Scenario B (Admission wins):** Admission Transaction A acquires the row lock, verifies active key state, and blocks Transaction R until admission commits. Subsequent admissions reject.
+- **Scenario C (Stale Principal):** An in-memory `VirtualKeyPrincipal` retained from a prior valid authentication fails admission once revocation commits, proving that authentication-time principals cannot substitute for admission-time PostgreSQL row checks.
+
+### 14.4 Secret Secrecy Matrix & Canary Verification
+Capturing structured application logs (Pino), HTTP response bodies, Redis keys, and PostgreSQL rows across 14 lifecycle operations within a single unified test stream confirms:
+1. **Key Creation (Op 1):** Discloses `rawKey` once, sets `Cache-Control: no-store` and `Pragma: no-cache`, and discloses neither `key_hash` nor verifier bytes.
+2. **Key Listing (Op 2):** Discloses non-secret metadata only.
+3. **Policy Replacement (Op 3):** Modifies policy without disclosing secret credentials.
+4. **Key Revocation (Op 4):** Revokes key logically (HTTP 204) without sensitive disclosure.
+5. **Repeat Revocation (Op 5):** Idempotent repeat returns HTTP 204 without leaking state.
+6. **Active Key Authentication (Op 6):** Authenticates data plane route (HTTP 200) cleanly.
+7. **Unknown Key Authentication (Op 7):** Returns uniform HTTP 401 without detail leakage.
+8. **Malformed Key Authentication (Op 8):** Returns uniform HTTP 401 without detail leakage.
+9. **Revoked Key Authentication (Op 9):** Returns uniform HTTP 401 without detail leakage.
+10. **Unauthorized Member Management (Op 10):** Enforces RBAC (HTTP 403) with zero secret leakage.
+11. **Cross-Tenant Management (Op 11):** Enforces tenant isolation (HTTP 404) with zero leakage.
+12. **Database Failure Canary (Op 12):** Deterministic database lookup failure routed through real authenticator returns controlled HTTP 503 with zero protected handler executions and zero driver error/connection leaks.
+13. **Redis Limiter Failure Canary (Op 13):** Deterministic limiter failure routed through real authenticator returns controlled HTTP 503 with zero protected handler executions and zero connection leaks.
+14. **Authentication Abuse Rejection (Op 14):** 31st request triggers rate limiting (HTTP 429) with zero handler executions.
+
+All 13 post-creation response bodies and the comprehensive application log stream are verified to contain zero raw keys, zero secrets, zero session secrets, zero CSRF tokens, zero database credentials, zero connection URIs, and zero synthetic error canaries. Redis contains only normalized IP rate limiter keys (`auth:ratelimit:vk:ip:<ip>`), and PostgreSQL persists only the 32-byte SHA-256 verifier (`key_hash BYTEA UNIQUE`).
+
+### 14.5 Normative Phase 2 Handoff Reference
+The full architectural handoff document is committed at:
+[`docs/architecture/phase2-admission-key-recheck.md`](./architecture/phase2-admission-key-recheck.md)
+tracking the mandatory implementation dependencies across Phase 2:
+- **SW-2.1.1 & SW-2.1.2:** Single-pass streaming proxy & request-dispatch state machine.
+- **SW-2.2.3:** Gateway-instance epoch validation & provider-attempt pre-dispatch admission checks (`SELECT ... FOR UPDATE` with `gateway_control` epoch fence).
+- **SW-2.4.1:** Multi-tier rate limiting & speculative Redis reservation (`RESERVE`).
+- **SW-2.4.4:** Two-phase financial settlement, fail-closed reconciliation, and reservation cancellation (`CANCEL_RESERVATION`).
+- **SW-2.5.1 – SW-2.5.3:** Upstream dispatch guards & hard deadline enforcement.
+- **SW-2.6.2:** Upstream dispatch pipeline integration.
+- **SW-2.8.3:** Reconciliation worker for unsettled reservations under commit uncertainty.
