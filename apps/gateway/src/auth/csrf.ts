@@ -91,21 +91,25 @@ export function verifyCsrfTokenHash(candidateBytes: Buffer, storedVerifierHash: 
 
 /**
  * Evaluates whether a given parsed hostname represents a loopback or unspecified address
- * across IPv4, IPv6, and IPv4-mapped IPv6 representations (CSRF-01).
+ * across IPv4, IPv6, and IPv4-mapped IPv6 representations (CSRF-01, CSRF-06).
+ * Accounts for terminal root dots in fully qualified DNS names (e.g. localhost.).
  * Used to enforce strict non-loopback browser origin policies in production.
  */
 export function isLoopbackOrUnspecifiedHost(hostname: string): boolean {
   const raw = hostname.startsWith('[') && hostname.endsWith(']') ? hostname.slice(1, -1) : hostname;
   const host = raw.toLowerCase();
 
-  // Localhost hostname check (localhost and any *.localhost subdomain)
-  if (host === 'localhost' || host.endsWith('.localhost')) {
+  // Strip optional trailing root dot for DNS FQDN classification (CSRF-06)
+  const dnsHost = host.endsWith('.') ? host.slice(0, -1) : host;
+
+  // Localhost hostname check (localhost and any *.localhost subdomain, with or without root dot)
+  if (dnsHost === 'localhost' || dnsHost.endsWith('.localhost')) {
     return true;
   }
 
   // IPv4 check: entire 127.0.0.0/8 loopback block and 0.0.0.0 unspecified
-  if (net.isIPv4(host)) {
-    const octets = host.split('.').map(Number);
+  if (net.isIPv4(dnsHost)) {
+    const octets = dnsHost.split('.').map(Number);
     if (octets[0] === 127) {
       return true;
     }
@@ -116,18 +120,18 @@ export function isLoopbackOrUnspecifiedHost(hostname: string): boolean {
   }
 
   // IPv6 check: ::1 loopback, :: unspecified, and IPv4-mapped representations
-  if (net.isIPv6(host)) {
-    if (host === '::1' || host === '0:0:0:0:0:0:0:1') {
+  if (net.isIPv6(dnsHost)) {
+    if (dnsHost === '::1' || dnsHost === '0:0:0:0:0:0:0:1') {
       return true;
     }
-    if (host === '::' || host === '0:0:0:0:0:0:0:0') {
+    if (dnsHost === '::' || dnsHost === '0:0:0:0:0:0:0:0') {
       return true;
     }
 
     // IPv4-mapped IPv6 check (::ffff:...)
     const ipv4MappedPrefix = '::ffff:';
-    if (host.startsWith(ipv4MappedPrefix)) {
-      const rest = host.slice(ipv4MappedPrefix.length);
+    if (dnsHost.startsWith(ipv4MappedPrefix)) {
+      const rest = dnsHost.slice(ipv4MappedPrefix.length);
 
       // In dotted-decimal notation (e.g. ::ffff:127.0.0.2)
       if (net.isIPv4(rest)) {

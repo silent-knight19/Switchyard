@@ -333,9 +333,12 @@ describe('SW-1.5.3: CSRF Token & Origin Verification Unit Test Suite', () => {
   });
 
   describe('Canonical Browser Origin Assertion (assertCanonicalOrigin) — CSRF-02', () => {
-    it('accepts and returns exact canonical production HTTPS origin', () => {
+    it('accepts and returns exact canonical production HTTPS origin (including FQDN with trailing dot)', () => {
       expect(assertCanonicalOrigin('https://app.switchyard.internal')).toBe(
         'https://app.switchyard.internal',
+      );
+      expect(assertCanonicalOrigin('https://app.switchyard.internal.')).toBe(
+        'https://app.switchyard.internal.',
       );
       expect(assertCanonicalOrigin('https://app.switchyard.internal:8443')).toBe(
         'https://app.switchyard.internal:8443',
@@ -422,11 +425,15 @@ describe('SW-1.5.3: CSRF Token & Origin Verification Unit Test Suite', () => {
     });
   });
 
-  describe('Loopback and Unspecified Host Detection (isLoopbackOrUnspecifiedHost) — CSRF-01', () => {
-    it('detects localhost and *.localhost subdomains', () => {
+  describe('Loopback and Unspecified Host Detection (isLoopbackOrUnspecifiedHost) — CSRF-01, CSRF-06', () => {
+    it('detects localhost and *.localhost subdomains (with and without terminal dot — CSRF-06)', () => {
       expect(isLoopbackOrUnspecifiedHost('localhost')).toBe(true);
+      expect(isLoopbackOrUnspecifiedHost('localhost.')).toBe(true);
       expect(isLoopbackOrUnspecifiedHost('LOCALHOST')).toBe(true);
+      expect(isLoopbackOrUnspecifiedHost('LOCALHOST.')).toBe(true);
       expect(isLoopbackOrUnspecifiedHost('sub.localhost')).toBe(true);
+      expect(isLoopbackOrUnspecifiedHost('sub.localhost.')).toBe(true);
+      expect(isLoopbackOrUnspecifiedHost('deep.sub.localhost.')).toBe(true);
       expect(isLoopbackOrUnspecifiedHost('deep.nested.localhost')).toBe(true);
     });
 
@@ -467,9 +474,11 @@ describe('SW-1.5.3: CSRF Token & Origin Verification Unit Test Suite', () => {
       expect(isLoopbackOrUnspecifiedHost('::ffff:0:0')).toBe(true);
     });
 
-    it('does not classify non-loopback hosts as loopback (preserves legitimate private IPs)', () => {
+    it('does not classify non-loopback hosts as loopback (preserves legitimate private IPs and FQDNs)', () => {
       expect(isLoopbackOrUnspecifiedHost('app.switchyard.internal')).toBe(false);
+      expect(isLoopbackOrUnspecifiedHost('app.switchyard.internal.')).toBe(false);
       expect(isLoopbackOrUnspecifiedHost('control.example.com')).toBe(false);
+      expect(isLoopbackOrUnspecifiedHost('control.example.com.')).toBe(false);
       expect(isLoopbackOrUnspecifiedHost('10.0.0.1')).toBe(false);
       expect(isLoopbackOrUnspecifiedHost('192.168.1.1')).toBe(false);
       expect(isLoopbackOrUnspecifiedHost('172.16.0.1')).toBe(false);

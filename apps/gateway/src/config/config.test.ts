@@ -336,12 +336,27 @@ describe('SW-1.2.2 Central Zod Configuration', () => {
         loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://0.0.0.0:3000' }),
       ).toThrowError(ConfigValidationError);
 
-      // Localhost and subdomains
+      // Localhost and subdomains (including terminal root dot FQDNs — CSRF-06)
+      expect(() =>
+        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://localhost' }),
+      ).toThrowError(ConfigValidationError);
+      expect(() =>
+        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://localhost.' }),
+      ).toThrowError(ConfigValidationError);
       expect(() =>
         loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://localhost:3000' }),
       ).toThrowError(ConfigValidationError);
       expect(() =>
+        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://sub.localhost' }),
+      ).toThrowError(ConfigValidationError);
+      expect(() =>
+        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://sub.localhost.' }),
+      ).toThrowError(ConfigValidationError);
+      expect(() =>
         loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://sub.localhost:3000' }),
+      ).toThrowError(ConfigValidationError);
+      expect(() =>
+        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://deep.sub.localhost.' }),
       ).toThrowError(ConfigValidationError);
 
       // IPv6 loopback and unspecified
@@ -371,6 +386,13 @@ describe('SW-1.2.2 Central Zod Configuration', () => {
       };
       const config = loadConfig(validProd);
       expect(config.BROWSER_ORIGIN).toBe('https://control.switchyard.internal');
+
+      // Accepts canonical FQDN with trailing dot (CSRF-06)
+      const fqdnConfig = loadConfig({
+        ...VALID_PROD_ENV,
+        BROWSER_ORIGIN: 'https://app.switchyard.internal.',
+      });
+      expect(fqdnConfig.BROWSER_ORIGIN).toBe('https://app.switchyard.internal.');
 
       // Accepts legitimate private/internal HTTPS origins
       const privateIpConfig = loadConfig({
