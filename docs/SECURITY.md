@@ -507,3 +507,34 @@ tracking the mandatory implementation dependencies across Phase 2:
 - **SW-2.5.1 – SW-2.5.3:** Upstream dispatch guards & hard deadline enforcement.
 - **SW-2.6.2:** Upstream dispatch pipeline integration.
 - **SW-2.8.3:** Reconciliation worker for unsettled reservations under commit uncertainty.
+
+## 15. Provider Credential Envelope Encryption (SW-1.7.1 & SW-1.7.2)
+
+Status: **IMPLEMENTED** — cryptographic foundation only. Administrative provider-credential routes remain deferred to SW-1.7.3, and final decrypt-path/backup-rotation audits remain deferred to SW-1.7.4.
+
+### 15.1 Cryptographic Contract
+- **Algorithms:** AES-256-GCM for both DEK wrapping and provider-credential encryption. Key length is exactly 32 bytes, IV length exactly 12 bytes, authentication tag length exactly 16 bytes.
+- **Organization DEKs:** Every organization receives an independent 32-byte DEK from `crypto.randomBytes()`. DEKs are never derived from organization UUIDs, names, passwords, virtual keys, or provider credentials.
+- **Versioned KEKs:** `MASTER_KEK_V1`, `MASTER_KEK_V2`, and `ACTIVE_KEK_VERSION` are validated by the central Zod configuration module. KEKs are canonical unpadded base64url strings encoding exactly 32 bytes (43 characters). Padded, noncanonical, malformed, all-zero, duplicate-across-versions, and active-version-missing configurations fail closed.
+- **Blob format:** `organizations.wrapped_dek` and `provider_keys.ciphertext` begin with the one-byte format marker `0x01`; the IV and authentication tag remain in their dedicated columns. `organizations.kek_version` is the authoritative KEK selector.
+- **Exact AAD:** DEK wrapping uses `dek:<org_id>:v<kek_version>`; provider encryption uses `pk:<org_id>:<provider_key_id>:<provider>`. Organization labels, provider hints, and display names are never authenticated metadata.
+- **Supported provider:** Only `openai` is accepted in this work package. The existing database CHECK constraint is unchanged.
+
+### 15.2 Configuration and Failure Behavior
+- No KEK configuration leaves the vault uninitialised so existing Gateway startup and non-vault tests remain compatible.
+- Supplying any KEK value requires a valid `ACTIVE_KEK_VERSION` and a valid key for that version. Construction without valid material throws `VaultError(CONFIGURATION_ERROR)`.
+- No default, development, placeholder, or arbitrary fallback KEK is ever selected. Missing historical KEKs cause `UNKNOWN_KEK_VERSION`; they are never replaced by another configured version.
+- SW-1.7.3 must make valid KEK configuration mandatory before provider-credential management routes are enabled. There is no unencrypted or vault-disabled credential fallback.
+
+### 15.3 Tenant, Tamper and Substitution Resistance
+- Authenticated decryption fails when ciphertext is moved across organizations, provider-key record IDs, providers, IVs, tags, or wrapped-DEK envelopes.
+- Organization envelope AAD binds the canonical lowercase organization UUID and stored KEK version. Provider AAD binds the organization UUID, provider-key UUID, and provider identifier.
+- Malformed lengths, unknown format markers, truncated ciphertext, and invalid stored KEK versions are rejected as `UNSUPPORTED_FORMAT` before authentication is attempted.
+- Cross-tenant reads remain denied by FORCE RLS under `withTenant()`. `gateway_worker` retains only non-secret metadata grants; selecting `wrapped_dek`, `dek_iv`, `dek_auth_tag`, `ciphertext`, `iv`, or `auth_tag` fails with SQLSTATE `42501`.
+
+### 15.4 Memory and Privacy Limitations
+- Temporary mutable DEK buffers are cleared with `.fill(0)` after use; intermediate decryption chunks are cleared on authentication failure.
+- Callers own plaintext input Buffers and returned decrypted Buffers and must clear them after authorised use.
+- JavaScript strings and runtime copies cannot be deterministically zeroized. Best-effort buffer clearing does not protect against heap snapshots, process compromise, copied buffers, or a compromised Node.js runtime.
+- Plaintext provider credentials, KEKs, and DEKs are never persisted in PostgreSQL, Redis, BullMQ, traces, Pino logs, error messages, or browser responses. Pino redaction explicitly covers `MASTER_KEK_*`, `wrapped_dek`, `dek_iv`, and `dek_auth_tag` naming variants.
+- No KEK rotation, DEK rotation, background rewrapping, caching, KMS integration, or provider dispatch is implemented in this work package.
