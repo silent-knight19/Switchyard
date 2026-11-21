@@ -49,7 +49,8 @@ export type CsrfFailureReason =
   | 'SESSION_REVOKED'
   | 'SESSION_EXPIRED_IDLE'
   | 'SESSION_EXPIRED_ABSOLUTE'
-  | 'DATABASE_ERROR';
+  | 'DATABASE_ERROR'
+  | 'CONFIGURATION_ERROR';
 
 export class CsrfError extends Error {
   public readonly reason: CsrfFailureReason;

@@ -1,6 +1,13 @@
 import crypto from 'node:crypto';
 import { describe, expect, it } from 'vitest';
-import { decodeCsrfToken, hashCsrfToken, verifyCsrfTokenHash, validateOrigin } from './csrf.js';
+import {
+  decodeCsrfToken,
+  hashCsrfToken,
+  verifyCsrfTokenHash,
+  validateOrigin,
+  assertCanonicalOrigin,
+  isLoopbackOrUnspecifiedHost,
+} from './csrf.js';
 import { CsrfError } from './types.js';
 
 describe('SW-1.5.3: CSRF Token & Origin Verification Unit Test Suite', () => {
@@ -322,6 +329,154 @@ describe('SW-1.5.3: CSRF Token & Origin Verification Unit Test Suite', () => {
         valid: false,
         reason: 'MALFORMED_ORIGIN',
       });
+    });
+  });
+
+  describe('Canonical Browser Origin Assertion (assertCanonicalOrigin) — CSRF-02', () => {
+    it('accepts and returns exact canonical production HTTPS origin', () => {
+      expect(assertCanonicalOrigin('https://app.switchyard.internal')).toBe(
+        'https://app.switchyard.internal',
+      );
+      expect(assertCanonicalOrigin('https://app.switchyard.internal:8443')).toBe(
+        'https://app.switchyard.internal:8443',
+      );
+    });
+
+    it('accepts and returns exact canonical development HTTP loopback origin', () => {
+      expect(assertCanonicalOrigin('http://127.0.0.1:3000')).toBe('http://127.0.0.1:3000');
+      expect(assertCanonicalOrigin('http://localhost:3000')).toBe('http://localhost:3000');
+    });
+
+    it('rejects missing, empty, or non-string origins with CONFIGURATION_ERROR', () => {
+      expect(() => assertCanonicalOrigin('')).toThrow(CsrfError);
+      expect(() => assertCanonicalOrigin('   ')).toThrow(CsrfError);
+      expect(() => assertCanonicalOrigin(null)).toThrow(CsrfError);
+      expect(() => assertCanonicalOrigin(undefined)).toThrow(CsrfError);
+      expect(() => assertCanonicalOrigin(12345)).toThrow(CsrfError);
+      try {
+        assertCanonicalOrigin('');
+      } catch (err) {
+        expect(err).toBeInstanceOf(CsrfError);
+        expect((err as CsrfError).reason).toBe('CONFIGURATION_ERROR');
+      }
+    });
+
+    it('rejects wildcards and comma-separated origins', () => {
+      expect(() => assertCanonicalOrigin('*')).toThrow(CsrfError);
+      expect(() =>
+        assertCanonicalOrigin('https://app.switchyard.internal, https://evil.com'),
+      ).toThrow(CsrfError);
+    });
+
+    it('rejects origins with user credentials', () => {
+      expect(() => assertCanonicalOrigin('https://user:pass@app.switchyard.internal')).toThrow(
+        CsrfError,
+      );
+      try {
+        assertCanonicalOrigin('https://user:pass@app.switchyard.internal');
+      } catch (err) {
+        expect((err as CsrfError).reason).toBe('CONFIGURATION_ERROR');
+        expect((err as CsrfError).message).toContain('must not contain credentials');
+      }
+    });
+
+    it('rejects origins with URL paths', () => {
+      expect(() => assertCanonicalOrigin('https://app.switchyard.internal/path')).toThrow(
+        CsrfError,
+      );
+      try {
+        assertCanonicalOrigin('https://app.switchyard.internal/path');
+      } catch (err) {
+        expect((err as CsrfError).reason).toBe('CONFIGURATION_ERROR');
+        expect((err as CsrfError).message).toContain('must not contain a path');
+      }
+    });
+
+    it('rejects origins with query parameters or URL fragments', () => {
+      expect(() => assertCanonicalOrigin('https://app.switchyard.internal?query=1')).toThrow(
+        CsrfError,
+      );
+      expect(() => assertCanonicalOrigin('https://app.switchyard.internal#frag')).toThrow(
+        CsrfError,
+      );
+    });
+
+    it('rejects origins with trailing slashes', () => {
+      expect(() => assertCanonicalOrigin('https://app.switchyard.internal/')).toThrow(CsrfError);
+      try {
+        assertCanonicalOrigin('https://app.switchyard.internal/');
+      } catch (err) {
+        expect((err as CsrfError).reason).toBe('CONFIGURATION_ERROR');
+        expect((err as CsrfError).message).toContain('without trailing slash');
+      }
+    });
+
+    it('rejects unsupported protocols', () => {
+      expect(() => assertCanonicalOrigin('ftp://app.switchyard.internal')).toThrow(CsrfError);
+      expect(() => assertCanonicalOrigin('ws://app.switchyard.internal')).toThrow(CsrfError);
+      expect(() => assertCanonicalOrigin('javascript:alert(1)')).toThrow(CsrfError);
+    });
+
+    it('rejects malformed URL strings', () => {
+      expect(() => assertCanonicalOrigin('not-a-valid-url')).toThrow(CsrfError);
+    });
+  });
+
+  describe('Loopback and Unspecified Host Detection (isLoopbackOrUnspecifiedHost) — CSRF-01', () => {
+    it('detects localhost and *.localhost subdomains', () => {
+      expect(isLoopbackOrUnspecifiedHost('localhost')).toBe(true);
+      expect(isLoopbackOrUnspecifiedHost('LOCALHOST')).toBe(true);
+      expect(isLoopbackOrUnspecifiedHost('sub.localhost')).toBe(true);
+      expect(isLoopbackOrUnspecifiedHost('deep.nested.localhost')).toBe(true);
+    });
+
+    it('detects the entire IPv4 127.0.0.0/8 loopback block', () => {
+      expect(isLoopbackOrUnspecifiedHost('127.0.0.1')).toBe(true);
+      expect(isLoopbackOrUnspecifiedHost('127.0.0.2')).toBe(true);
+      expect(isLoopbackOrUnspecifiedHost('127.1.2.3')).toBe(true);
+      expect(isLoopbackOrUnspecifiedHost('127.255.255.254')).toBe(true);
+      expect(isLoopbackOrUnspecifiedHost('127.255.255.255')).toBe(true);
+    });
+
+    it('detects IPv4 unspecified 0.0.0.0', () => {
+      expect(isLoopbackOrUnspecifiedHost('0.0.0.0')).toBe(true);
+    });
+
+    it('detects IPv6 loopback (::1) and unspecified (::) with or without brackets', () => {
+      expect(isLoopbackOrUnspecifiedHost('::1')).toBe(true);
+      expect(isLoopbackOrUnspecifiedHost('[::1]')).toBe(true);
+      expect(isLoopbackOrUnspecifiedHost('0:0:0:0:0:0:0:1')).toBe(true);
+      expect(isLoopbackOrUnspecifiedHost('::')).toBe(true);
+      expect(isLoopbackOrUnspecifiedHost('[::]')).toBe(true);
+      expect(isLoopbackOrUnspecifiedHost('0:0:0:0:0:0:0:0')).toBe(true);
+    });
+
+    it('detects IPv4-mapped IPv6 loopbacks (dotted decimal and hex)', () => {
+      // Dotted decimal
+      expect(isLoopbackOrUnspecifiedHost('::ffff:127.0.0.1')).toBe(true);
+      expect(isLoopbackOrUnspecifiedHost('::ffff:127.0.0.2')).toBe(true);
+      expect(isLoopbackOrUnspecifiedHost('[::ffff:127.0.0.2]')).toBe(true);
+      expect(isLoopbackOrUnspecifiedHost('::ffff:127.255.255.254')).toBe(true);
+      expect(isLoopbackOrUnspecifiedHost('::ffff:0.0.0.0')).toBe(true);
+
+      // Normalized hexadecimal representations (as parsed by WHATWG URL)
+      expect(isLoopbackOrUnspecifiedHost('::ffff:7f00:1')).toBe(true);
+      expect(isLoopbackOrUnspecifiedHost('::ffff:7f00:2')).toBe(true);
+      expect(isLoopbackOrUnspecifiedHost('[::ffff:7f00:2]')).toBe(true);
+      expect(isLoopbackOrUnspecifiedHost('::ffff:7fff:fffe')).toBe(true);
+      expect(isLoopbackOrUnspecifiedHost('::ffff:0:0')).toBe(true);
+    });
+
+    it('does not classify non-loopback hosts as loopback (preserves legitimate private IPs)', () => {
+      expect(isLoopbackOrUnspecifiedHost('app.switchyard.internal')).toBe(false);
+      expect(isLoopbackOrUnspecifiedHost('control.example.com')).toBe(false);
+      expect(isLoopbackOrUnspecifiedHost('10.0.0.1')).toBe(false);
+      expect(isLoopbackOrUnspecifiedHost('192.168.1.1')).toBe(false);
+      expect(isLoopbackOrUnspecifiedHost('172.16.0.1')).toBe(false);
+      expect(isLoopbackOrUnspecifiedHost('126.255.255.255')).toBe(false);
+      expect(isLoopbackOrUnspecifiedHost('128.0.0.1')).toBe(false);
+      expect(isLoopbackOrUnspecifiedHost('2001:db8::1')).toBe(false);
+      expect(isLoopbackOrUnspecifiedHost('[2001:db8::1]')).toBe(false);
     });
   });
 });

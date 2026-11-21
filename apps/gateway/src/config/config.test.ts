@@ -314,17 +314,53 @@ describe('SW-1.2.2 Central Zod Configuration', () => {
       expect(() => loadConfig(prodWithoutOrigin)).toThrowError(ConfigValidationError);
     });
 
-    it('18g. production profile rejects HTTP and loopback origins', () => {
+    it('18g. production profile rejects HTTP and all loopback/unspecified origin representations (CSRF-01)', () => {
+      // HTTP protocol rejection
       expect(() =>
         loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'http://app.switchyard.internal' }),
       ).toThrowError(ConfigValidationError);
 
+      // IPv4 127.0.0.0/8 loopback block
+      expect(() =>
+        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://127.0.0.1:3000' }),
+      ).toThrowError(ConfigValidationError);
+      expect(() =>
+        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://127.0.0.2' }),
+      ).toThrowError(ConfigValidationError);
+      expect(() =>
+        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://127.255.255.254' }),
+      ).toThrowError(ConfigValidationError);
+
+      // Unspecified IPv4
+      expect(() =>
+        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://0.0.0.0:3000' }),
+      ).toThrowError(ConfigValidationError);
+
+      // Localhost and subdomains
       expect(() =>
         loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://localhost:3000' }),
       ).toThrowError(ConfigValidationError);
-
       expect(() =>
-        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://127.0.0.1:3000' }),
+        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://sub.localhost:3000' }),
+      ).toThrowError(ConfigValidationError);
+
+      // IPv6 loopback and unspecified
+      expect(() =>
+        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://[::1]:3000' }),
+      ).toThrowError(ConfigValidationError);
+      expect(() =>
+        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://[::]:3000' }),
+      ).toThrowError(ConfigValidationError);
+
+      // IPv4-mapped IPv6 loopbacks
+      expect(() =>
+        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://[::ffff:127.0.0.1]:3000' }),
+      ).toThrowError(ConfigValidationError);
+      expect(() =>
+        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://[::ffff:127.0.0.2]:3000' }),
+      ).toThrowError(ConfigValidationError);
+      expect(() =>
+        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://[::ffff:7f00:2]:3000' }),
       ).toThrowError(ConfigValidationError);
     });
 
@@ -335,6 +371,13 @@ describe('SW-1.2.2 Central Zod Configuration', () => {
       };
       const config = loadConfig(validProd);
       expect(config.BROWSER_ORIGIN).toBe('https://control.switchyard.internal');
+
+      // Accepts legitimate private/internal HTTPS origins
+      const privateIpConfig = loadConfig({
+        ...VALID_PROD_ENV,
+        BROWSER_ORIGIN: 'https://10.0.0.1:8443',
+      });
+      expect(privateIpConfig.BROWSER_ORIGIN).toBe('https://10.0.0.1:8443');
     });
   });
 });

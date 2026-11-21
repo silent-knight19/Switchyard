@@ -1,7 +1,8 @@
 import crypto from 'node:crypto';
-import type { FastifyReply, FastifyRequest, FastifyInstance } from 'fastify';
+import net from 'node:net';
+import type { FastifyReply, FastifyRequest } from 'fastify';
 import type { SessionService } from './session.js';
-import { CsrfError, SessionError, type OriginValidationResult } from './types.js';
+import { CsrfError, type OriginValidationResult } from './types.js';
 
 export const PROTECTED_HTTP_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
@@ -89,6 +90,136 @@ export function verifyCsrfTokenHash(candidateBytes: Buffer, storedVerifierHash: 
 }
 
 /**
+ * Evaluates whether a given parsed hostname represents a loopback or unspecified address
+ * across IPv4, IPv6, and IPv4-mapped IPv6 representations (CSRF-01).
+ * Used to enforce strict non-loopback browser origin policies in production.
+ */
+export function isLoopbackOrUnspecifiedHost(hostname: string): boolean {
+  const raw = hostname.startsWith('[') && hostname.endsWith(']') ? hostname.slice(1, -1) : hostname;
+  const host = raw.toLowerCase();
+
+  // Localhost hostname check (localhost and any *.localhost subdomain)
+  if (host === 'localhost' || host.endsWith('.localhost')) {
+    return true;
+  }
+
+  // IPv4 check: entire 127.0.0.0/8 loopback block and 0.0.0.0 unspecified
+  if (net.isIPv4(host)) {
+    const octets = host.split('.').map(Number);
+    if (octets[0] === 127) {
+      return true;
+    }
+    if (octets[0] === 0 && octets[1] === 0 && octets[2] === 0 && octets[3] === 0) {
+      return true;
+    }
+    return false;
+  }
+
+  // IPv6 check: ::1 loopback, :: unspecified, and IPv4-mapped representations
+  if (net.isIPv6(host)) {
+    if (host === '::1' || host === '0:0:0:0:0:0:0:1') {
+      return true;
+    }
+    if (host === '::' || host === '0:0:0:0:0:0:0:0') {
+      return true;
+    }
+
+    // IPv4-mapped IPv6 check (::ffff:...)
+    const ipv4MappedPrefix = '::ffff:';
+    if (host.startsWith(ipv4MappedPrefix)) {
+      const rest = host.slice(ipv4MappedPrefix.length);
+
+      // In dotted-decimal notation (e.g. ::ffff:127.0.0.2)
+      if (net.isIPv4(rest)) {
+        const octets = rest.split('.').map(Number);
+        return (
+          octets[0] === 127 ||
+          (octets[0] === 0 && octets[1] === 0 && octets[2] === 0 && octets[3] === 0)
+        );
+      }
+
+      // In normalized hex notation (e.g. ::ffff:7f00:2 or ::ffff:0:0)
+      const parts = rest.split(':');
+      if (parts.length === 2) {
+        const highWord = parseInt(parts[0] ?? '', 16);
+        const lowWord = parseInt(parts[1] ?? '', 16);
+        const firstOctet = (highWord >> 8) & 0xff;
+        if (firstOctet === 127) {
+          return true;
+        }
+        if (highWord === 0 && lowWord === 0) {
+          return true;
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Validates that an allowed-Origin configuration is an exact, canonical browser origin (CSRF-02).
+ * Fails closed if the configuration contains credentials, paths, queries, fragments,
+ * trailing slashes, wildcards, multiple origins, or unsupported protocols.
+ */
+export function assertCanonicalOrigin(origin: unknown): string {
+  if (typeof origin !== 'string' || origin.trim() === '') {
+    throw new CsrfError(
+      'CONFIGURATION_ERROR',
+      'Allowed browser origin configuration must be a non-empty string',
+    );
+  }
+
+  if (origin.includes(',') || origin === '*') {
+    throw new CsrfError(
+      'CONFIGURATION_ERROR',
+      'Wildcards and multiple comma-separated origins are strictly prohibited',
+    );
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(origin);
+  } catch {
+    throw new CsrfError(
+      'CONFIGURATION_ERROR',
+      `Malformed browser origin configuration: "${String(origin)}"`,
+    );
+  }
+
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new CsrfError(
+      'CONFIGURATION_ERROR',
+      `Browser origin must use http: or https: protocol; received "${parsed.protocol}"`,
+    );
+  }
+
+  if (parsed.username || parsed.password) {
+    throw new CsrfError('CONFIGURATION_ERROR', 'Browser origin must not contain credentials');
+  }
+
+  if (parsed.pathname !== '' && parsed.pathname !== '/') {
+    throw new CsrfError('CONFIGURATION_ERROR', 'Browser origin must not contain a path');
+  }
+
+  if (parsed.search || parsed.hash) {
+    throw new CsrfError(
+      'CONFIGURATION_ERROR',
+      'Browser origin must not contain query or fragment parameters',
+    );
+  }
+
+  if (parsed.origin !== origin) {
+    throw new CsrfError(
+      'CONFIGURATION_ERROR',
+      `Browser origin must be an exact canonical origin without trailing slash; received "${origin}", expected "${parsed.origin}"`,
+    );
+  }
+
+  return parsed.origin;
+}
+
+/**
  * Validates request Origin against approved browser origin configuration.
  * Rejects missing, empty, "null", multiple, malformed, cross-site, or parameter-bearing origins.
  */
@@ -120,7 +251,7 @@ export function validateOrigin(rawOrigin: unknown, allowedOrigin: string): Origi
     return { valid: false, reason: 'MULTIPLE_ORIGINS' };
   }
 
-  // Parse allowed origin once
+  // Parse allowed origin
   let allowedUrl: URL;
   try {
     allowedUrl = new URL(allowedOrigin);
@@ -154,7 +285,6 @@ export function validateOrigin(rawOrigin: unknown, allowedOrigin: string): Origi
   }
 
   // Canonical origin check: originUrl.origin must match rawOrigin exactly
-  // Catches trailing slashes (e.g. "http://example.com/" vs "http://example.com")
   if (originUrl.origin !== rawOrigin) {
     return { valid: false, reason: 'MALFORMED_ORIGIN' };
   }
@@ -167,6 +297,22 @@ export function validateOrigin(rawOrigin: unknown, allowedOrigin: string): Origi
   return { valid: true };
 }
 
+/**
+ * Checks whether rawHeaders array contains more than one occurrence of a header name (CSRF-04).
+ */
+function hasDuplicateRawHeader(rawHeaders: string[] | undefined, headerName: string): boolean {
+  if (!rawHeaders) return false;
+  const target = headerName.toLowerCase();
+  let count = 0;
+  for (let i = 0; i < rawHeaders.length; i += 2) {
+    if (rawHeaders[i]?.toLowerCase() === target) {
+      count++;
+      if (count > 1) return true;
+    }
+  }
+  return false;
+}
+
 export interface CsrfProtectionOptions {
   sessionService: SessionService;
   allowedOrigin: string;
@@ -175,9 +321,13 @@ export interface CsrfProtectionOptions {
 /**
  * Creates a Fastify preHandler hook enforcing strict Origin verification and
  * session-bound CSRF token validation on state-changing browser mutations.
+ * Validates the allowedOrigin configuration once at construction time (CSRF-02).
  */
 export function createCsrfProtectionPreHandler(options: CsrfProtectionOptions) {
   const { sessionService, allowedOrigin } = options;
+
+  // Validate allowedOrigin once at factory creation time (CSRF-02)
+  const trustedOrigin = assertCanonicalOrigin(allowedOrigin);
 
   return async function csrfProtectionPreHandler(
     req: FastifyRequest,
@@ -190,9 +340,28 @@ export function createCsrfProtectionPreHandler(options: CsrfProtectionOptions) {
       return;
     }
 
+    // 0. Defense-in-depth: Reject duplicate raw header lines (CSRF-04)
+    if (hasDuplicateRawHeader(req.raw.rawHeaders, 'origin')) {
+      reply.status(403).send({
+        statusCode: 403,
+        error: 'Forbidden',
+        message: 'Invalid or missing Origin',
+      });
+      return;
+    }
+
+    if (hasDuplicateRawHeader(req.raw.rawHeaders, 'x-csrf-token')) {
+      reply.status(403).send({
+        statusCode: 403,
+        error: 'Forbidden',
+        message: 'Invalid or missing CSRF token',
+      });
+      return;
+    }
+
     // 1. Strict Origin verification
     const rawOrigin = req.headers['origin'];
-    const originResult = validateOrigin(rawOrigin, allowedOrigin);
+    const originResult = validateOrigin(rawOrigin, trustedOrigin);
     if (!originResult.valid) {
       reply.status(403).send({
         statusCode: 403,
@@ -269,81 +438,4 @@ export function createCsrfProtectionPreHandler(options: CsrfProtectionOptions) {
       return;
     }
   };
-}
-
-/**
- * Registers test-only endpoints in an isolated test harness for verifying
- * CSRF token reissuance and mutation handling without exposing incomplete
- * production routes (SW-1.5.3 test boundary; production routes owned by SW-1.5.4).
- */
-export function registerTestCsrfRoutes(
-  app: FastifyInstance,
-  options: { sessionService: SessionService; allowedOrigin: string; onMutation?: () => void },
-) {
-  const { sessionService, allowedOrigin, onMutation } = options;
-  const csrfPreHandler = createCsrfProtectionPreHandler({ sessionService, allowedOrigin });
-
-  // Test-only token reissuance endpoint
-  app.post('/test/auth/csrf/reissue', async (req, reply) => {
-    // Requires exact allowed Origin
-    const originResult = validateOrigin(req.headers['origin'], allowedOrigin);
-    if (!originResult.valid) {
-      return reply.status(403).send({
-        statusCode: 403,
-        error: 'Forbidden',
-        message: 'Invalid or missing Origin',
-      });
-    }
-
-    // Requires authenticated browser session
-    const sessionSecret = sessionService.extractSessionSecretFromCookieHeader(
-      req.headers['cookie'],
-    );
-    if (!sessionSecret) {
-      return reply.status(401).send({
-        statusCode: 401,
-        error: 'Unauthorized',
-        message: 'Authentication required',
-      });
-    }
-
-    try {
-      const { csrfToken } = await sessionService.reissueCsrfToken(sessionSecret);
-      return reply
-        .header('Cache-Control', 'no-store, no-cache, must-revalidate, private')
-        .header('Pragma', 'no-cache')
-        .send({ csrfToken });
-    } catch (err) {
-      if (err instanceof SessionError) {
-        return reply.status(401).send({
-          statusCode: 401,
-          error: 'Unauthorized',
-          message: 'Authentication required',
-        });
-      }
-      return reply.status(500).send({
-        statusCode: 500,
-        error: 'Internal Server Error',
-        message: 'Internal server error',
-      });
-    }
-  });
-
-  // Test-only protected mutation endpoint
-  app.post('/test/protected/mutation', { preHandler: csrfPreHandler }, async (_req, reply) => {
-    if (onMutation) onMutation();
-    return reply.status(200).send({ success: true, mutated: true });
-  });
-
-  // Test-only protected PUT mutation
-  app.put('/test/protected/mutation', { preHandler: csrfPreHandler }, async (_req, reply) => {
-    if (onMutation) onMutation();
-    return reply.status(200).send({ success: true, mutated: true });
-  });
-
-  // Test-only protected DELETE mutation
-  app.delete('/test/protected/mutation', { preHandler: csrfPreHandler }, async (_req, reply) => {
-    if (onMutation) onMutation();
-    return reply.status(200).send({ success: true, mutated: true });
-  });
 }

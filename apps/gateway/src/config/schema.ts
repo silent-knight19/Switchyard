@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type { ConfigIssue } from './errors.js';
 import { isSensitiveKey } from '../logging/redaction.js';
 import { formatSafeZodMessage } from '../logging/serializers.js';
+import { assertCanonicalOrigin, isLoopbackOrUnspecifiedHost } from '../auth/csrf.js';
 
 const FORBIDDEN_SECURITY_FLAGS = [
   'FAIL_OPEN',
@@ -112,57 +113,26 @@ export const rawEnvSchema = z
       });
     }
 
-    // Invariant (SW-1.5.3): Strict browser origin validation
+    // Invariant (SW-1.5.3, CSRF-02): Canonical browser origin validation
+    let parsedOriginUrl: URL | null = null;
     try {
-      const parsedOrigin = new URL(data.BROWSER_ORIGIN);
-      if (parsedOrigin.protocol !== 'http:' && parsedOrigin.protocol !== 'https:') {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: ['BROWSER_ORIGIN'],
-          message: 'Browser origin must use http: or https: protocol',
-        });
-      } else if (parsedOrigin.username || parsedOrigin.password) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: ['BROWSER_ORIGIN'],
-          message: 'Browser origin must not contain credentials',
-        });
-      } else if (parsedOrigin.pathname !== '' && parsedOrigin.pathname !== '/') {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: ['BROWSER_ORIGIN'],
-          message: 'Browser origin must not contain a path',
-        });
-      } else if (parsedOrigin.search || parsedOrigin.hash) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: ['BROWSER_ORIGIN'],
-          message: 'Browser origin must not contain query or fragment parameters',
-        });
-      } else if (parsedOrigin.origin !== data.BROWSER_ORIGIN) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: ['BROWSER_ORIGIN'],
-          message: 'Browser origin must be an exact canonical origin without trailing slash',
-        });
-      }
-    } catch {
+      assertCanonicalOrigin(data.BROWSER_ORIGIN);
+      parsedOriginUrl = new URL(data.BROWSER_ORIGIN);
+    } catch (err) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['BROWSER_ORIGIN'],
-        message: 'Malformed browser origin URL',
+        message: err instanceof Error ? err.message : 'Invalid browser origin configuration',
       });
     }
 
     // Invariants for production profile
     if (data.NODE_ENV === 'production') {
-      // Invariant (SW-1.5.3): Production profile requires explicit HTTPS non-loopback browser origin
+      // Invariant (SW-1.5.3, CSRF-01): Production profile requires explicit HTTPS non-loopback browser origin
       if (
         data.BROWSER_ORIGIN === 'http://127.0.0.1:3000' ||
         !data.BROWSER_ORIGIN.startsWith('https://') ||
-        data.BROWSER_ORIGIN.includes('localhost') ||
-        data.BROWSER_ORIGIN.includes('127.0.0.1') ||
-        data.BROWSER_ORIGIN.includes('[::1]')
+        (parsedOriginUrl !== null && isLoopbackOrUnspecifiedHost(parsedOriginUrl.hostname))
       ) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
