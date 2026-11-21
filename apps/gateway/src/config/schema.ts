@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type { ConfigIssue } from './errors.js';
 import { isSensitiveKey } from '../logging/redaction.js';
 import { formatSafeZodMessage } from '../logging/serializers.js';
+import { assertCanonicalOrigin, isLoopbackOrUnspecifiedHost } from '../auth/csrf.js';
 
 const FORBIDDEN_SECURITY_FLAGS = [
   'FAIL_OPEN',
@@ -74,6 +75,7 @@ export const rawEnvSchema = z
     TLS_VERIFY: strictBoolean.default(true),
     MOCK_PROVIDER_ENABLED: strictBoolean.default(false),
     DEMO_SEEDING_ENABLED: strictBoolean.default(false),
+    BROWSER_ORIGIN: z.string().min(1).default('http://127.0.0.1:3000'),
 
     // Optional Upstream Endpoints
     UPSTREAM_ENDPOINT_URL: z
@@ -111,8 +113,34 @@ export const rawEnvSchema = z
       });
     }
 
+    // Invariant (SW-1.5.3, CSRF-02): Canonical browser origin validation
+    let parsedOriginUrl: URL | null = null;
+    try {
+      assertCanonicalOrigin(data.BROWSER_ORIGIN);
+      parsedOriginUrl = new URL(data.BROWSER_ORIGIN);
+    } catch (err) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['BROWSER_ORIGIN'],
+        message: err instanceof Error ? err.message : 'Invalid browser origin configuration',
+      });
+    }
+
     // Invariants for production profile
     if (data.NODE_ENV === 'production') {
+      // Invariant (SW-1.5.3, CSRF-01): Production profile requires explicit HTTPS non-loopback browser origin
+      if (
+        data.BROWSER_ORIGIN === 'http://127.0.0.1:3000' ||
+        !data.BROWSER_ORIGIN.startsWith('https://') ||
+        (parsedOriginUrl !== null && isLoopbackOrUnspecifiedHost(parsedOriginUrl.hostname))
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['BROWSER_ORIGIN'],
+          message:
+            'Production profile requires an explicit non-loopback HTTPS browser origin (BROWSER_ORIGIN)',
+        });
+      }
       // Invariant (R6): Production upstream origin restrictions
       if (data.UPSTREAM_ENDPOINT_URL !== undefined) {
         ctx.addIssue({

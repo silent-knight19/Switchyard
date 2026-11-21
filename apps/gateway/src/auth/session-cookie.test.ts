@@ -310,6 +310,7 @@ describe('SW-1.5.2: Session Cookie & Secret Encoding', () => {
         TLS_VERIFY: true,
         MOCK_PROVIDER_ENABLED: false,
         DEMO_SEEDING_ENABLED: false,
+        BROWSER_ORIGIN: 'https://app.switchyard.internal',
       } as const;
 
       expect(
@@ -355,6 +356,7 @@ describe('SW-1.5.2: Session Cookie & Secret Encoding', () => {
         TLS_VERIFY: true,
         MOCK_PROVIDER_ENABLED: false,
         DEMO_SEEDING_ENABLED: false,
+        BROWSER_ORIGIN: 'https://app.switchyard.internal',
       } as const;
 
       expect(
@@ -397,6 +399,7 @@ describe('SW-1.5.2: Session Cookie & Secret Encoding', () => {
         TLS_VERIFY: true,
         MOCK_PROVIDER_ENABLED: false,
         DEMO_SEEDING_ENABLED: false,
+        BROWSER_ORIGIN: 'http://127.0.0.1:3000',
       } as const;
 
       expect(
@@ -433,6 +436,7 @@ describe('SW-1.5.2: Session Cookie & Secret Encoding', () => {
           TLS_VERIFY: true,
           MOCK_PROVIDER_ENABLED: false,
           DEMO_SEEDING_ENABLED: false,
+          BROWSER_ORIGIN: 'https://app.switchyard.internal',
         } as const;
 
         // Default construction with prodConfig produces secure __Host-session

@@ -41,6 +41,7 @@ const VALID_PROD_ENV: Record<string, string> = {
   TLS_VERIFY: 'true',
   MOCK_PROVIDER_ENABLED: 'false',
   DEMO_SEEDING_ENABLED: 'false',
+  BROWSER_ORIGIN: 'https://app.switchyard.internal',
 };
 
 describe('SW-1.2.2 Central Zod Configuration', () => {
@@ -256,5 +257,149 @@ describe('SW-1.2.2 Central Zod Configuration', () => {
       const err = e as ConfigValidationError;
       expect(err.message).toContain('fail-closed');
     }
+  });
+
+  describe('SW-1.5.3: BROWSER_ORIGIN Strict Configuration Validation', () => {
+    it('18a. defaults development BROWSER_ORIGIN to http://127.0.0.1:3000', () => {
+      const config = loadConfig(VALID_DEV_ENV);
+      expect(config.BROWSER_ORIGIN).toBe('http://127.0.0.1:3000');
+    });
+
+    it('18b. accepts custom valid development origin without trailing slash', () => {
+      const customDev = { ...VALID_DEV_ENV, BROWSER_ORIGIN: 'http://localhost:3001' };
+      const config = loadConfig(customDev);
+      expect(config.BROWSER_ORIGIN).toBe('http://localhost:3001');
+    });
+
+    it('18c. rejects browser origin with trailing slash', () => {
+      const trailingSlash = { ...VALID_DEV_ENV, BROWSER_ORIGIN: 'http://127.0.0.1:3000/' };
+      expect(() => loadConfig(trailingSlash)).toThrowError(ConfigValidationError);
+    });
+
+    it('18d. rejects browser origin with path, query, fragment, or credentials', () => {
+      expect(() =>
+        loadConfig({ ...VALID_DEV_ENV, BROWSER_ORIGIN: 'http://127.0.0.1:3000/path' }),
+      ).toThrowError(ConfigValidationError);
+
+      expect(() =>
+        loadConfig({ ...VALID_DEV_ENV, BROWSER_ORIGIN: 'http://127.0.0.1:3000?foo=bar' }),
+      ).toThrowError(ConfigValidationError);
+
+      expect(() =>
+        loadConfig({ ...VALID_DEV_ENV, BROWSER_ORIGIN: 'http://127.0.0.1:3000#section' }),
+      ).toThrowError(ConfigValidationError);
+
+      expect(() =>
+        loadConfig({ ...VALID_DEV_ENV, BROWSER_ORIGIN: 'http://user:pass@127.0.0.1:3000' }),
+      ).toThrowError(ConfigValidationError);
+    });
+
+    it('18e. rejects wildcard or malformed browser origins', () => {
+      expect(() => loadConfig({ ...VALID_DEV_ENV, BROWSER_ORIGIN: '*' })).toThrowError(
+        ConfigValidationError,
+      );
+
+      expect(() => loadConfig({ ...VALID_DEV_ENV, BROWSER_ORIGIN: 'not-a-url' })).toThrowError(
+        ConfigValidationError,
+      );
+
+      expect(() =>
+        loadConfig({ ...VALID_DEV_ENV, BROWSER_ORIGIN: 'ftp://app.switchyard.internal' }),
+      ).toThrowError(ConfigValidationError);
+    });
+
+    it('18f. production profile rejects default development origin (no silent fallback)', () => {
+      const prodWithoutOrigin = { ...VALID_PROD_ENV };
+      delete prodWithoutOrigin['BROWSER_ORIGIN'];
+      expect(() => loadConfig(prodWithoutOrigin)).toThrowError(ConfigValidationError);
+    });
+
+    it('18g. production profile rejects HTTP and all loopback/unspecified origin representations (CSRF-01)', () => {
+      // HTTP protocol rejection
+      expect(() =>
+        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'http://app.switchyard.internal' }),
+      ).toThrowError(ConfigValidationError);
+
+      // IPv4 127.0.0.0/8 loopback block
+      expect(() =>
+        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://127.0.0.1:3000' }),
+      ).toThrowError(ConfigValidationError);
+      expect(() =>
+        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://127.0.0.2' }),
+      ).toThrowError(ConfigValidationError);
+      expect(() =>
+        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://127.255.255.254' }),
+      ).toThrowError(ConfigValidationError);
+
+      // Unspecified IPv4
+      expect(() =>
+        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://0.0.0.0:3000' }),
+      ).toThrowError(ConfigValidationError);
+
+      // Localhost and subdomains (including terminal root dot FQDNs — CSRF-06)
+      expect(() =>
+        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://localhost' }),
+      ).toThrowError(ConfigValidationError);
+      expect(() =>
+        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://localhost.' }),
+      ).toThrowError(ConfigValidationError);
+      expect(() =>
+        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://localhost:3000' }),
+      ).toThrowError(ConfigValidationError);
+      expect(() =>
+        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://sub.localhost' }),
+      ).toThrowError(ConfigValidationError);
+      expect(() =>
+        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://sub.localhost.' }),
+      ).toThrowError(ConfigValidationError);
+      expect(() =>
+        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://sub.localhost:3000' }),
+      ).toThrowError(ConfigValidationError);
+      expect(() =>
+        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://deep.sub.localhost.' }),
+      ).toThrowError(ConfigValidationError);
+
+      // IPv6 loopback and unspecified
+      expect(() =>
+        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://[::1]:3000' }),
+      ).toThrowError(ConfigValidationError);
+      expect(() =>
+        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://[::]:3000' }),
+      ).toThrowError(ConfigValidationError);
+
+      // IPv4-mapped IPv6 loopbacks
+      expect(() =>
+        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://[::ffff:127.0.0.1]:3000' }),
+      ).toThrowError(ConfigValidationError);
+      expect(() =>
+        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://[::ffff:127.0.0.2]:3000' }),
+      ).toThrowError(ConfigValidationError);
+      expect(() =>
+        loadConfig({ ...VALID_PROD_ENV, BROWSER_ORIGIN: 'https://[::ffff:7f00:2]:3000' }),
+      ).toThrowError(ConfigValidationError);
+    });
+
+    it('18h. production profile accepts explicit non-loopback HTTPS origin', () => {
+      const validProd = {
+        ...VALID_PROD_ENV,
+        BROWSER_ORIGIN: 'https://control.switchyard.internal',
+      };
+      const config = loadConfig(validProd);
+      expect(config.BROWSER_ORIGIN).toBe('https://control.switchyard.internal');
+
+      // Accepts canonical FQDN with trailing dot (CSRF-06)
+      const fqdnConfig = loadConfig({
+        ...VALID_PROD_ENV,
+        BROWSER_ORIGIN: 'https://app.switchyard.internal.',
+      });
+      expect(fqdnConfig.BROWSER_ORIGIN).toBe('https://app.switchyard.internal.');
+
+      // Accepts legitimate private/internal HTTPS origins
+      const privateIpConfig = loadConfig({
+        ...VALID_PROD_ENV,
+        BROWSER_ORIGIN: 'https://10.0.0.1:8443',
+      });
+      expect(privateIpConfig.BROWSER_ORIGIN).toBe('https://10.0.0.1:8443');
+    });
   });
 });

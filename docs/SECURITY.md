@@ -191,6 +191,40 @@ To allow deployment role `gateway_migrator` to install executor-owned functions 
 
 | Requirement / Task | Status | Reference | Verified Evidence |
 | :--- | :---: | :--- | :--- |
-| **Batch A: Secure Authentication (SW-1.5.1)** | IMPLEMENTED | `src/auth/service.ts`, `src/auth/password.ts`, `src/auth/email.ts`, `src/auth/rate-limiter.ts` | 128-byte password cap, real Argon2id hashing (`m=19456, t=2, p=1`), dummy verify on unknown accounts, canonical email normalization, Redis IP/account rate limits |
-| **Batch A: Server-Side Web Sessions (SW-1.5.2)** | IMPLEMENTED | `src/auth/session.ts`, Migration `0011-session-tenant-lookup.sql`, ADR 0001 | 256-bit opaque secret (`__Host-session`), SHA-256 verifier persistence, atomic rotation, idle/absolute expiry, revocation, RLS cross-tenant isolation |
-| **Batch A: Pre-Tenant Session Lookup (ADR 0001)** | IMPLEMENTED | Migration `0011-session-tenant-lookup.sql` | `app_private.lookup_session_org_by_hash(BYTEA)` owned by `gateway_auth_executor`, UUID-only return, granted strictly to `gateway_app` |
+| **Batch A: Secure Authentication (SW-1.5.1)** | ACCEPTED | PR #11 (merge commit `2fbe6080919e20dee18af2a94da7f046e6fff20c`) | 128-byte password cap, real Argon2id hashing (`m=19456, t=2, p=1`), dummy verify on unknown accounts, canonical email normalization, Redis IP/account rate limits |
+| **Batch A: Server-Side Web Sessions (SW-1.5.2)** | ACCEPTED | PR #11 (merge commit `2fbe6080919e20dee18af2a94da7f046e6fff20c`) | 256-bit opaque secret (`__Host-session`), SHA-256 verifier persistence, atomic rotation, idle/absolute expiry, revocation, RLS cross-tenant isolation |
+| **Batch A: Pre-Tenant Session Lookup (ADR 0001)** | ACCEPTED | PR #11 (merge commit `2fbe6080919e20dee18af2a94da7f046e6fff20c`) | `app_private.lookup_session_org_by_hash(BYTEA)` owned by `gateway_auth_executor`, UUID-only return, granted strictly to `gateway_app` |
+| **Batch B: Session-Bound CSRF & Strict Origin (SW-1.5.3)** | IMPLEMENTED | `src/auth/csrf.ts`, `src/auth/session.ts`, `src/config/schema.ts` | 256-bit synchronizer token, constant-time `timingSafeEqual`, exact `Origin` matching against `BROWSER_ORIGIN`, atomic row serialization under RLS, Fastify preHandler boundary |
+
+---
+
+## 8. CSRF & Strict Origin Verification Architecture (SW-1.5.3)
+
+Switchyard implements the server-side synchronizer token pattern bound to authenticated server-side sessions (Architecture v1.2 §13.3) combined with strict browser Origin verification.
+
+### 8.1 Cryptographic Token Representation & Verifiers
+- **Generation:** 256 bits of cryptographically secure entropy (`crypto.randomBytes(32)`).
+- **Encoding:** Canonical unpadded `base64url` (exactly 43 characters, 32 decoded bytes).
+- **Canonical Validation:** Round-trip assertion `buf.toString('base64url') === rawToken` strictly rejects noncanonical trailing pad bits, whitespace, standard base64 characters (`+`, `/`), and padding (`=`).
+- **Storage:** Only the SHA-256 digest (`csrf_token_hash BYTEA`) is stored in `public.web_sessions`. Plaintext tokens are never persisted in PostgreSQL, Redis, or logging systems.
+- **Verification:** Digested using SHA-256 and compared in constant time with `crypto.timingSafeEqual(computedHash, storedHash)` after verifying exact 32-byte digest lengths.
+
+### 8.2 Strict Origin Verification Boundary
+- State-changing browser methods (`POST`, `PUT`, `PATCH`, `DELETE`) require an exact match against configured `BROWSER_ORIGIN`.
+- Rejects missing, empty, `"null"`, array, comma-separated, malformed, or cross-site origins.
+- Rejects trailing slashes, paths, query parameters, URL fragments, and embedded credentials in Origin headers.
+- Protection against subdomain prefix and suffix attacks via exact canonical URL origin comparison (`url.origin === allowedOrigin`).
+- Untrusted request headers (`Host`, `X-Forwarded-Host`, `X-Forwarded-Proto`, `Referer`) are never used to derive allowed origins.
+
+### 8.3 Concurrency & Reissuance Semantics
+- Only one active CSRF verifier exists per server-side session.
+- `reissueCsrfToken` acquires a row lock (`FOR UPDATE OF ws`) under tenant RLS.
+- Reissuance follows last-committed-wins: committed reissuance immediately invalidates prior tokens for that session.
+- Concurrent issuance operations serialize on the row lock; older tokens fail validation with `CSRF_TOKEN_MISMATCH`.
+- Revoked, idle-expired, or absolute-expired sessions cannot issue or verify tokens.
+- Transaction rollback on token issuance leaves prior committed verifiers intact.
+
+### 8.4 Deferred SW-1.5.4 Default-Deny Integration
+- SW-1.5.3 provides the reusable Fastify preHandler hook `createCsrfProtectionPreHandler`.
+- No incomplete authenticated production endpoints are registered in SW-1.5.3.
+- Subphase 1.5 Task SW-1.5.4 will integrate default-deny route metadata (`principal: 'browser' | 'virtual_key' | 'anonymous'`) and role-based access control.
