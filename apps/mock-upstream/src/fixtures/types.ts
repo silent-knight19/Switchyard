@@ -111,7 +111,13 @@ export interface EdgeCaseFixture {
     | 'duplicate_done'
     | 'oversized_line'
     | 'oversized_event'
-    | 'malformed_usage';
+    | 'malformed_usage'
+    | 'usage_tail'
+    | 'no_usage_tail';
+  responseId?: string;
+  created?: number;
+  model?: string;
+  usage?: ChatCompletionUsage;
 }
 
 export interface NonSseFixture {

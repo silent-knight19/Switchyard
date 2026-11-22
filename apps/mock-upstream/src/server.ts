@@ -6,6 +6,11 @@ import type { AbortObservation, Fixture } from './fixtures/types.js';
 import { sendJsonResponse } from './response/json.js';
 import { sendSseResponse } from './response/sse.js';
 import { sendHttpError, executeNetworkFault } from './response/faults.js';
+import {
+  executeEdgeCase,
+  sendNonSseResponse,
+  sendCapabilityResponse,
+} from './response/edge-cases.js';
 
 export interface MockServerOptions {
   port?: number;
@@ -582,7 +587,25 @@ export class MockServer {
       return;
     }
 
-    throw new Error(`Unsupported fixture type in Stage A/B: ${fixture.type}`);
+    if (fixture.type === 'edge_case') {
+      await executeEdgeCase(res, fixture, abortSignal, onBytesWritten);
+      return;
+    }
+
+    if (fixture.type === 'non_sse') {
+      const bytes = sendNonSseResponse(res, fixture);
+      onBytesWritten(bytes);
+      return;
+    }
+
+    if (fixture.type === 'capability') {
+      const bytes = sendCapabilityResponse(res, fixture);
+      onBytesWritten(bytes);
+      return;
+    }
+
+    const exhaustiveCheck: never = fixture;
+    throw new Error(`Unhandled fixture: ${JSON.stringify(exhaustiveCheck)}`);
   }
 }
 
