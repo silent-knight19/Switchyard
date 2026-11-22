@@ -11,6 +11,7 @@
     "migrate": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON src/db/migrate.ts --apply",
     "migrate:adopt-legacy": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON src/db/migrate.ts --apply --adopt-legacy",
     "start": "node dist/index.js",
+    "start:worker": "node dist/worker-main.js",
     "test": "vitest run --passWithNoTests",
     "test:db": "vitest run --config vitest.db.config.ts",
     "test:integration": "INTEGRATION_TESTS=required vitest run --passWithNoTests",

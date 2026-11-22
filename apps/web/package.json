@@ -3,11 +3,21 @@
   "version": "0.0.1",
   "private": true,
   "scripts": {
-    "build": "tsc --noEmit",
+    "build": "next build",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "lint": "eslint . --no-error-on-unmatched-pattern",
+    "start": "next start -p 3001 -H 0.0.0.0",
     "test": "vitest run --passWithNoTests",
     "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "next": "15.5.29",
+    "react": "19.0.0",
+    "react-dom": "19.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "19.0.0",
+    "@types/react-dom": "19.0.0"
   }
 }

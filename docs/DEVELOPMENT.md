@@ -574,3 +574,41 @@ The default `pnpm test` suite excludes `*.db.test.ts`, and CI runs them in a sep
 The older `pnpm --filter @switchyard/gateway test:integration` suite (live Compose PostgreSQL and
 Redis, gated by `INTEGRATION_TESTS`) still exists for connectivity tests; it is not a substitute
 for `test:db`.
+
+#### 7.7.11 Six-Component Service Topology & Runtime Integration (SW-P1-B01)
+
+Resolving Phase 1 acceptance blocker `ARCH-P1-01` (Architecture v1.2 §23), Switchyard provides a clean-clone Docker Compose environment containing all six mandatory components:
+
+| Component | Technology | Process / Command | Network / Ports | Health Check |
+|---|---|---|---|---|
+| **Gateway** | Node.js Fastify API server | `node apps/gateway/dist/index.js` | `127.0.0.1:${PORT:-3000}:3000` | HTTP `GET /health/ready` |
+| **Worker** | Node.js worker daemon | `node apps/gateway/dist/worker-main.js` | Internal only (0 host ports) | CLI `node dist/worker-main.js --health` |
+| **Web** | Next.js App Router (standalone) | `node apps/web/server.js` | `127.0.0.1:${WEB_PORT:-3001}:3001` | HTTP `GET /health/ready` |
+| **PostgreSQL** | PostgreSQL 16.8 | `docker-entrypoint.sh` | `127.0.0.1:${POSTGRES_PORT:-5432}:5432` | `pg_isready` |
+| **Redis** | Redis 7.4.2 | `redis-server` (AOF + noeviction) | `127.0.0.1:${REDIS_PORT:-6379}:6379` | `redis-cli ping` + ACL attestation |
+| **Mock Upstream** | Node.js OpenAI mock | `node apps/mock-upstream/dist/index.js` | Internal only (4000, 0 host ports) | HTTP `GET /health/ready` |
+
+##### Manual Startup Commands:
+- **Worker standalone:**
+  ```bash
+  pnpm --filter @switchyard/gateway start:worker
+  ```
+- **Web standalone:**
+  ```bash
+  pnpm --filter @switchyard/web dev      # Development mode
+  pnpm --filter @switchyard/web build    # Production build
+  pnpm --filter @switchyard/web start    # Production runtime
+  ```
+- **Docker Compose (all 6 services):**
+  ```bash
+  docker compose up -d
+  ```
+
+##### Worker Readiness & Observability Semantics (WRK-01, WRK-02, WRK-03, WRK-04, WRK-05, WRK-06, WRK-07, WRK-08):
+- **Readiness State & Bounded Probes (WRK-01, WRK-04):** Worker health is governed by continuous, bounded dependency probes (`WORKER_PROBE_INTERVAL_MS` default 5000ms, timeout 2000ms). Both PostgreSQL (`SELECT 1` under `gateway_worker`) and Redis (`PING` under `switchyard_worker`) must be healthy for the worker to report `ready`. If either dependency fails or times out, readiness immediately transitions to `unhealthy`, returning non-zero from `worker-main.js --health`. Probe timeouts enforce real cancellation and detachment: PostgreSQL clients are returned or destroyed (`client.release(true)`) preventing pool exhaustion, Redis offline queue accumulation is disabled (`enableOfflineQueue: false`), and probe sequence generation fencing prevents delayed stale results from corrupting newer readiness states. Readiness automatically recovers when dependencies are restored, even after prolonged outages exceeding short retry budgets.
+- **Underlying Resource Cleanup & Leak Prevention (WRK-07):** A strict distinction is enforced between wrapper probe completion and underlying I/O resource cleanup. When database connection acquisition or query execution times out, underlying sockets are forcibly terminated: timed-out PostgreSQL clients are destroyed via `client.release(true)` and late-arriving connection promises are tracked as abandoned and immediately destroyed upon arrival. Repeated probe timeouts never increase active client allocations or starve pool waiting queues.
+- **Signal-Driven Graceful Shutdown & Container Recovery (WRK-08):** Worker container lifecycle handles `SIGTERM` / `SIGINT` signals with bounded shutdown (< 500ms), safely closing Redis and PostgreSQL client pools, unlinking the health state file `/tmp/switchyard-worker-health.json` to prevent stale readiness artifacts, and exiting with status code 0 well before container runtime grace periods expire (distinguished from SIGKILL exit 137). Restarted worker containers re-establish healthy connections and pass CLI health checks without manual intervention.
+- **Heartbeat Freshness & Operational Bounds (WRK-05):** Probe intervals (100ms - 30000ms) and timeouts (50ms - 10000ms) are strictly validated with invariant `WORKER_PROBE_TIMEOUT_MS <= WORKER_PROBE_INTERVAL_MS`. Operational failure detection occurs within at most one probe cycle ($I + T \le 7\text{s}$ under default configuration). Heartbeat freshness threshold is coherently derived as $\max(3 \times I, I + 2 \times T)$ (default 15000ms), eliminating false expiration while rejecting genuinely stale processes.
+- **Production Credential Validation (WRK-06):** In production profiles (`NODE_ENV=production`), default development credentials (`switchyard_worker_password`, `switchyard_dev_password`, `switchyard_app_password`, `password`, `postgres`, `admin`, `root`) are rejected fail-closed. Sensitive credentials are never echoed in error messages or logs.
+- **Canary Redaction (WRK-02):** Configuration validation errors and startup logs strictly redact environment values and synthetic canaries using allowlisted error codes and safe serializers.
+- **Service Attribution (WRK-03):** Worker structured logs are identified with `service: "@switchyard/worker"` and `name: "@switchyard/worker"`, distinguishing worker daemon logs from Gateway server logs.

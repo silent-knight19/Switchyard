@@ -51,6 +51,7 @@ export function createLogger(options: CreateLoggerOptions = {}): pino.Logger {
 }
 
 let rootLogger: pino.Logger | null = null;
+let workerLogger: pino.Logger | null = null;
 
 export function getLogger(): pino.Logger {
   if (!rootLogger) {
@@ -59,6 +60,18 @@ export function getLogger(): pino.Logger {
   return rootLogger;
 }
 
+export function getWorkerLogger(): pino.Logger {
+  if (!workerLogger) {
+    workerLogger = createLogger({ serviceName: '@switchyard/worker' });
+  }
+  return workerLogger;
+}
+
 export function resetLoggerForTesting(): void {
   rootLogger = null;
+  workerLogger = null;
+}
+
+export function resetWorkerLoggerForTesting(): void {
+  workerLogger = null;
 }

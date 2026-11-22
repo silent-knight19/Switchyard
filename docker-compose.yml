@@ -24,7 +24,7 @@ services:
         ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-switchyard} -d ${POSTGRES_DB:-switchyard}"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
       start_period: 10s
 
   redis:
@@ -35,13 +35,15 @@ services:
       REDIS_PASSWORD: ${REDIS_PASSWORD:-switchyard_dev_password}
       REDIS_APP_USER: ${REDIS_APP_USER:-switchyard_app}
       REDIS_APP_PASSWORD: ${REDIS_APP_PASSWORD:-switchyard_app_password}
+      REDIS_WORKER_USER: ${REDIS_WORKER_USER:-switchyard_worker}
+      REDIS_WORKER_PASSWORD: ${REDIS_WORKER_PASSWORD:-switchyard_worker_password}
       REDISCLI_AUTH: ${REDIS_PASSWORD:-switchyard_dev_password}
       REDIS_MAXMEMORY: ${REDIS_MAXMEMORY:-64mb}
     command:
       - /bin/sh
       - -c
       - |
-        printf "appendonly yes\nappendfsync everysec\nmaxmemory %s\nmaxmemory-policy noeviction\nrequirepass %s\nuser default on >%s ~* &* +@all\nuser %s on >%s ~* &* +@all -@admin -@dangerous +info -FLUSHALL -FLUSHDB -CONFIG -DEBUG -SHUTDOWN -REPLICAOF -KEYS\n" "$$REDIS_MAXMEMORY" "$$REDIS_PASSWORD" "$$REDIS_PASSWORD" "$$REDIS_APP_USER" "$$REDIS_APP_PASSWORD" | exec redis-server -
+        printf "appendonly yes\nappendfsync everysec\nmaxmemory %s\nmaxmemory-policy noeviction\nrequirepass %s\nuser default on >%s ~* &* +@all\nuser %s on >%s ~* &* +@all -@admin -@dangerous +info -FLUSHALL -FLUSHDB -CONFIG -DEBUG -SHUTDOWN -REPLICAOF -KEYS\nuser %s on >%s ~* &* -@all +ping +info +acl|whoami\n" "$$REDIS_MAXMEMORY" "$$REDIS_PASSWORD" "$$REDIS_PASSWORD" "$$REDIS_APP_USER" "$$REDIS_APP_PASSWORD" "$$REDIS_WORKER_USER" "$$REDIS_WORKER_PASSWORD" | exec redis-server -
     ports:
       - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     volumes:
@@ -57,14 +59,17 @@ services:
           redis-cli info memory | grep -q 'maxmemory_policy:noeviction' &&
           redis-cli info persistence | grep -q 'aof_enabled:1' &&
           [ "$${REDIS_APP_USER:-switchyard_app}" != "default" ] &&
+          [ "$${REDIS_WORKER_USER:-switchyard_worker}" != "default" ] &&
           for cmd in "FLUSHALL" "FLUSHDB" "CONFIG GET maxmemory" "DEBUG OBJECT x" "SHUTDOWN" "REPLICAOF NO ONE" "KEYS *" "ACL LIST"; do
             res=$$(redis-cli ACL DRYRUN "$${REDIS_APP_USER:-switchyard_app}" $$cmd) &&
             echo "$$res" | grep -qi "no permissions" || exit 1;
+            res_worker=$$(redis-cli ACL DRYRUN "$${REDIS_WORKER_USER:-switchyard_worker}" $$cmd) &&
+            echo "$$res_worker" | grep -qi "no permissions" || exit 1;
           done
       interval: 5s
-      timeout: 3s
-      retries: 5
-      start_period: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
   migrate:
     build:
@@ -125,9 +130,73 @@ services:
           "fetch('http://127.0.0.1:3000/health/ready').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))",
         ]
       interval: 5s
-      timeout: 3s
-      retries: 5
-      start_period: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    stop_grace_period: 10s
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ${WORKER_CONTAINER_NAME:-switchyard-worker}
+    restart: unless-stopped
+    command: ["node", "apps/gateway/dist/worker-main.js"]
+    environment:
+      NODE_ENV: development
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-switchyard}
+      POSTGRES_USER: ${GATEWAY_WORKER_USER:-gateway_worker}
+      POSTGRES_PASSWORD: ${GATEWAY_WORKER_PASSWORD:-switchyard_worker_password}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_USER: ${REDIS_WORKER_USER:-switchyard_worker}
+      REDIS_PASSWORD: ${REDIS_WORKER_PASSWORD:-switchyard_worker_password}
+      REDIS_MAXMEMORY_POLICY: noeviction
+    networks:
+      - switchyard-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "apps/gateway/dist/worker-main.js", "--health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    stop_grace_period: 10s
+
+  web:
+    build:
+      context: .
+      dockerfile: docker/web/Dockerfile
+    container_name: ${WEB_CONTAINER_NAME:-switchyard-web}
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      HOSTNAME: "0.0.0.0"
+    ports:
+      - "127.0.0.1:${WEB_PORT:-3001}:3001"
+    networks:
+      - switchyard-network
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3001/health/ready').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
     stop_grace_period: 10s
 
   mock-upstream:
@@ -152,9 +221,9 @@ services:
           "fetch('http://127.0.0.1:4000/health/ready').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))",
         ]
       interval: 5s
-      timeout: 3s
-      retries: 5
-      start_period: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
     stop_grace_period: 10s
 
 networks:
