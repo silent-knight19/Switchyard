@@ -64,6 +64,30 @@ async function expectSqlState(promise: Promise<unknown>, sqlState: string): Prom
   return error;
 }
 
+async function getBackendPid(client: pg.Client | pg.PoolClient): Promise<number> {
+  const { rows } = await client.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+  return rows[0]!.pid;
+}
+
+async function waitForBlockedClient(
+  inspector: pg.Client,
+  blockerPid: number,
+  timeoutMs = 5000,
+): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const { rows } = await inspector.query<{ pid: number }>(
+      'SELECT pid FROM pg_stat_activity WHERE $1::int = ANY(pg_blocking_pids(pid))',
+      [blockerPid],
+    );
+    if (rows.length > 0 && rows[0]?.pid) {
+      return rows[0].pid;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`Timeout waiting for connection blocked by PID ${blockerPid}`);
+}
+
 describe('SW-1.7-B: Provider Credential Vault Completion (Real PostgreSQL 16 Suite)', () => {
   let cluster: DisposableCluster;
   let db: DisposableDatabase;
@@ -91,6 +115,12 @@ describe('SW-1.7-B: Provider Credential Vault Completion (Real PostgreSQL 16 Sui
       },
     },
   );
+
+  function createDedicatedClient(): pg.Client {
+    return new pg.Client({
+      connectionString: roleConnectionString(db.url, 'gateway_app', passwords.gateway_app),
+    });
+  }
 
   async function bootstrapOrg(
     orgId: string,
@@ -456,6 +486,82 @@ describe('SW-1.7-B: Provider Credential Vault Completion (Real PostgreSQL 16 Sui
         await singleConnPool.end();
       }
     });
+
+    it('A11. accepts valid non-ASCII / emoji credential and decrypts byte-identically (PVAULT-02)', async () => {
+      const nonAsciiCanary = 'sk-synthetic-unicode-çéñø-123-🚀✨🔥🌟';
+      const created = await service.createKey(ORG_A, {
+        provider: 'openai',
+        label: 'Org A Unicode Key',
+        credential: nonAsciiCanary,
+      });
+
+      expect(created.id).toBeDefined();
+      expect(created.keyHint).toBe('****🚀✨🔥🌟');
+
+      const row = await loadProviderRow(ORG_A, created.id);
+      expect(row).not.toBeNull();
+
+      const orgEnvelope = await loadOrgEnvelope(ORG_A);
+      const decrypted = vaultV1.decryptProviderCredential({
+        orgId: ORG_A,
+        providerKeyId: created.id,
+        provider: row!.provider,
+        providerEnvelope: {
+          ciphertext: row!.ciphertext,
+          iv: row!.iv,
+          authTag: row!.auth_tag,
+        },
+        organizationEnvelope: orgEnvelope,
+      });
+
+      try {
+        expect(decrypted.toString('utf8')).toBe(nonAsciiCanary);
+      } finally {
+        decrypted.fill(0);
+      }
+    });
+
+    it('A12. rejects malformed Unicode credentials before database write, ensuring no row is created or replaced (PVAULT-02)', async () => {
+      const malformedCanary = 'sk-canary-\uD800-isolated-high';
+
+      // 1. Rejection on createKey: no row created
+      await expect(
+        service.createKey(ORG_A, {
+          provider: 'openai',
+          label: 'Malformed Attempt',
+          credential: malformedCanary,
+        }),
+      ).rejects.toMatchObject({
+        reason: 'INVALID_INPUT',
+        message: 'Invalid credential: malformed Unicode sequence',
+      });
+
+      // Verify no row exists with this label
+      const checkRes = await withTenant(appPool, ORG_A, async (client) => {
+        return client.query('SELECT count(*)::int AS count FROM provider_keys WHERE label = $1', [
+          'Malformed Attempt',
+        ]);
+      });
+      expect(checkRes.rows[0]?.count).toBe(0);
+
+      // 2. Rejection on replaceKey: existing row not modified
+      const beforeRow = await loadProviderRow(ORG_A, createdKeyAId);
+      await expect(
+        service.replaceKey(ORG_A, createdKeyAId, {
+          label: 'Attempted Malformed Replace',
+          credential: malformedCanary,
+        }),
+      ).rejects.toMatchObject({
+        reason: 'INVALID_INPUT',
+        message: 'Invalid credential: malformed Unicode sequence',
+      });
+
+      const afterRow = await loadProviderRow(ORG_A, createdKeyAId);
+      expect(Buffer.compare(afterRow!.ciphertext, beforeRow!.ciphertext)).toBe(0);
+      expect(Buffer.compare(afterRow!.iv, beforeRow!.iv)).toBe(0);
+      expect(Buffer.compare(afterRow!.auth_tag, beforeRow!.auth_tag)).toBe(0);
+      expect(afterRow!.label).toBe(beforeRow!.label);
+    });
   });
 
   describe('STAGE B — SW-1.7.4 Decrypt-Path Scrubbing, Privacy & Hardening', () => {
@@ -484,10 +590,12 @@ describe('SW-1.7-B: Provider Credential Vault Completion (Real PostgreSQL 16 Sui
       expect(workerOrgMeta.rows).toBeDefined();
     });
 
-    it('B2. verifies intermediate memory scrubbing on successful and failing vault unwrap/decrypt', async () => {
+    it('B2. verifies caller buffer zeroization and references vault regression suite for intermediate decipher scrubbing (PVAULT-04)', async () => {
       const orgEnvelope = await loadOrgEnvelope(ORG_A);
 
-      // Verify successful decrypt clears intermediate buffers and caller owns returned buffer
+      // Verify successful decrypt and caller ownership of returned buffer
+      // Note: Internal decipher chunk scrubbing during unwrap/decrypt is comprehensively
+      // proven with chunk capture spies in apps/gateway/src/vault/envelope.test.ts.
       const tempCred = Buffer.from('sk-canary-memory-scrub-verification-12345', 'utf8');
       const tempKeyId = crypto.randomUUID();
 
@@ -651,6 +759,397 @@ describe('SW-1.7-B: Provider Credential Vault Completion (Real PostgreSQL 16 Sui
       // Assert that canaryString is not present in ANY collected log line
       for (const logLine of capturedLogs) {
         expect(logLine).not.toContain(canaryString);
+      }
+    });
+  });
+
+  describe('STAGE C — Concurrency, Rollback & Transaction Serialization (PVAULT-03)', () => {
+    it('C1. executes two competing replacements and ensures deterministic serialization without mixed fields', async () => {
+      const canaryC1Init = 'sk-c1-init-111111';
+      const canaryC1Rep1 = 'sk-c1-rep1-111111';
+      const canaryC1Rep2 = 'sk-c1-rep2-222222';
+
+      const initialKey = await service.createKey(ORG_A, {
+        provider: 'openai',
+        label: 'C1 Initial',
+        credential: canaryC1Init,
+      });
+
+      const client1 = createDedicatedClient();
+      await client1.connect();
+
+      try {
+        const pid1 = await getBackendPid(client1);
+
+        // Client 1 begins transaction and locks row
+        await client1.query('BEGIN');
+        await client1.query("SELECT pg_catalog.set_config('app.current_org_id', $1, true)", [
+          ORG_A,
+        ]);
+        await client1.query('SELECT id FROM provider_keys WHERE id = $1 FOR UPDATE', [
+          initialKey.id,
+        ]);
+
+        // Client 2 replacement runs in background via service.replaceKey
+        const replace2Promise = service.replaceKey(ORG_A, initialKey.id, {
+          label: 'C1 Replacement 2 (Winner)',
+          credential: canaryC1Rep2,
+        });
+
+        // Deterministically wait until client 2 is actively blocked by client 1
+        await waitForBlockedClient(adminClient, pid1);
+
+        // While client 2 is blocked, client 1 executes replacement 1
+        const orgEnvelope = await loadOrgEnvelope(ORG_A);
+        const cred1Buf = Buffer.from(canaryC1Rep1, 'utf8');
+        let enc1;
+        try {
+          enc1 = vaultV1.encryptProviderCredential({
+            orgId: ORG_A,
+            providerKeyId: initialKey.id,
+            provider: 'openai',
+            plaintext: cred1Buf,
+            organizationEnvelope: orgEnvelope,
+          });
+        } finally {
+          cred1Buf.fill(0);
+        }
+
+        await client1.query(
+          `UPDATE provider_keys
+           SET label = $1, key_hint = $2, ciphertext = $3, iv = $4, auth_tag = $5
+           WHERE id = $6 AND org_id = $7`,
+          [
+            'C1 Replacement 1',
+            '****1111',
+            enc1.ciphertext,
+            enc1.iv,
+            enc1.authTag,
+            initialKey.id,
+            ORG_A,
+          ],
+        );
+        await client1.query('COMMIT');
+
+        // Client 2 unblocks, executes replacement 2, and resolves
+        const res2 = await replace2Promise;
+        expect(res2.id).toBe(initialKey.id);
+        expect(res2.label).toBe('C1 Replacement 2 (Winner)');
+        expect(res2.keyHint).toBe('****2222');
+
+        // Verify final record in database contains complete replacement 2 (no mixed fields)
+        const finalRow = await loadProviderRow(ORG_A, initialKey.id);
+        expect(finalRow).not.toBeNull();
+        expect(finalRow!.label).toBe('C1 Replacement 2 (Winner)');
+        expect(finalRow!.key_hint).toBe('****2222');
+
+        // Must decrypt cleanly to replacement 2 (proving IV, auth_tag, and ciphertext are uncorrupted)
+        const decrypted = vaultV1.decryptProviderCredential({
+          orgId: ORG_A,
+          providerKeyId: initialKey.id,
+          provider: 'openai',
+          providerEnvelope: {
+            ciphertext: finalRow!.ciphertext,
+            iv: finalRow!.iv,
+            authTag: finalRow!.auth_tag,
+          },
+          organizationEnvelope: orgEnvelope,
+        });
+
+        try {
+          expect(decrypted.toString('utf8')).toBe(canaryC1Rep2);
+        } finally {
+          decrypted.fill(0);
+        }
+      } finally {
+        await client1.end().catch(() => undefined);
+      }
+    });
+
+    it('C2. disable commits before replacement: replacement observes inactive state and fails with 409', async () => {
+      const canaryC2Init = 'sk-c2-init-333333';
+      const canaryC2Attempt = 'sk-c2-reactivation-attempt';
+
+      const initialKey = await service.createKey(ORG_A, {
+        provider: 'openai',
+        label: 'C2 Active Key',
+        credential: canaryC2Init,
+      });
+
+      const client1 = createDedicatedClient();
+      await client1.connect();
+
+      try {
+        const pid1 = await getBackendPid(client1);
+
+        // Client 1 begins transaction, locks row, and disables key (uncommitted)
+        await client1.query('BEGIN');
+        await client1.query("SELECT pg_catalog.set_config('app.current_org_id', $1, true)", [
+          ORG_A,
+        ]);
+        await client1.query('SELECT id, is_active FROM provider_keys WHERE id = $1 FOR UPDATE', [
+          initialKey.id,
+        ]);
+        await client1.query(
+          'UPDATE provider_keys SET is_active = false WHERE id = $1 AND org_id = $2',
+          [initialKey.id, ORG_A],
+        );
+
+        // Competing replacement starts in background
+        const replacePromise = service.replaceKey(ORG_A, initialKey.id, {
+          label: 'Attempted Re-activation',
+          credential: canaryC2Attempt,
+        });
+
+        // Deterministically verify replacement is blocked by client 1
+        await waitForBlockedClient(adminClient, pid1);
+
+        // Client 1 commits disable
+        await client1.query('COMMIT');
+
+        // Replacement unblocks, re-evaluates is_active, and fails closed with KEY_DISABLED (409)
+        await expect(replacePromise).rejects.toMatchObject({
+          reason: 'KEY_DISABLED',
+          message: 'Cannot replace credential of a disabled provider key',
+        });
+
+        // Verify final state: inactive, ciphertext untouched
+        const finalRow = await loadProviderRow(ORG_A, initialKey.id);
+        expect(finalRow!.is_active).toBe(false);
+        expect(finalRow!.label).toBe('C2 Active Key');
+      } finally {
+        await client1.end().catch(() => undefined);
+      }
+    });
+
+    it('C3. replacement commits before disable: replacement succeeds atomically and subsequent disable deactivates it', async () => {
+      const canaryC3Init = 'sk-c3-init-444444';
+      const canaryC3Rep = 'sk-c3-replaced-before-disable-555555';
+
+      const initialKey = await service.createKey(ORG_A, {
+        provider: 'openai',
+        label: 'C3 Active Key',
+        credential: canaryC3Init,
+      });
+
+      const client1 = createDedicatedClient();
+      await client1.connect();
+
+      try {
+        const pid1 = await getBackendPid(client1);
+
+        // Client 1 begins transaction, locks row, updates credential (uncommitted)
+        await client1.query('BEGIN');
+        await client1.query("SELECT pg_catalog.set_config('app.current_org_id', $1, true)", [
+          ORG_A,
+        ]);
+        await client1.query('SELECT id, is_active FROM provider_keys WHERE id = $1 FOR UPDATE', [
+          initialKey.id,
+        ]);
+
+        const orgEnvelope = await loadOrgEnvelope(ORG_A);
+        const credBuf = Buffer.from(canaryC3Rep, 'utf8');
+        let enc;
+        try {
+          enc = vaultV1.encryptProviderCredential({
+            orgId: ORG_A,
+            providerKeyId: initialKey.id,
+            provider: 'openai',
+            plaintext: credBuf,
+            organizationEnvelope: orgEnvelope,
+          });
+        } finally {
+          credBuf.fill(0);
+        }
+
+        await client1.query(
+          `UPDATE provider_keys
+           SET label = $1, key_hint = $2, ciphertext = $3, iv = $4, auth_tag = $5
+           WHERE id = $6 AND org_id = $7`,
+          ['C3 Updated', '****5555', enc.ciphertext, enc.iv, enc.authTag, initialKey.id, ORG_A],
+        );
+
+        // Competing disable starts in background
+        const disablePromise = service.disableKey(ORG_A, initialKey.id);
+
+        // Deterministically verify disable is blocked by client 1
+        await waitForBlockedClient(adminClient, pid1);
+
+        // Client 1 commits replacement
+        await client1.query('COMMIT');
+
+        // Disable unblocks, locks row, sets is_active = false, and commits
+        await disablePromise;
+
+        // Final state: inactive, but retains the replaced credential
+        const finalRow = await loadProviderRow(ORG_A, initialKey.id);
+        expect(finalRow!.is_active).toBe(false);
+        expect(finalRow!.label).toBe('C3 Updated');
+        expect(finalRow!.key_hint).toBe('****5555');
+
+        const decrypted = vaultV1.decryptProviderCredential({
+          orgId: ORG_A,
+          providerKeyId: initialKey.id,
+          provider: 'openai',
+          providerEnvelope: {
+            ciphertext: finalRow!.ciphertext,
+            iv: finalRow!.iv,
+            authTag: finalRow!.auth_tag,
+          },
+          organizationEnvelope: orgEnvelope,
+        });
+
+        try {
+          expect(decrypted.toString('utf8')).toBe('sk-c3-replaced-before-disable-555555');
+        } finally {
+          decrypted.fill(0);
+        }
+      } finally {
+        await client1.end().catch(() => undefined);
+      }
+    });
+
+    it('C4. failed replacement rollback: aborted transaction leaves previous ciphertext, IV, tag, and decryptability intact', async () => {
+      const canaryC4Orig = 'sk-c4-orig-666666';
+
+      const initialKey = await service.createKey(ORG_A, {
+        provider: 'openai',
+        label: 'C4 Original Key',
+        credential: canaryC4Orig,
+      });
+
+      const beforeRow = await loadProviderRow(ORG_A, initialKey.id);
+      expect(beforeRow).not.toBeNull();
+
+      const client1 = createDedicatedClient();
+      await client1.connect();
+
+      try {
+        await client1.query('BEGIN');
+        await client1.query("SELECT pg_catalog.set_config('app.current_org_id', $1, true)", [
+          ORG_A,
+        ]);
+        await client1.query('SELECT id FROM provider_keys WHERE id = $1 FOR UPDATE', [
+          initialKey.id,
+        ]);
+
+        // Write dirty replacement data
+        await client1.query(
+          `UPDATE provider_keys
+           SET label = 'Aborted Label', ciphertext = $1, iv = $2, auth_tag = $3
+           WHERE id = $4 AND org_id = $5`,
+          [
+            Buffer.from('corrupted-ciphertext', 'utf8'),
+            Buffer.alloc(12, 0xff),
+            Buffer.alloc(16, 0xee),
+            initialKey.id,
+            ORG_A,
+          ],
+        );
+
+        // Simulate failure and explicit rollback
+        await client1.query('ROLLBACK');
+
+        // Verify that database completely restored previous committed state
+        const afterRow = await loadProviderRow(ORG_A, initialKey.id);
+        expect(afterRow).not.toBeNull();
+        expect(afterRow!.label).toBe(beforeRow!.label);
+        expect(afterRow!.key_hint).toBe(beforeRow!.key_hint);
+        expect(Buffer.compare(afterRow!.ciphertext, beforeRow!.ciphertext)).toBe(0);
+        expect(Buffer.compare(afterRow!.iv, beforeRow!.iv)).toBe(0);
+        expect(Buffer.compare(afterRow!.auth_tag, beforeRow!.auth_tag)).toBe(0);
+
+        // Decryptability remains intact
+        const orgEnvelope = await loadOrgEnvelope(ORG_A);
+        const decrypted = vaultV1.decryptProviderCredential({
+          orgId: ORG_A,
+          providerKeyId: initialKey.id,
+          provider: 'openai',
+          providerEnvelope: {
+            ciphertext: afterRow!.ciphertext,
+            iv: afterRow!.iv,
+            authTag: afterRow!.auth_tag,
+          },
+          organizationEnvelope: orgEnvelope,
+        });
+
+        try {
+          expect(decrypted.toString('utf8')).toBe(canaryC4Orig);
+        } finally {
+          decrypted.fill(0);
+        }
+      } finally {
+        await client1.end().catch(() => undefined);
+      }
+    });
+
+    it('C5. cross-tenant mutation: Org B cannot exploit concurrent mutation timing to replace or disable Org A credential', async () => {
+      const canaryC5OrgA = 'sk-c5-orga-777777';
+      const canaryC5OrgB = 'sk-c5-orgb-takeover';
+
+      const keyA = await service.createKey(ORG_A, {
+        provider: 'openai',
+        label: 'Org A In-Flight Key',
+        credential: canaryC5OrgA,
+      });
+
+      const clientA = createDedicatedClient();
+      await clientA.connect();
+
+      try {
+        // Org A transaction acquires exclusive row lock
+        await clientA.query('BEGIN');
+        await clientA.query("SELECT pg_catalog.set_config('app.current_org_id', $1, true)", [
+          ORG_A,
+        ]);
+        await clientA.query('SELECT id FROM provider_keys WHERE id = $1 FOR UPDATE', [keyA.id]);
+
+        // Org B attempts concurrent replacement on Org A's key
+        // FORCE RLS ensures Org B's query immediately sees zero rows (does not even block on Org A's lock)
+        await expect(
+          service.replaceKey(ORG_B, keyA.id, {
+            label: 'Malicious Org B Takeover',
+            credential: canaryC5OrgB,
+          }),
+        ).rejects.toMatchObject({
+          reason: 'KEY_NOT_FOUND',
+          message: 'Provider key not found',
+        });
+
+        // Org B attempts concurrent disable on Org A's key
+        await expect(service.disableKey(ORG_B, keyA.id)).rejects.toMatchObject({
+          reason: 'KEY_NOT_FOUND',
+          message: 'Provider key not found',
+        });
+
+        // Org A commits its transaction
+        await clientA.query('COMMIT');
+
+        // Org A's key remains completely intact and active
+        const rowA = await loadProviderRow(ORG_A, keyA.id);
+        expect(rowA!.is_active).toBe(true);
+        expect(rowA!.label).toBe('Org A In-Flight Key');
+
+        const orgEnvelope = await loadOrgEnvelope(ORG_A);
+        const decrypted = vaultV1.decryptProviderCredential({
+          orgId: ORG_A,
+          providerKeyId: keyA.id,
+          provider: 'openai',
+          providerEnvelope: {
+            ciphertext: rowA!.ciphertext,
+            iv: rowA!.iv,
+            authTag: rowA!.auth_tag,
+          },
+          organizationEnvelope: orgEnvelope,
+        });
+
+        try {
+          expect(decrypted.toString('utf8')).toBe(canaryC5OrgA);
+        } finally {
+          decrypted.fill(0);
+        }
+      } finally {
+        await clientA.end().catch(() => undefined);
       }
     });
   });

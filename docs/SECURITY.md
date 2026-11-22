@@ -565,12 +565,13 @@ DELETE /api/provider-keys/:id    # Disable credential (soft delete)
 - Mutating operations (`POST`, `PUT`, `DELETE`) strictly enforce canonical `Origin` matching `BROWSER_ORIGIN` and constant-time verification of session-bound synchronizer tokens in `x-csrf-token`.
 - Requests with mismatched, missing, or forged CSRF tokens or untrusted origins are terminated before handler execution with HTTP 403.
 
-#### 16.1.3 Strict Request Validation & Credential Safety
+#### 16.1.3 Strict Request Validation, Unicode Well-Formedness & Diagnostic Safety
 - Request bodies require strict JSON object formatting. Unexpected properties, duplicate headers, or query parameters on `POST`, `PUT`, and `DELETE` trigger immediate HTTP 400 (`Bad Request`) validation failures.
-- **Supported Providers:** Restricted strictly to `openai`. Unrecognized providers are rejected with HTTP 400.
+- **Supported Providers:** Restricted strictly to `openai`. Unrecognized providers are rejected with a static HTTP 400 message (`Unsupported provider: only "openai" is currently supported`). Untrusted provider values are never reflected in error messages.
+- **Key ID Validation:** Canonical UUID validation (`validateKeyId`) rejects malformed UUIDs with a static HTTP 400 message (`Invalid key ID: malformed UUID`) without reflecting untrusted input.
 - **Label Validation:** 1 to 255 UTF-8 bytes; non-empty, non-whitespace, with prohibited control characters rejected.
-- **Credential Limits:** 1 to 4096 UTF-8 bytes. Never trimmed or normalized.
-- **Error Secrecy:** Malformed, invalid, or oversized credentials are never echoed in HTTP error responses or logs.
+- **Unicode Well-Formedness & Credential Limits:** 1 to 4096 UTF-8 bytes. Validated via `isWellFormedUnicode()` to ensure only well-formed Unicode scalar sequences are accepted before conversion to a Buffer; isolated high surrogates, isolated low surrogates, and malformed surrogate ordering are rejected fail-closed with HTTP 400 (`Invalid credential: malformed Unicode sequence`). Exact credential content is preserved without trimming or normalization.
+- **Error Secrecy:** Malformed, invalid, or oversized credentials and untrusted input values are never echoed in HTTP error responses or logs.
 
 #### 16.1.4 Safe Key Hint Derivation (§11.5)
 - For credentials exceeding 4 characters, the service derives a hint consisting of fixed prefix `****` followed by at most the last 4 sanitized display characters (e.g. `****3456`). Control characters within the last 4 characters are stripped.
@@ -579,16 +580,22 @@ DELETE /api/provider-keys/:id    # Disable credential (soft delete)
 
 #### 16.1.5 Bounded Keyset Pagination & Safe Metadata
 - `GET /api/provider-keys` queries keys inside `withTenant(pool, orgId)` ordered by `created_at DESC, id DESC`.
-- keyste pagination uses opaque canonical base64url cursors `{ createdAt, id }` with microsecond UTC precision (`YYYY-MM-DDTHH:mm:ss.ffffffZ`).
+- Keyset pagination uses opaque canonical base64url cursors `{ createdAt, id }` with microsecond UTC precision (`YYYY-MM-DDTHH:mm:ss.ffffffZ`).
 - Limit is bounded between 1 and 100 (default 20).
 - **Zero Decryption & Zero Secret Selection:** The SQL query selects non-secret columns only (`id`, `provider`, `label`, `key_hint`, `is_active`, `created_at`). `ciphertext`, `iv`, `auth_tag`, `wrapped_dek`, `dek_iv`, `dek_auth_tag`, and `kek_version` are never selected or exposed.
 - All management responses set `Cache-Control: no-store` and `Pragma: no-cache`.
 
-#### 16.1.6 Atomic Replacement & Row-Locking Concurrency
+#### 16.1.6 Atomic Replacement, Concurrency & Rollback Guarantees
 - `PUT /api/provider-keys/:id` acquires a row lock (`SELECT ... FOR UPDATE`) inside the tenant transaction.
 - Attempting to replace a disabled credential (`is_active = false`) fails closed with HTTP 409 (`Conflict`).
 - Organization ownership and provider identity cannot be modified.
 - Generates a fresh random 12-byte IV and fresh 16-byte authentication tag through `EnvelopeVault.encryptProviderCredential`, updates the row atomically, and returns safe metadata only.
+- **Deterministic Concurrency Serialization (Real PostgreSQL 16 Suite):**
+  - **C1 (Replace vs Replace):** Two competing replacements serialize deterministically under row locking without mixed fields; the winning replacement commits atomically and decrypts byte-identically.
+  - **C2 (Disable before Replace):** When a disable transaction holds the row lock, a competing replacement blocks until disable commits, re-evaluates `is_active = false`, and rejects with HTTP 409 Conflict without reactivating the credential.
+  - **C3 (Replace before Disable):** When a replacement transaction holds the row lock, a competing disable blocks until replacement commits, then proceeds to deactivate the updated record.
+  - **C4 (Failed Replacement Rollback):** An aborted/rolled-back replacement transaction leaves the previous ciphertext, IV, authentication tag, label, hint, and decryptability completely intact.
+  - **C5 (Cross-Tenant Concurrency Resistance):** Tenant B cannot exploit concurrent mutation timing to replace or disable Tenant A's credential; PostgreSQL FORCE RLS isolates tenant rows unconditionally.
 
 #### 16.1.7 Logical Disabling & Idempotency
 - `DELETE /api/provider-keys/:id` acquires a row lock and sets `is_active = false`.
@@ -596,20 +603,23 @@ DELETE /api/provider-keys/:id    # Disable credential (soft delete)
 - Repeated disable requests succeed idempotently with HTTP 204 (`No Content`).
 - Cross-tenant and nonexistent IDs return HTTP 404 with zero modified rows.
 
-#### 16.1.8 Startup & KEK Configuration Gating
-- Provider-key routes are registered at startup.
-- In environments where KEKs are not configured, non-vault operations (health, virtual keys, gateway proxy) remain functional. Credential management routes pass authentication and return controlled HTTP 503 (`Service Unavailable`: "Provider credential vault is unavailable").
+#### 16.1.8 Startup & Consistent KEK Configuration Gating (PVAULT-01)
+- Provider-key routes are registered at startup. Non-vault Gateway operations (health checks, virtual keys, gateway proxy) start and run cleanly when all KEK environment variables are absent.
+- When the vault is uninitialized or unavailable, all four provider-credential management operations (`POST`, `PUT`, `GET`, `DELETE`) fail safely and consistently with HTTP 503 (`Service Unavailable`: "Provider credential vault is unavailable").
+- Authentication, RBAC, and CSRF gates are evaluated prior to route handler execution: anonymous callers receive HTTP 401 (`Unauthorized`) and member-role callers receive HTTP 403 (`Forbidden`), preventing configuration disclosure to unauthenticated or unauthorized callers.
+- Invalid KEK configuration continues to fail closed during central Zod configuration parsing at startup.
 
 ### 16.2 Decrypt-Path Scrubbing & Privacy Verification (SW-1.7.4)
 
 #### 16.2.1 Memory Scrubbing & Buffer Hygiene
-- In `ProviderKeyManagementService`, caller credentials are converted into temporary Node.js `Buffer` instances and wiped in a `finally` block via `.fill(0)` on both successful creation/replacement and all exception paths.
-- In `EnvelopeVault`, intermediate AES-GCM decipher chunks and unwrap buffers are zeroized in `finally` blocks upon both successful completion and authentication failures.
+- In `ProviderKeyManagementService`, caller credentials are converted into temporary Node.js `Buffer` instances and wiped in a `finally` block via `.fill(0)` on both successful creation/replacement and all exception paths. Unit test instrumentation tracking allocated Buffer instances independently verifies that every allocated temporary buffer is zeroized (`every(byte === 0)`).
+- In `EnvelopeVault`, intermediate AES-GCM decipher chunks and unwrap buffers are zeroized in `finally` blocks upon both successful completion and authentication failures (comprehensively verified with chunk capture spies in `apps/gateway/src/vault/envelope.test.ts`).
 - The returned plaintext Buffer from internal gateway decryption is caller-owned and must be zeroized by the caller immediately after authorized upstream dispatch.
 - **Node.js Runtime Limitation Disclosure:** While mutable Buffers are zeroized, immutable V8 JavaScript strings (instantiated during JSON body parsing) cannot be deterministically cleared by application code and persist until garbage collected. This architectural boundary is mitigated by bounded body limits, absence of request-body logging, and non-root process sandboxing.
 
-#### 16.2.2 Log Privacy & Canary Probes
-- Synthetic canary credentials (`CANARY_SECRET_*`) probed across structured Pino logs, Fastify error serialization, and PostgreSQL error handlers prove zero credential leakage across successful operations and controlled error conditions (validation errors, 400, 403, 404, 409, 503).
+#### 16.2.2 Real Request / Log Privacy & Canary Probes
+- Focused privacy tests using actual registered provider management Fastify routes, real authorization boundaries, credential-bearing HTTP requests, and captured structured Pino logger output prove zero credential leakage across successful operations and controlled error conditions (validation errors, 400, 403, 404, 409, 503).
+- Synthetic canary credentials (`CANARY_SECRET_*`) are verified to be completely absent from captured application log lines, serialized HTTP responses, and safe error objects.
 - Pino redaction covers `credential`, `credentials`, `providerkey`, `key`, `password`, `token`, `secret`, `kek`, `dek`.
 
 #### 16.2.3 Worker Role Isolation Proven

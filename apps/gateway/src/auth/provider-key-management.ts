@@ -83,19 +83,35 @@ export function isValidUuid(id: unknown): id is string {
 
 export function validateKeyId(keyId: unknown): string {
   if (typeof keyId !== 'string') {
-    throw new ProviderKeyManagementError(
-      'INVALID_INPUT',
-      `Invalid key ID: expected string, got ${keyId === null ? 'null' : typeof keyId}`,
-    );
+    throw new ProviderKeyManagementError('INVALID_INPUT', 'Invalid key ID: expected string');
   }
   const trimmed = keyId.trim();
   if (trimmed.length === 0 || !UUID_REGEX.test(trimmed)) {
-    throw new ProviderKeyManagementError(
-      'INVALID_INPUT',
-      `Invalid key ID: malformed UUID "${keyId}"`,
-    );
+    throw new ProviderKeyManagementError('INVALID_INPUT', 'Invalid key ID: malformed UUID');
   }
   return trimmed.toLowerCase();
+}
+
+/**
+ * Validates that a string contains only well-formed Unicode scalar sequences.
+ * Rejects isolated high surrogates, isolated low surrogates, and malformed surrogate ordering.
+ */
+export function isWellFormedUnicode(str: string): boolean {
+  if (typeof (str as unknown as { isWellFormed?: () => boolean }).isWellFormed === 'function') {
+    return (str as unknown as { isWellFormed: () => boolean }).isWellFormed();
+  }
+  for (let i = 0; i < str.length; i++) {
+    const code = str.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      if (i + 1 >= str.length) return false;
+      const next = str.charCodeAt(i + 1);
+      if (next < 0xdc00 || next > 0xdfff) return false;
+      i++;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /**
@@ -144,7 +160,7 @@ export function validateProvider(rawProvider: unknown): SupportedProvider {
   if (!SUPPORTED_PROVIDERS.includes(trimmed as SupportedProvider)) {
     throw new ProviderKeyManagementError(
       'INVALID_INPUT',
-      `Unsupported provider "${trimmed}": only "openai" is currently supported`,
+      'Unsupported provider: only "openai" is currently supported',
     );
   }
   return trimmed as SupportedProvider;
@@ -266,6 +282,16 @@ export class ProviderKeyManagementService {
     return this.vault !== undefined;
   }
 
+  private assertVaultAvailable(): EnvelopeVault {
+    if (!this.vault) {
+      throw new ProviderKeyManagementError(
+        'VAULT_UNAVAILABLE',
+        'Provider credential vault is unavailable',
+      );
+    }
+    return this.vault;
+  }
+
   /**
    * Creates an encrypted provider credential for the organization.
    * Credential plaintext buffer is zeroized in a finally block.
@@ -287,6 +313,13 @@ export class ProviderKeyManagementService {
       throw new ProviderKeyManagementError('INVALID_INPUT', 'Invalid credential: expected string');
     }
 
+    if (!isWellFormedUnicode(input.credential)) {
+      throw new ProviderKeyManagementError(
+        'INVALID_INPUT',
+        'Invalid credential: malformed Unicode sequence',
+      );
+    }
+
     const credBuffer = Buffer.from(input.credential, 'utf8');
     try {
       if (credBuffer.length === 0) {
@@ -303,12 +336,7 @@ export class ProviderKeyManagementService {
         );
       }
 
-      if (!this.vault) {
-        throw new ProviderKeyManagementError(
-          'VAULT_UNAVAILABLE',
-          'Provider credential vault is unavailable',
-        );
-      }
+      const vault = this.assertVaultAvailable();
 
       const keyHint = deriveKeyHint(input.credential);
       const providerKeyId = crypto.randomUUID();
@@ -342,7 +370,7 @@ export class ProviderKeyManagementService {
         // 2. Encrypt provider credential under organization DEK
         let encrypted;
         try {
-          encrypted = this.vault!.encryptProviderCredential({
+          encrypted = vault.encryptProviderCredential({
             orgId: validatedOrgId,
             providerKeyId,
             provider,
@@ -451,6 +479,13 @@ export class ProviderKeyManagementService {
       throw new ProviderKeyManagementError('INVALID_INPUT', 'Invalid credential: expected string');
     }
 
+    if (!isWellFormedUnicode(input.credential)) {
+      throw new ProviderKeyManagementError(
+        'INVALID_INPUT',
+        'Invalid credential: malformed Unicode sequence',
+      );
+    }
+
     const credBuffer = Buffer.from(input.credential, 'utf8');
     try {
       if (credBuffer.length === 0) {
@@ -467,12 +502,7 @@ export class ProviderKeyManagementService {
         );
       }
 
-      if (!this.vault) {
-        throw new ProviderKeyManagementError(
-          'VAULT_UNAVAILABLE',
-          'Provider credential vault is unavailable',
-        );
-      }
+      const vault = this.assertVaultAvailable();
 
       const keyHint = deriveKeyHint(input.credential);
 
@@ -530,7 +560,7 @@ export class ProviderKeyManagementService {
         // 3. Encrypt replacement credential with fresh IV
         let encrypted;
         try {
-          encrypted = this.vault!.encryptProviderCredential({
+          encrypted = vault.encryptProviderCredential({
             orgId: validatedOrgId,
             providerKeyId: validatedKeyId,
             provider: existing.provider,
@@ -641,6 +671,8 @@ export class ProviderKeyManagementService {
       decodedCursor = decodeCursor(options.cursor);
     }
 
+    this.assertVaultAvailable();
+
     return withTenant(this.pool, validatedOrgId, async (client) => {
       let queryText: string;
       let queryParams: unknown[];
@@ -721,6 +753,8 @@ export class ProviderKeyManagementService {
   async disableKey(orgId: string, keyId: string): Promise<void> {
     const validatedOrgId = validateTenantId(orgId);
     const validatedKeyId = validateKeyId(keyId);
+
+    this.assertVaultAvailable();
 
     await withTenant(this.pool, validatedOrgId, async (client) => {
       const res = await client.query<{ id: string; is_active: boolean }>(

@@ -1,5 +1,6 @@
 import fastify from 'fastify';
 import type pg from 'pg';
+import pino from 'pino';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { registerProviderKeyRoutes } from './provider-keys.js';
 import {
@@ -272,7 +273,10 @@ describe('ProviderKeyRoutes — HTTP Contract, Validation, RBAC & Headers', () =
 
     it('rejects unsupported provider with 400 Bad Request when service rejects it', async () => {
       (mockService.createKey as ReturnType<typeof vi.fn>).mockRejectedValue(
-        new ProviderKeyManagementError('INVALID_INPUT', 'Unsupported provider "anthropic"'),
+        new ProviderKeyManagementError(
+          'INVALID_INPUT',
+          'Unsupported provider: only "openai" is currently supported',
+        ),
       );
 
       const res = await app.inject({
@@ -286,7 +290,35 @@ describe('ProviderKeyRoutes — HTTP Contract, Validation, RBAC & Headers', () =
         },
       });
       expect(res.statusCode).toBe(400);
-      expect(JSON.parse(res.body).message).toContain('Unsupported provider');
+      expect(JSON.parse(res.body).message).toBe(
+        'Unsupported provider: only "openai" is currently supported',
+      );
+    });
+
+    it('rejects unsupported provider without echoing untrusted provider value (PVAULT-05)', async () => {
+      (mockService.createKey as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new ProviderKeyManagementError(
+          'INVALID_INPUT',
+          'Unsupported provider: only "openai" is currently supported',
+        ),
+      );
+
+      const canaryProvider = 'sk-synthetic-secret-provider-attempt-12345';
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/provider-keys',
+        headers: authHeaders,
+        payload: {
+          provider: canaryProvider,
+          label: 'Test Secret Provider',
+          credential: 'synthetic-credential',
+        },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).message).toBe(
+        'Unsupported provider: only "openai" is currently supported',
+      );
+      expect(res.body).not.toContain(canaryProvider);
     });
 
     it('never echoes raw credential in validation error responses', async () => {
@@ -540,6 +572,332 @@ describe('ProviderKeyRoutes — HTTP Contract, Validation, RBAC & Headers', () =
         headers: authHeaders,
       });
       expect(res.statusCode).toBe(404);
+    });
+  });
+
+  describe('Consistent KEK Gating Across All Operations (PVAULT-01)', () => {
+    it('returns 503 on POST when vault is unavailable', async () => {
+      (mockService.createKey as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new ProviderKeyManagementError(
+          'VAULT_UNAVAILABLE',
+          'Provider credential vault is unavailable',
+        ),
+      );
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/provider-keys',
+        headers: authHeaders,
+        payload: {
+          provider: 'openai',
+          label: 'Test Key',
+          credential: 'sk-test-valid-credential-123',
+        },
+      });
+      expect(res.statusCode).toBe(503);
+      expect(JSON.parse(res.body).message).toBe('Provider credential vault is unavailable');
+    });
+
+    it('returns 503 on PUT when vault is unavailable', async () => {
+      (mockService.replaceKey as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new ProviderKeyManagementError(
+          'VAULT_UNAVAILABLE',
+          'Provider credential vault is unavailable',
+        ),
+      );
+      const res = await app.inject({
+        method: 'PUT',
+        url: `/api/provider-keys/${KEY_A_ID}`,
+        headers: authHeaders,
+        payload: {
+          label: 'Test Replacement',
+          credential: 'sk-test-valid-credential-123',
+        },
+      });
+      expect(res.statusCode).toBe(503);
+      expect(JSON.parse(res.body).message).toBe('Provider credential vault is unavailable');
+    });
+
+    it('returns 503 on GET when vault is unavailable', async () => {
+      (mockService.listKeys as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new ProviderKeyManagementError(
+          'VAULT_UNAVAILABLE',
+          'Provider credential vault is unavailable',
+        ),
+      );
+      const res = await app.inject({
+        method: 'GET',
+        url: '/api/provider-keys',
+        headers: authHeaders,
+      });
+      expect(res.statusCode).toBe(503);
+      expect(JSON.parse(res.body).message).toBe('Provider credential vault is unavailable');
+    });
+
+    it('returns 503 on DELETE when vault is unavailable', async () => {
+      (mockService.disableKey as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new ProviderKeyManagementError(
+          'VAULT_UNAVAILABLE',
+          'Provider credential vault is unavailable',
+        ),
+      );
+      const res = await app.inject({
+        method: 'DELETE',
+        url: `/api/provider-keys/${KEY_A_ID}`,
+        headers: authHeaders,
+      });
+      expect(res.statusCode).toBe(503);
+      expect(JSON.parse(res.body).message).toBe('Provider credential vault is unavailable');
+    });
+
+    it('denies anonymous callers with 401 rather than disclosing vault configuration status', async () => {
+      (mockService.listKeys as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new ProviderKeyManagementError(
+          'VAULT_UNAVAILABLE',
+          'Provider credential vault is unavailable',
+        ),
+      );
+      const res = await app.inject({
+        method: 'GET',
+        url: '/api/provider-keys',
+      });
+      expect(res.statusCode).toBe(401);
+      expect(JSON.parse(res.body).error).toBe('Unauthorized');
+      expect(res.body).not.toContain('vault');
+    });
+
+    it('denies member role callers with 403 rather than disclosing vault configuration status', async () => {
+      sessionValidation = {
+        valid: true,
+        user: {
+          id: USER_A_MEMBER_ID,
+          orgId: ORG_A_ID,
+          emailNormalized: 'member@alpha.com',
+          role: 'member',
+        },
+        session: {
+          ...sessionValidation.session!,
+          userId: USER_A_MEMBER_ID,
+        },
+      };
+
+      (mockService.listKeys as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new ProviderKeyManagementError(
+          'VAULT_UNAVAILABLE',
+          'Provider credential vault is unavailable',
+        ),
+      );
+      const res = await app.inject({
+        method: 'GET',
+        url: '/api/provider-keys',
+        headers: authHeaders,
+      });
+      expect(res.statusCode).toBe(403);
+      expect(JSON.parse(res.body).error).toBe('Forbidden');
+      expect(res.body).not.toContain('vault');
+    });
+  });
+
+  describe('Untrusted Value Reflection Prevention (PVAULT-05)', () => {
+    it('does not echo untrusted path parameter in error response', async () => {
+      const canaryId = 'canary-secret-token-malformed-id-12345';
+      const res = await app.inject({
+        method: 'DELETE',
+        url: `/api/provider-keys/${canaryId}`,
+        headers: authHeaders,
+      });
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).message).toBe('Invalid key ID: malformed UUID');
+      expect(res.body).not.toContain(canaryId);
+    });
+  });
+
+  describe('Real Request / Log Canary Privacy Probe (PVAULT-04 Part C)', () => {
+    it('proves synthetic canary credentials never appear in application logs or HTTP responses across success and failure', async () => {
+      const capturedLogLines: string[] = [];
+      const testLogger = pino(
+        {
+          level: 'trace',
+          redact: {
+            paths: ['credential', 'credentials', 'password', 'token', 'secret', '*.credential'],
+            censor: '[REDACTED]',
+          },
+        },
+        {
+          write: (chunk: string) => {
+            capturedLogLines.push(chunk);
+          },
+        },
+      );
+
+      const probeApp = fastify({ loggerInstance: testLogger });
+      installAuthorizationBoundary(probeApp, {
+        sessionService: mockSessionService as SessionService,
+        trustedOrigin: TRUSTED_ORIGIN,
+      });
+
+      const probeMockService = {
+        createKey: vi.fn(),
+        replaceKey: vi.fn(),
+        listKeys: vi.fn(),
+        disableKey: vi.fn(),
+      } as unknown as ProviderKeyManagementService;
+
+      await registerProviderKeyRoutes(probeApp, {
+        pool: {} as pg.Pool,
+        service: probeMockService,
+      });
+
+      const canarySuccess = 'sk-synthetic-live-http-canary-success-998877';
+      const canaryFailure = 'sk-synthetic-live-http-canary-failure-112233';
+
+      (probeMockService.createKey as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: KEY_A_ID,
+        provider: 'openai',
+        label: 'Canary Probe Key',
+        keyHint: '****8877',
+        isActive: true,
+        createdAt: '2026-11-22T10:00:00.000000Z',
+      });
+
+      // 1. Controlled successful operation
+      const successRes = await probeApp.inject({
+        method: 'POST',
+        url: '/api/provider-keys',
+        headers: authHeaders,
+        payload: {
+          provider: 'openai',
+          label: 'Canary Probe Key',
+          credential: canarySuccess,
+        },
+      });
+
+      expect(successRes.statusCode).toBe(201);
+      expect(successRes.body).not.toContain(canarySuccess);
+
+      // 2. Controlled failure operation (service failure)
+      (probeMockService.createKey as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new ProviderKeyManagementError('DATABASE_ERROR', 'Simulated database failure'),
+      );
+
+      const failureRes = await probeApp.inject({
+        method: 'POST',
+        url: '/api/provider-keys',
+        headers: authHeaders,
+        payload: {
+          provider: 'openai',
+          label: 'Failing Canary Key',
+          credential: canaryFailure,
+        },
+      });
+
+      expect(failureRes.statusCode).toBe(503);
+      expect(failureRes.body).not.toContain(canaryFailure);
+
+      // 3. Verify neither canary appears anywhere in captured application logs
+      for (const logLine of capturedLogLines) {
+        expect(logLine).not.toContain(canarySuccess);
+        expect(logLine).not.toContain(canaryFailure);
+      }
+    });
+  });
+
+  describe('Safe Error Response Coverage (PVAULT-04 Part D)', () => {
+    it('covers safe 400 Invalid Input responses with Cache-Control: no-store', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/provider-keys',
+        headers: authHeaders,
+        payload: { invalid: 'payload' },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.headers['cache-control']).toBe('no-store');
+      const body = JSON.parse(res.body);
+      expect(body.statusCode).toBe(400);
+      expect(body.error).toBe('Bad Request');
+    });
+
+    it('covers safe 403 Forbidden responses with Cache-Control: no-store', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/provider-keys',
+        headers: {
+          ...authHeaders,
+          origin: 'https://malicious.origin.test',
+        },
+        payload: {
+          provider: 'openai',
+          label: 'Test',
+          credential: 'sk-test-valid',
+        },
+      });
+      expect(res.statusCode).toBe(403);
+      const body = JSON.parse(res.body);
+      expect(body.statusCode).toBe(403);
+      expect(body.error).toBe('Forbidden');
+    });
+
+    it('covers safe 404 Not Found responses with Cache-Control: no-store', async () => {
+      (mockService.replaceKey as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new ProviderKeyManagementError('KEY_NOT_FOUND', 'Provider key not found'),
+      );
+      const res = await app.inject({
+        method: 'PUT',
+        url: `/api/provider-keys/${KEY_A_ID}`,
+        headers: authHeaders,
+        payload: {
+          label: 'Updated',
+          credential: 'sk-test-valid',
+        },
+      });
+      expect(res.statusCode).toBe(404);
+      expect(res.headers['cache-control']).toBe('no-store');
+      const body = JSON.parse(res.body);
+      expect(body.statusCode).toBe(404);
+      expect(body.error).toBe('Not Found');
+      expect(body.message).toBe('Provider key not found');
+    });
+
+    it('covers safe 409 Conflict responses with Cache-Control: no-store', async () => {
+      (mockService.replaceKey as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new ProviderKeyManagementError(
+          'KEY_DISABLED',
+          'Cannot replace credential of a disabled provider key',
+        ),
+      );
+      const res = await app.inject({
+        method: 'PUT',
+        url: `/api/provider-keys/${KEY_A_ID}`,
+        headers: authHeaders,
+        payload: {
+          label: 'Updated',
+          credential: 'sk-test-valid',
+        },
+      });
+      expect(res.statusCode).toBe(409);
+      expect(res.headers['cache-control']).toBe('no-store');
+      const body = JSON.parse(res.body);
+      expect(body.statusCode).toBe(409);
+      expect(body.error).toBe('Conflict');
+    });
+
+    it('covers safe 503 Service Unavailable responses with Cache-Control: no-store', async () => {
+      (mockService.listKeys as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new ProviderKeyManagementError(
+          'VAULT_UNAVAILABLE',
+          'Provider credential vault is unavailable',
+        ),
+      );
+      const res = await app.inject({
+        method: 'GET',
+        url: '/api/provider-keys',
+        headers: authHeaders,
+      });
+      expect(res.statusCode).toBe(503);
+      expect(res.headers['cache-control']).toBe('no-store');
+      const body = JSON.parse(res.body);
+      expect(body.statusCode).toBe(503);
+      expect(body.error).toBe('Service Unavailable');
+      expect(body.message).toBe('Provider credential vault is unavailable');
     });
   });
 });
