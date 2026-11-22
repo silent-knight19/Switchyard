@@ -30,7 +30,8 @@ export type SeedDevErrorCode =
   | 'UNSUPPORTED_DATABASE_IDENTITY'
   | 'INVALID_DATABASE_PORT'
   | 'INVALID_DATABASE_NAME'
-  | 'MISSING_DATABASE_CREDENTIAL';
+  | 'MISSING_DATABASE_CREDENTIAL'
+  | 'EXISTING_ENVELOPE_INVALID';
 
 export class SeedDevError extends Error {
   public readonly code: SeedDevErrorCode;
