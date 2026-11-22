@@ -733,7 +733,7 @@ This section defines the security boundary for the explicit `pnpm seed:dev` CLI 
 | Password leak through argv, shell history, or process listings | Command-line arguments are rejected outright. The password is never accepted as an environment variable, flag, or positional argument. |
 | Secret leakage in stdout/stderr or error objects | Output contains only the status, organization UUID, and allowlisted error codes. Passwords, Argon2 verifiers, KEK material, database passwords, wrapped DEKs, IVs, auth tags, connection strings, and driver messages are never printed. |
 | Placeholder or predictable DEK material | The seeder calls the production `EnvelopeVault.createOrganizationEnvelope` with the active KEK. It cannot persist zeroed, random-in-test, or placeholder envelope bytes. |
-| Identity collision or privilege adoption | An existing email is adopted only when it is already an `admin` in the requested `DEMO_ORG_ID`. Otherwise the result is `CONFLICT` with zero writes. The seeder never promotes members or rewrites another organization's account. |
+| Identity collision or privilege adoption | An existing email is accepted only when it is already an `admin` in the requested `DEMO_ORG_ID` and the stored organization's DEK envelope authenticates with the configured KEK under tenant-scoped RLS. Otherwise the seeder returns a controlled failure or `CONFLICT`, with zero writes. It never promotes members or rewrites another organization's account. |
 | Duplicate records under concurrent runs | Organization plus admin creation is one atomic `SECURITY DEFINER` database call. A duplicate-key race is re-verified and classified without a second write. |
 | Partial provisioning | The privileged function inserts `organizations` and `users` in one transaction. Any failure, including duplicate organization UUID, rolls both back, so no orphan admin can exist. |
 
@@ -749,6 +749,7 @@ Validation fails closed in this order: `NODE_ENV=production` rejection, non-deve
 - Input is decoded as fatal UTF-8. Invalid byte sequences are rejected without echoing the bytes.
 - Input is never trimmed, normalized, case-folded, or otherwise transformed. A trailing newline from `echo` is part of the password, so documentation requires `printf '%s'`.
 - The existing `validatePasswordInput` and Argon2id configuration (`m=19456, t=2, p=1`) from the authentication service are reused; the seeder does not implement its own hashing.
+- PostgreSQL pool shutdown has a bounded wait and explicitly requests connection closure if graceful end stalls. Because an underlying driver/socket can become unresponsive, hard transport disposal cannot be guaranteed; the CLI returns a controlled nonzero cleanup failure rather than false success.
 - Mutable byte buffers are zeroized on success and failure. The resulting immutable JavaScript string cannot be deterministically zeroized, is not logged, and is released to garbage collection after use. This is the same runtime limitation documented for request-body strings in §16.2.1.
 
 ### 18.4 KEK, DEK, and Database Identity
@@ -759,7 +760,7 @@ The seeder never starts the HTTP server, never acquires the Gateway singleton ad
 
 ### 18.5 Idempotency and Conflict Safety
 
-An existing canonical email is looked up through the restricted pre-tenant function `app_private.lookup_user_for_login`, and only `id`, `org_id`, and `role` are selected. The result is `ALREADY_PRESENT` only when `org_id` equals `DEMO_ORG_ID` and `role` is `admin`. Everything else is `CONFLICT` with zero changes. Re-running never resets a password, changes a role, updates the budget or name, or rewraps the DEK, and the `CONFLICT` exit code is distinct (`3`) from operational failure (`1`).
+An existing canonical email is looked up through the restricted pre-tenant function `app_private.lookup_user_for_login`, and only `id`, `org_id`, and `role` are selected. The result is `ALREADY_PRESENT` only when `org_id` equals `DEMO_ORG_ID`, `role` is `admin`, and the existing organization's encrypted DEK authenticates with the configured KEK through the tenant-scoped `withTenant` boundary. Identity mismatch is `CONFLICT`; a missing, tampered, or KEK-incompatible envelope fails closed without writes. Re-running never resets a password, changes a role, updates the budget or name, or rewraps the DEK, and the `CONFLICT` exit code is distinct (`3`) from operational failure (`1`).
 
 ### 18.6 Verification Evidence
 
