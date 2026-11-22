@@ -6,6 +6,7 @@ export default tseslint.config(
       '**/dist/**',
       '**/node_modules/**',
       '**/.next/**',
+      '**/next-env.d.ts',
       'docs/**',
       '.agents/**',
       'pnpm-lock.yaml',
