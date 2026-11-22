@@ -114,7 +114,8 @@ async function verifyExistingOrganizationEnvelope(
   try {
     envelope = await withTenant(pool, config.orgId, async (client) => {
       const { rows } = await client.query<StoredEnvelopeRow>(
-        'SELECT kek_version, wrapped_dek, dek_iv, dek_auth_tag FROM public.organizations WHERE id = $1',
+        `SELECT kek_version, wrapped_dek, dek_iv, dek_auth_tag
+           FROM public.organizations WHERE id = $1`,
         [config.orgId],
       );
       const row = rows[0];
@@ -275,7 +276,10 @@ export async function seedDemoAccount(
 
   const existing = await lookupExistingAdmin(pool, config.adminEmail);
   if (existing) {
-    return { status: await classifyExisting(pool, existing, config, dependencies), orgId: config.orgId };
+    return {
+      status: await classifyExisting(pool, existing, config, dependencies),
+      orgId: config.orgId,
+    };
   }
 
   const vault = dependencies.createVault(config.keyring);
@@ -301,7 +305,10 @@ export async function seedDemoAccount(
       // A concurrent invocation may have created the same demo identity after our pre-check.
       const raced = await lookupExistingAdmin(pool, config.adminEmail);
       if (raced) {
-        return { status: await classifyExisting(pool, raced, config, dependencies), orgId: config.orgId };
+        return {
+          status: await classifyExisting(pool, raced, config, dependencies),
+          orgId: config.orgId,
+        };
       }
       return { status: 'CONFLICT', orgId: config.orgId };
     }
