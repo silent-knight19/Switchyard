@@ -1,137 +1,90 @@
 # Switchyard — SW-1.8.4: Production Isolation & Phase 1 Acceptance Verification Report
 
-**Task ID:** `SW-1.8.4`  
-**Task Name:** Production Isolation Verification and Phase 1 Acceptance Suite  
-**Subphase:** 1.8 — Deterministic Private Mock Upstream  
-**Phase:** 1 — Foundation, Identity, Tenant Isolation, and Deterministic Mock  
-**Repository:** `silent-knight19/Switchyard`  
-**Base `main` SHA:** `a62b72d25fd6007c26effb0b405b7d18ee95657a`  
-**Branch:** `task/sw-1.8.4-phase1-acceptance-verification`  
+**Task ID:** `SW-1.8.4`<br>
+**Task Name:** Production Isolation Verification and Phase 1 Acceptance Suite<br>
+**Subphase:** 1.8 — Deterministic Private Mock Upstream<br>
+**Phase:** 1 — Foundation, Identity, Tenant Isolation, and Deterministic Mock<br>
+**Repository:** `silent-knight19/Switchyard`<br>
+**Base `main` SHA:** `a62b72d25fd6007c26effb0b405b7d18ee95657a`<br>
+**Independently Reviewed HEAD SHA:** `1eefc1d11d42ce35bbbe1f08df40f526c0f91e03`<br>
+**Branch:** `task/sw-1.8.4-phase1-acceptance-verification`<br>
+**Existing PR:** https://github.com/silent-knight19/Switchyard/pull/21<br>
 **Authority:** Finalized Architecture & Engineering Plan v1.2, §5, §10.4, §11–14, §18, §19, §20–21, §23 Phase 1; `AGENTS.md`  
 
 ---
 
 ## 1. Executive Summary & Gate Dispositions
 
-This report provides the formal, independent verification results for atomic task `SW-1.8.4` and the Phase 1 Foundation acceptance gate. Per the architect contract, verification outcomes are bifurcated into two separate dispositions:
+This report provides the formal, independent verification results for atomic task `SW-1.8.4` and the Phase 1 Foundation acceptance gate following independent review remediation (SW184-01 through SW184-05). Per the architect contract, verification outcomes are bifurcated into two separate dispositions:
 
 ### Outcome A — Subphase 1.8 Verification: RECOMMEND ACCEPTANCE
 The deterministic private mock upstream (`@switchyard/mock-upstream`) fully satisfies all architectural, security, isolation, and reproducibility requirements:
 - **Production Startup Rejection:** Refuses to boot when `NODE_ENV=production` (verified via both direct constructor initialization and separate compiled subprocess execution exiting with code 1 before any HTTP listener or socket binding).
-- **Private Network Exposure:** Attached to private container network `switchyard-network` without published host ports (`ports:` block absent in `docker-compose.yml`).
+- **Private Network Exposure:** Attached to private container network `switchyard-network` without published host ports (`ports:` block absent in `docker-compose.yml`, verified via live Docker inspection in isolated Compose integration testing).
 - **Private Test Controls:** Protected by 64-hexadecimal `MOCK_CONTROL_SECRET` (unauthorized access to `/__test/*` and `x-test-fixture-id` returns HTTP 401 Unauthorized; standard `/v1/chat/completions` requests execute default fixtures without requiring control tokens; secrets are never reflected in errors or responses).
 - **Deterministic JSON/SSE Fixtures:** Byte-identical repeated completions, exact usage tokens, fixed timestamps, and stable response IDs without reliance on external AI provider networks or paid API tokens.
 - **Fault Matrix & Edge Cases:** Verified deterministic simulation of HTTP 4xx/5xx, connection resets/refusals, TTFT hangs, mid-stream disconnects, fragmented UTF-8, and malformed frames.
 - **Resource Cleanup:** Clean SIGTERM and `server.stop()` shutdown terminating sockets, clearing delay timers, and returning signal listener counts to 0.
 
 ### Outcome B — Overall Phase 1 Acceptance Gate: BLOCKED / NOT SATISFIED
-The Phase 1 Foundation cannot be marked ACCEPTED because a mandatory clean-clone startup exit criterion specified in Architecture v1.2 §23 is unsatisfied:
-- **Architecture Requirement (Architecture v1.2 §23 Phase 1 Exit Gate):** Requires clean-clone Docker Compose startup of Gateway, Worker, Web, PostgreSQL, Redis, and private mock upstream.
-- **Actual Implementation State:**
-  - `apps/gateway`, `apps/mock-upstream`, PostgreSQL, and Redis are fully implemented and operational.
-  - `apps/web` exists only as monorepo package scaffolding (`package.json`, `tsconfig.json`) without executable source or runnable service.
-  - `apps/worker` does not exist in the filesystem.
-  - `docker-compose.yml` does not define `worker` or `web` services.
-- **Discrepancy Analysis:** The Implementation Roadmap v1.0 deferred BullMQ background worker functionality to Phase 2 (`SW-2.4`) and the Control Plane Web Application to Phase 4 (`SW-4`). However, Architecture v1.2 §23 explicitly lists them as Phase 1 deliverables and exit criteria.
-- **Directive Adherence:** Under the Principal Architect execution contract and `AGENTS.md`, missing runtimes must not be opportunistically implemented under SW-1.8.4. Phase 1 is therefore designated **BLOCKED** pending owner approval of either a bounded remediation task or an architectural clarification.
+The Phase 1 Foundation cannot be marked ACCEPTED because mandatory clean-clone startup and development seeding exit criteria specified in Architecture v1.2 §23 are unsatisfied:
+- **Architecture Requirement 1 (Architecture v1.2 §23 Phase 1 Exit Gate):** Requires clean-clone Docker Compose startup of Gateway, Worker, Web, PostgreSQL, Redis, and private mock upstream.
+  - **Actual Implementation State:** `apps/gateway`, `apps/mock-upstream`, PostgreSQL, and Redis are fully implemented and operational. `apps/web` exists only as monorepo package scaffolding (`package.json`, `tsconfig.json`) without executable source or runnable service. `apps/worker` does not exist in the filesystem. `docker-compose.yml` does not define `worker` or `web` services (Finding `ARCH-P1-01`).
+- **Architecture Requirement 2 (Roadmap v1.0 & Architecture §23):** Requires an explicit development-only demo seeding workflow.
+  - **Actual Implementation State:** While production configuration strictly forbids demo seeding (verified in `apps/gateway/src/config/config.test.ts`), no working development seeding CLI, endpoint, or script exists in the repository (Finding `ARCH-P1-02`).
+- **Directive Adherence:** Under the Principal Architect execution contract and `AGENTS.md`, missing runtimes and seeders must not be opportunistically implemented under SW-1.8.4. Phase 1 is therefore designated **BLOCKED** pending owner approval of either bounded remediation tasks or architectural clarifications.
 
 ---
 
-## 2. Deliverable D — Architectural Discrepancy Register
+## 2. Review Remediation Summary (SW184-01 through SW184-05)
+
+| Finding ID | Severity | Description | Remediation Applied |
+|---|---|---|---|
+| **SW184-01** | Low | Correct evidence identity. Previous report contained a truncated/misreferenced commit SHA. | Updated report to reference the exact 40-character reviewed HEAD (`1eefc1d11d42ce35bbbe1f08df40f526c0f91e03`), final pushed HEAD, and fresh CI workflow runs for the updated commit. |
+| **SW184-02** | Medium | Remove tests that require architecture violations. Test asserted that `worker` and `web` must remain absent. | Replaced inverted negative assertions with a future-proof inventory verification mechanism in `apps/mock-upstream/src/test/stage-d.test.ts`. Service presence is determined dynamically; missing mandatory services are recorded as acceptance blockers without requiring them to remain missing. |
+| **SW184-03** | High | Complete isolated Docker integration evidence. Compose test lacked unique container name and live mock network tests. | Updated `apps/gateway/src/db/compose-init.db.test.ts` to assign unique `MOCK_UPSTREAM_CONTAINER_NAME: switchyard-test-mock-${runId}`, wait for mock container health, verify 0 published host ports via Docker inspection, verify inter-container connectivity from `gateway` to `mock-upstream:4000`, assert 401 on unauthorized test controls, assert 500 on authorized fault fixture selection, and verify cleanup without leaking credentials in logs. |
+| **SW184-04** | Medium | Correct acceptance claims and evidence across P1-01 through P1-24. | Audited all 24 criteria. Replaced in-process unit citations with real Compose container initialization (`compose-init.db.test.ts`) for Gateway and Mock Upstream; separated static Compose checks from live Docker inspection; distinguished unit tests from PostgreSQL/Redis integration tests; kept P1-02, P1-03, and P1-07 blocked. |
+| **SW184-05** | Medium | Correct development-seeding evidence for P1-07. | Audited repository for development seeding. Confirmed production rejects demo seeding, but no development seeding CLI or script exists. Marked P1-07 as `PARTIALLY VERIFIED / BLOCKED` and registered `ARCH-P1-02`. |
+
+---
+
+## 3. Deliverable D — Architectural Discrepancy Register
 
 | Finding ID | Severity | Requirement Violated | Affected Files | Actual State | Expected Architecture State | Recommended Remediation |
 |---|---|---|---|---|---|---|
 | **ARCH-P1-01** | High | Architecture v1.2 §23 Phase 1 Deliverables: "Docker Compose with PostgreSQL, Redis, Gateway, worker, web, and mock upstream." | `docker-compose.yml`, `apps/worker`, `apps/web` | `apps/worker` does not exist. `apps/web` contains only skeleton `package.json` and `tsconfig.json` without an executable server. `docker-compose.yml` only defines `postgres`, `redis`, `migrate`, `gateway`, and `mock-upstream`. | Clean-clone `docker compose up` starts runnable Gateway, Worker, Web, PostgreSQL, Redis, and Mock Upstream containers. | Project Owner decision required: Either (A) Authorize a bounded bridge task to add minimal runnable placeholder worker and web services to Docker Compose satisfying §23, or (B) Formally approve an ADR aligning Architecture §23 exit criteria with Roadmap v1.0 (deferring worker to SW-2.4 and web to Phase 4). |
+| **ARCH-P1-02** | Medium | Architecture v1.2 §23 Phase 1 Exit Gate: "Demo account is local-only and non-default outside development." Roadmap v1.0: "explicit development seed only." | `apps/gateway/src/config/schema.ts`, `docker/postgres/init/02-init-development.sh` | Production config rejects `DEMO_SEEDING_ENABLED=true` and no demo accounts exist in database init scripts. However, no executable development seeding CLI, endpoint, or script exists in the repository. | A working, explicit development-only demo seeding mechanism exists to populate local organizations and accounts. | Project Owner decision required: Authorize a dedicated task to implement a development-only seeding script (e.g. `pnpm seed:dev`), or document that developer accounts must be bootstrapped via initial admin registration API. |
 
 ---
 
-## 3. Required Phase 1 Acceptance Matrix (P1-01 through P1-24)
+## 4. Required Phase 1 Acceptance Matrix (P1-01 through P1-24)
 
 | ID | Requirement | Status | Verification Command / Test File | Actual Observed Result | Supporting Evidence Location | Outstanding Limitations / Blockers |
 |---|---|---|---|---|---|---|
-| **P1-01** | Clean-clone Gateway startup | **PASS** | `apps/gateway/src/gateway.test.ts`<br>`docker compose config` | Gateway compiles, loads valid environment, verifies dependencies, and exposes healthy `/health/ready` endpoint. | `apps/gateway/src/gateway.test.ts:31` | None. |
-| **P1-02** | Clean-clone worker startup | **BLOCKED** | File system & `docker-compose.yml` inspection | `apps/worker` directory is absent; no worker service in `docker-compose.yml`. | `apps/mock-upstream/src/test/stage-d.test.ts:348` | Blocked by missing worker application runtime (ARCH-P1-01). |
-| **P1-03** | Clean-clone web startup | **BLOCKED** | File system & `docker-compose.yml` inspection | `apps/web` is scaffolding only (no UI code/server); no web service in `docker-compose.yml`. | `apps/mock-upstream/src/test/stage-d.test.ts:344` | Blocked by missing web application runtime (ARCH-P1-01). |
-| **P1-04** | PostgreSQL startup, migration and readiness | **PASS** | `apps/gateway/src/db/migrate.db.test.ts`<br>`apps/gateway/src/db/privileges.db.test.ts` | PostgreSQL 16.8 container boots, applies migrations 0001–0011 under `gateway_migrator` with checksum verification. | `apps/gateway/src/db/migrate.db.test.ts:1` | None. |
-| **P1-05** | Redis startup, persistence, ACL and readiness | **PASS** | `apps/gateway/src/auth/rate-limiter.redis.db.test.ts`<br>`docker-compose.yml` | Redis 7.4.2 starts with `noeviction`, AOF enabled, and ACL-restricted user `switchyard_app` denying administrative commands. | `docker-compose.yml:31-68` | None. |
-| **P1-06** | Private mock-upstream startup | **PASS** | `apps/mock-upstream/src/test/stage-d.test.ts:162` | Container starts on private network, listens on 4000, passes `/health/ready` check without host port mapping. | `apps/mock-upstream/src/test/stage-d.test.ts:162` | None. |
-| **P1-07** | Explicit development-only demo seeding | **PASS** | `apps/gateway/src/config/config.test.ts:167`<br>`apps/mock-upstream/src/test/stage-d.test.ts:581` | `DEMO_SEEDING_ENABLED` defaults to `false`, rejected in production. Database init scripts provision DB roles only; no demo accounts seeded. | `apps/gateway/src/config/schema.ts:188`<br>`docker/postgres/init/02-init-development.sh:1` | None. |
-| **P1-08** | Default-deny tenant RLS | **PASS** | `apps/gateway/src/db/tenant-rls.db.test.ts` | `relrowsecurity` and `relforcerowsecurity` enforced on all 9 tenant tables. SELECT, INSERT, UPDATE, DELETE strictly isolated between Org A and Org B. | `apps/gateway/src/db/tenant-rls.db.test.ts:98` | None. |
-| **P1-09** | Composite tenant foreign keys | **PASS** | `apps/gateway/src/db/tenant-rls.db.test.ts` | Cross-tenant child references rejected with SQLSTATE 23503 across all parent-child tables. | `apps/gateway/src/db/tenant-rls.db.test.ts:145` | None. |
-| **P1-10** | Restricted database roles and privileged functions | **PASS** | `apps/gateway/src/db/privileges.db.test.ts`<br>`apps/gateway/src/db/privileged-functions.db.test.ts` | Runtime roles (`gateway_app`, `gateway_worker`, `gateway_startup`) cannot alter schema or escalate privileges. Definer functions enforce search_path. | `apps/gateway/src/db/privileges.db.test.ts:54` | None. |
-| **P1-11** | Pooled tenant-context isolation | **PASS** | `apps/gateway/src/db/tenant-rls.db.test.ts` | `withTenant()` safely sets transaction-local context, cleans up parameters on client return, and prevents prepared-statement leakage across connections. | `apps/gateway/src/db/tenant-rls.db.test.ts:60` | None. |
-| **P1-12** | Browser session authentication and revocation | **PASS** | `apps/gateway/src/auth/session.db.test.ts`<br>`apps/gateway/src/auth/auth.db.test.ts` | Argon2id password hashing, opaque server session tokens, session expiry, password-change invalidation, and explicit logout verified. | `apps/gateway/src/auth/session.db.test.ts:1` | None. |
-| **P1-13** | CSRF enforcement | **PASS** | `apps/gateway/src/auth/csrf.db.test.ts`<br>`apps/gateway/src/auth/csrf.http.db.test.ts` | Double-submit synchronizer token and strict canonical origin checking enforced. Missing/forged token or mismatched origin returns HTTP 403 Forbidden. | `apps/gateway/src/auth/csrf.http.db.test.ts:1` | None. |
-| **P1-14** | Admin/member RBAC | **PASS** | `apps/gateway/src/auth/authorization.db.test.ts`<br>`apps/gateway/src/auth/authorization.http.db.test.ts` | Member role denied admin routes (HTTP 403). Virtual keys denied control plane; browser sessions denied data plane. | `apps/gateway/src/auth/authorization.http.db.test.ts:1` | None. |
-| **P1-15** | Virtual-key creation, authentication and revocation | **PASS** | `apps/gateway/src/auth/virtual-key.test.ts`<br>`apps/gateway/src/auth/virtual-key-management.db.test.ts`<br>`apps/gateway/src/auth/virtual-key-authenticator.db.test.ts` | High-entropy key generation, SHA-256 hashed storage, one-time secret presentation, immediate revocation, and post-revocation 401 rejection verified. | `apps/gateway/src/auth/virtual-key-authenticator.db.test.ts:1` | None. |
-| **P1-16** | Provider-key envelope encryption and management | **PASS** | `apps/gateway/src/vault/envelope.db.test.ts`<br>`apps/gateway/src/auth/provider-key-management.db.test.ts` | AES-256-GCM envelope encryption with versioned KEKs, tenant-bound and provider-bound AAD. Decryption fails on wrong tenant or tampered ciphertext. Plaintext never readable. | `apps/gateway/src/vault/envelope.db.test.ts:1`<br>`apps/gateway/src/auth/provider-key-management.db.test.ts:1` | None. |
-| **P1-17** | No raw secrets in logs/read APIs | **PASS** | `apps/gateway/src/logging/logging.test.ts`<br>`apps/gateway/src/config/config.test.ts:208`<br>`apps/mock-upstream/src/test/stage-d.test.ts:311` | Pino log serializer redacts API keys, passwords, KEKs, session tokens, and synthetic canaries. Config errors and HTTP responses omit secrets. | `apps/gateway/src/logging/logging.test.ts:1` | None. |
-| **P1-18** | Deterministic mock JSON/SSE responses | **PASS** | `apps/mock-upstream/src/test/stage-a.test.ts`<br>`apps/mock-upstream/src/test/stage-d.test.ts:524` | Byte-identical repeated responses for JSON and SSE streams; stable response IDs (`chatcmpl-mock-*`), timestamps, and exact token counts. | `apps/mock-upstream/src/test/stage-d.test.ts:524-570` | None. |
-| **P1-19** | Deterministic mock fault injection | **PASS** | `apps/mock-upstream/src/test/stage-b.test.ts` | Matrix of HTTP faults (400, 401, 403, 422, 429 Retry-After, 500, 502, 503, 504) and real socket faults (refusal, reset, TTFT hang, mid-stream disconnect) verified. | `apps/mock-upstream/src/test/stage-b.test.ts:1` | None. |
-| **P1-20** | Private mock control authorization | **PASS** | `apps/mock-upstream/src/test/stage-d.test.ts:240` | `GET /__test/abort-observations`, `POST /__test/reset`, `PUT /__test/active-fixture`, `DELETE /__test/active-fixture`, and `x-test-fixture-id` require valid 64-hex secret. | `apps/mock-upstream/src/test/stage-d.test.ts:240-318` | None. |
-| **P1-21** | Production rejects mock/test controls | **PASS** | `apps/mock-upstream/src/test/stage-d.test.ts:88` | Mock entrypoint fails closed when `NODE_ENV=production` in separate subprocess (code 1), preventing listener binding or route exposure. | `apps/mock-upstream/src/test/stage-d.test.ts:88-145` | None. |
-| **P1-22** | Production rejects insecure configuration and seeding | **PASS** | `apps/gateway/src/config/config.test.ts:151-220`<br>`apps/mock-upstream/src/test/stage-d.test.ts:88` | Production Gateway rejects `MOCK_PROVIDER_ENABLED`, `DEMO_SEEDING_ENABLED`, `TLS_VERIFY=false`, `COOKIE_SECURE=false`, all 8 `FORBIDDEN_SECURITY_FLAGS`, custom upstream URLs, and default passwords. | `apps/gateway/src/config/config.test.ts:151-260` | None. |
-| **P1-23** | No unintended public mock exposure | **PASS** | `apps/mock-upstream/src/test/stage-d.test.ts:320`<br>`docker-compose.yml` | `mock-upstream` service defines no `ports:` mapping; only accessible via internal Docker bridge network. Gateway/Postgres/Redis loopback-bound to `127.0.0.1`. | `docker-compose.yml:133-159` | None. |
-| **P1-24** | Clean shutdown and bounded resource cleanup | **PASS** | `apps/mock-upstream/src/test/stage-d.test.ts:162,476` | SIGTERM terminates compiled process with code 0; `stop()` destroys active sockets, cancels delayed SSE writers, clears timers, and leaves 0 signal listeners. | `apps/mock-upstream/src/test/stage-d.test.ts:162,476` | None. |
-
----
-
-## 4. Verification Details by Group
-
-### Group A — Mock Production Isolation
-1. **Production Startup Rejection:**
-   - Evaluated `parseMockConfig({ NODE_ENV: 'production' })` and `new MockServer()`: both throw descriptive errors before any network resource allocation.
-   - Evaluated compiled entrypoint `node dist/index.js` in an isolated subprocess with `NODE_ENV=production`:
-     - Process exited with return code 1.
-     - Stderr output confirmed: `"Fatal error starting mock upstream server: Error: Mock upstream server cannot run in production environment (NODE_ENV=production)"`.
-     - Socket connection to configured test port failed with `ECONNREFUSED`, proving no TCP listener was opened.
-     - No sensitive secret canary or fixture payload appeared in stdout or stderr.
-2. **Gateway Production Invariants:**
-   - Central Zod configuration strictly rejects `MOCK_PROVIDER_ENABLED=true` and `DEMO_SEEDING_ENABLED=true` in production profile.
-   - Tested all eight forbidden fail-open/bypass flags (`FAIL_OPEN`, `ALLOW_FAIL_OPEN`, `BYPASS_AUTH`, `ALLOW_INSECURE_AUTH`, `BYPASS_RLS`, `DISABLE_TENANT_ISOLATION`, `DISABLE_AUTH`, `INSECURE_MODE`); every flag triggers `ConfigValidationError` and fails closed.
-   - Default dev passwords (`switchyard_dev_password`, `switchyard_app_password`) and non-noeviction Redis policies are rejected in production.
-3. **Test Control Route Security:**
-   - All four diagnostic endpoints (`GET /__test/abort-observations`, `POST /__test/reset`, `PUT /__test/active-fixture`, `DELETE /__test/active-fixture`) enforce constant-time timing-safe comparison of the 32-byte (64 hex character) secret.
-   - Unauthenticated or misauthenticated requests return 401 with standard JSON error payload without echoing the attempted token.
-   - Request-level fixture selection via `x-test-fixture-id` requires the control secret; requests without it return 401, preventing unauthorized fault injection.
-
-### Group B — Private Docker Networking
-1. **Network Topology:**
-   - Evaluated rendered Docker Compose specification: `mock-upstream` connects to `switchyard-network` without exposing or publishing any host ports.
-   - Gateway, PostgreSQL, and Redis publish ports bound strictly to host loopback (`127.0.0.1:${PORT:-3000}:3000`, `127.0.0.1:${POSTGRES_PORT:-5432}:5432`, `127.0.0.1:${REDIS_PORT:-6379}:6379`).
-2. **Secret Forwarding & Validation:**
-   - Compose forwards `MOCK_CONTROL_SECRET: ${MOCK_CONTROL_SECRET:-}` dynamically. No static credentials are committed to the Dockerfile, Compose file, or source code.
-   - An invalid explicit secret (e.g. malformed hex or length !== 64) aborts process startup with exit code 1 without echoing the malformed string.
-   - When omitted, a cryptographically secure 64-hex string is generated at server initialization.
-3. **Graceful Shutdown:**
-   - Validated that `server.stop()` destroys all tracked active TCP sockets, aborts ongoing HTTP requests, clears pending chunk delay timeouts, and cleans up event listeners.
-
-### Group C — Determinism & Fault Matrix
-1. **Response Reproducibility:**
-   - Two consecutive identical POST completions to `/v1/chat/completions` produce byte-identical JSON strings with identical token usages (`prompt_tokens: 12`, `completion_tokens: 8`, `total_tokens: 20`), created timestamp `1700000000`, and response ID `chatcmpl-mock-json-basic`.
-   - Streaming requests stream byte-identical SSE events across repeated runs with predictable chunk delimiters and final `data: [DONE]\n\n`.
-2. **Deterministic Fault Injection:**
-   - 10 named HTTP fault scenarios and 5 real TCP network fault scenarios execute deterministically without flaky sleep-only synchronization.
-3. **Protocol Edge Cases:**
-   - Verified handling of multi-byte UTF-8 split boundaries, chunk fragmentation, oversized events, and non-SSE streaming payloads.
-
-### Group D — Phase 1 Security Regression
-1. **PostgreSQL Migrations & Privileges:**
-   - 26 `.db.test.ts` test files verify least privilege across database roles (`gateway_migrator`, `gateway_app`, `gateway_startup`, `gateway_worker`).
-   - Tenant RLS (`FORCE ROW LEVEL SECURITY`) and transaction-scoped tenant isolation via `withTenant()` guarantee zero cross-tenant read/write leakage.
-2. **Identity & Credential Security:**
-   - Sessions, CSRF synchronizer tokens, and Virtual API Keys operate without caching sensitive auth credentials in Redis.
-   - Provider vault envelope encryption uses AES-256-GCM with versioned KEKs and tenant-bound AAD. Tampered ciphertext or wrong-tenant decryption fails immediately.
-
-### Group E — Clean-Clone Acceptance
-1. **Toolchain Verification:**
-   - Node.js LTS: `v26.13.1`
-   - pnpm: `12.21.0`
-   - Clean install with `pnpm install --frozen-lockfile` succeeds.
-   - Monorepo builds completely in 1.4s with 0 errors across all workspace packages.
-2. **Missing Service Blockers:**
-   - Compose startup was verified for `postgres`, `redis`, `migrate`, `gateway`, and `mock-upstream`.
-   - As documented in Deliverable D, the required `worker` and `web` runtime containers cannot be started because they have not yet been implemented in the codebase.
+| **P1-01** | Clean-clone Gateway startup | **PASS** | `apps/gateway/src/db/compose-init.db.test.ts`<br>`apps/gateway/src/gateway.test.ts` | Real Gateway container starts in isolated Compose project, connects to PostgreSQL and Redis, and returns 200 OK on `/health/ready` with all dependencies healthy. | `apps/gateway/src/db/compose-init.db.test.ts:325`<br>`apps/gateway/src/gateway.test.ts:31` | None. |
+| **P1-02** | Clean-clone worker startup | **BLOCKED** | File system & `docker-compose.yml` inspection | `apps/worker` directory is absent; no worker service in `docker-compose.yml`. | `apps/mock-upstream/src/test/stage-d.test.ts:418` | Blocked by missing worker application runtime (ARCH-P1-01). |
+| **P1-03** | Clean-clone web startup | **BLOCKED** | File system & `docker-compose.yml` inspection | `apps/web` is scaffolding only (no UI code/server); no web service in `docker-compose.yml`. | `apps/mock-upstream/src/test/stage-d.test.ts:418` | Blocked by missing web application runtime (ARCH-P1-01). |
+| **P1-04** | PostgreSQL startup, migration and readiness | **PASS** | `apps/gateway/src/db/compose-init.db.test.ts`<br>`apps/gateway/src/db/migrate.db.test.ts` | Real PostgreSQL 16.8 container boots, applies migrations 0001–0011 under restricted `gateway_migrator` role with checksum verification. | `apps/gateway/src/db/compose-init.db.test.ts:173`<br>`apps/gateway/src/db/migrate.db.test.ts:1` | None. |
+| **P1-05** | Redis startup, persistence, ACL and readiness | **PASS** | `apps/gateway/src/db/compose-init.db.test.ts`<br>`apps/gateway/src/auth/rate-limiter.redis.db.test.ts` | Real Redis 7.4.2 container starts with `maxmemory-policy noeviction`, AOF enabled, and ACL-restricted user `switchyard_app` denying administrative commands. | `apps/gateway/src/db/compose-init.db.test.ts:325`<br>`docker-compose.yml:31-68` | None. |
+| **P1-06** | Private mock-upstream startup | **PASS** | `apps/gateway/src/db/compose-init.db.test.ts`<br>`apps/mock-upstream/src/test/stage-d.test.ts` | Real container starts in Compose, passes `/health/ready`, and reaches `healthy` status on private network. In-process and subprocess entrypoint execution also verified. | `apps/gateway/src/db/compose-init.db.test.ts:123,410`<br>`apps/mock-upstream/src/test/stage-d.test.ts:162` | None. |
+| **P1-07** | Explicit development-only demo seeding | **PARTIALLY VERIFIED / BLOCKED** | `apps/gateway/src/config/config.test.ts:167`<br>`apps/mock-upstream/src/test/stage-d.test.ts:581` | Production strictly rejects `DEMO_SEEDING_ENABLED=true` (PASS). Database init script sets role passwords only (PASS). However, no explicit development seeding script/workflow is implemented in the repository (BLOCKED). | `apps/gateway/src/config/schema.ts:188`<br>`docker/postgres/init/02-init-development.sh:1` | Blocked by missing development demo seeder (ARCH-P1-02). |
+| **P1-08** | Default-deny tenant RLS | **PASS** | `apps/gateway/src/db/tenant-rls.db.test.ts` | Real PostgreSQL integration test proves `relrowsecurity` and `relforcerowsecurity` across all 9 tenant tables; SELECT, INSERT, UPDATE, DELETE strictly isolated between Org A and Org B. | `apps/gateway/src/db/tenant-rls.db.test.ts:98` | None. |
+| **P1-09** | Composite tenant foreign keys | **PASS** | `apps/gateway/src/db/tenant-rls.db.test.ts` | Real PostgreSQL integration test proves cross-tenant child references rejected with SQLSTATE 23503 across all parent-child tables. | `apps/gateway/src/db/tenant-rls.db.test.ts:145` | None. |
+| **P1-10** | Restricted database roles and privileged functions | **PASS** | `apps/gateway/src/db/privileges.db.test.ts`<br>`apps/gateway/src/db/privileged-functions.db.test.ts` | Real PostgreSQL integration test proves runtime roles (`gateway_app`, `gateway_worker`, `gateway_startup`) cannot alter schema or escalate privileges. Definer functions enforce search_path. | `apps/gateway/src/db/privileges.db.test.ts:54`<br>`apps/gateway/src/db/privileged-functions.db.test.ts:1` | None. |
+| **P1-11** | Pooled tenant-context isolation | **PASS** | `apps/gateway/src/db/tenant-rls.db.test.ts` | Real PostgreSQL integration test proves `withTenant()` safely sets transaction-local context, cleans up parameters on client return, and prevents prepared-statement leakage across pooled connections. | `apps/gateway/src/db/tenant-rls.db.test.ts:60` | None. |
+| **P1-12** | Browser session authentication and revocation | **PASS** | `apps/gateway/src/auth/session.db.test.ts`<br>`apps/gateway/src/auth/auth.db.test.ts` | Real PostgreSQL integration test proves Argon2id password hashing, opaque server session tokens, session expiry, password-change invalidation, and explicit logout. | `apps/gateway/src/auth/session.db.test.ts:1`<br>`apps/gateway/src/auth/auth.db.test.ts:1` | None. |
+| **P1-13** | CSRF enforcement | **PASS** | `apps/gateway/src/auth/csrf.http.db.test.ts`<br>`apps/gateway/src/auth/csrf.db.test.ts` | Real HTTP server integration test proves double-submit synchronizer token and canonical origin checking. Missing/forged token or mismatched origin returns HTTP 403 Forbidden. | `apps/gateway/src/auth/csrf.http.db.test.ts:1` | None. |
+| **P1-14** | Admin/member RBAC | **PASS** | `apps/gateway/src/auth/authorization.http.db.test.ts`<br>`apps/gateway/src/auth/authorization.db.test.ts` | Real HTTP server integration test proves member role denied admin routes (HTTP 403). Virtual keys denied control plane; browser sessions denied data plane. | `apps/gateway/src/auth/authorization.http.db.test.ts:1` | None. |
+| **P1-15** | Virtual-key creation, authentication and revocation | **PASS** | `apps/gateway/src/auth/virtual-key-authenticator.db.test.ts`<br>`apps/gateway/src/auth/virtual-key-management.db.test.ts`<br>`apps/gateway/src/auth/virtual-key-revocation.db.test.ts` | Real PostgreSQL integration tests prove high-entropy key generation, SHA-256 hashed storage, one-time secret presentation, immediate revocation, and post-revocation 401 rejection. | `apps/gateway/src/auth/virtual-key-authenticator.db.test.ts:1` | None. |
+| **P1-16** | Provider-key envelope encryption and management | **PASS** | `apps/gateway/src/vault/envelope.db.test.ts`<br>`apps/gateway/src/auth/provider-key-management.db.test.ts` | Real PostgreSQL integration tests prove AES-256-GCM envelope encryption with versioned KEKs, tenant-bound and provider-bound AAD. Decryption fails on wrong tenant or tampered ciphertext. Plaintext never readable. | `apps/gateway/src/vault/envelope.db.test.ts:1`<br>`apps/gateway/src/auth/provider-key-management.db.test.ts:1` | None. |
+| **P1-17** | No raw secrets in logs/read APIs | **PASS** | `apps/gateway/src/logging/logging.test.ts`<br>`apps/gateway/src/config/config.test.ts:208`<br>`apps/mock-upstream/src/test/stage-d.test.ts:363` | Pino log serializer redacts API keys, passwords, KEKs, session tokens, and synthetic canaries. Config errors, HTTP responses, and container logs omit secrets. | `apps/gateway/src/logging/logging.test.ts:1`<br>`apps/mock-upstream/src/test/stage-d.test.ts:363` | None. |
+| **P1-18** | Deterministic mock JSON/SSE responses | **PASS** | `apps/mock-upstream/src/test/stage-a.test.ts`<br>`apps/mock-upstream/src/test/stage-d.test.ts:515` | Byte-identical repeated responses for JSON and SSE streams; stable response IDs (`chatcmpl-mock-*`), timestamps, and exact token counts. | `apps/mock-upstream/src/test/stage-d.test.ts:515-560` | None. |
+| **P1-19** | Deterministic mock fault injection | **PASS** | `apps/mock-upstream/src/test/stage-b.test.ts`<br>`apps/gateway/src/db/compose-init.db.test.ts:468` | Matrix of HTTP faults (400, 401, 403, 422, 429 Retry-After, 500, 502, 503, 504) and real socket faults (refusal, reset, TTFT hang, mid-stream disconnect) verified in unit suite and live Compose network. | `apps/mock-upstream/src/test/stage-b.test.ts:1`<br>`apps/gateway/src/db/compose-init.db.test.ts:468` | None. |
+| **P1-20** | Private mock control authorization | **PASS** | `apps/mock-upstream/src/test/stage-d.test.ts:240`<br>`apps/gateway/src/db/compose-init.db.test.ts:450` | `GET /__test/abort-observations`, `POST /__test/reset`, `PUT /__test/active-fixture`, `DELETE /__test/active-fixture`, and `x-test-fixture-id` require valid 64-hex secret in local tests and over Docker network. | `apps/mock-upstream/src/test/stage-d.test.ts:240-318`<br>`apps/gateway/src/db/compose-init.db.test.ts:450` | None. |
+| **P1-21** | Production rejects mock/test controls | **PASS** | `apps/mock-upstream/src/test/stage-d.test.ts:88` | Mock entrypoint fails closed when `NODE_ENV=production` in separate subprocess (exit code 1), preventing listener binding or route exposure. | `apps/mock-upstream/src/test/stage-d.test.ts:88-145` | None. |
+| **P1-22** | Production rejects insecure configuration and seeding | **PASS** | `apps/gateway/src/config/config.test.ts:151-220`<br>`apps/mock-upstream/src/test/stage-d.test.ts:88` | Production Gateway rejects `MOCK_PROVIDER_ENABLED`, `DEMO_SEEDING_ENABLED`, `TLS_VERIFY=false`, `COOKIE_SECURE=false`, all 8 `FORBIDDEN_SECURITY_FLAGS`, custom upstream URLs, and default passwords. | `apps/gateway/src/config/config.test.ts:151-220` | None. |
+| **P1-23** | No unintended public mock exposure | **PASS** | `apps/gateway/src/db/compose-init.db.test.ts:410`<br>`apps/mock-upstream/src/test/stage-d.test.ts:390` | Real Docker container inspection (`docker port` is empty; `HostConfig.PortBindings` is null/empty) proves mock container has no published host port. Static Compose verification also passes. | `apps/gateway/src/db/compose-init.db.test.ts:410`<br>`apps/mock-upstream/src/test/stage-d.test.ts:390` | None. |
+| **P1-24** | Clean shutdown and bounded resource cleanup | **PASS** | `apps/mock-upstream/src/test/stage-d.test.ts:162,476`<br>`apps/mock-upstream/src/test/stage-b.test.ts` | SIGTERM terminates compiled process with code 0; `stop()` destroys active sockets, cancels delayed SSE writers, clears timers, and leaves 0 signal listeners. | `apps/mock-upstream/src/test/stage-d.test.ts:162,476` | None. |
 
 ---
 
@@ -155,8 +108,8 @@ The Phase 1 Foundation cannot be marked ACCEPTED because a mandatory clean-clone
 ## 6. Final Recommendations & Status
 
 1. **SW-1.8.4 Task Status:** `IMPLEMENTED`  
-   All automated verification suites, subprocess tests, configuration assertions, acceptance evidence, and documentation are complete and verified.
+   All review findings SW184-01 through SW184-05 are resolved. Live Docker Compose integration evidence is implemented, future-proof inventory analysis is active, development seeding state is accurately classified, and full test suites pass.
 2. **Subphase 1.8 Disposition:** `RECOMMEND ACCEPTANCE`  
-   The deterministic private mock upstream satisfies every functional, security, and isolation requirement.
+   The deterministic private mock upstream satisfies every functional, security, private networking, and isolation requirement.
 3. **Phase 1 Acceptance Gate Disposition:** `BLOCKED`  
-   Blocked strictly by architectural discrepancy ARCH-P1-01 (absence of runnable `worker` and `web` services in Docker Compose as required by Architecture v1.2 §23 Phase 1 exit criteria). Awaiting Project Owner decision.
+   Phase 1 foundation cannot be approved because clean-clone Docker Compose startup of `worker` and `web` runtimes is not yet implemented (Finding `ARCH-P1-01`), and an explicit development seeding mechanism is not yet implemented (Finding `ARCH-P1-02`). Awaiting Project Owner decisions on both findings.
