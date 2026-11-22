@@ -574,3 +574,32 @@ The default `pnpm test` suite excludes `*.db.test.ts`, and CI runs them in a sep
 The older `pnpm --filter @switchyard/gateway test:integration` suite (live Compose PostgreSQL and
 Redis, gated by `INTEGRATION_TESTS`) still exists for connectivity tests; it is not a substitute
 for `test:db`.
+
+#### 7.7.11 Six-Component Service Topology & Runtime Integration (SW-P1-B01)
+
+Resolving Phase 1 acceptance blocker `ARCH-P1-01` (Architecture v1.2 §23), Switchyard provides a clean-clone Docker Compose environment containing all six mandatory components:
+
+| Component | Technology | Process / Command | Network / Ports | Health Check |
+|---|---|---|---|---|
+| **Gateway** | Node.js Fastify API server | `node apps/gateway/dist/index.js` | `127.0.0.1:${PORT:-3000}:3000` | HTTP `GET /health/ready` |
+| **Worker** | Node.js worker daemon | `node apps/gateway/dist/worker-main.js` | Internal only (0 host ports) | CLI `node dist/worker-main.js --health` |
+| **Web** | Next.js App Router (standalone) | `node apps/web/server.js` | `127.0.0.1:${WEB_PORT:-3001}:3001` | HTTP `GET /health/ready` |
+| **PostgreSQL** | PostgreSQL 16.8 | `docker-entrypoint.sh` | `127.0.0.1:${POSTGRES_PORT:-5432}:5432` | `pg_isready` |
+| **Redis** | Redis 7.4.2 | `redis-server` (AOF + noeviction) | `127.0.0.1:${REDIS_PORT:-6379}:6379` | `redis-cli ping` + ACL attestation |
+| **Mock Upstream** | Node.js OpenAI mock | `node apps/mock-upstream/dist/index.js` | Internal only (4000, 0 host ports) | HTTP `GET /health/ready` |
+
+##### Manual Startup Commands:
+- **Worker standalone:**
+  ```bash
+  pnpm --filter @switchyard/gateway start:worker
+  ```
+- **Web standalone:**
+  ```bash
+  pnpm --filter @switchyard/web dev      # Development mode
+  pnpm --filter @switchyard/web build    # Production build
+  pnpm --filter @switchyard/web start    # Production runtime
+  ```
+- **Docker Compose (all 6 services):**
+  ```bash
+  docker compose up -d
+  ```

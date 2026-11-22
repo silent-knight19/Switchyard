@@ -438,7 +438,9 @@ describe('SW-1.8.4 Stage D: Production Isolation and Acceptance Suite', () => {
         ? process.cwd()
         : path.resolve(process.cwd(), '../..');
       const webExecutableExists = fs.existsSync(path.resolve(rootDir, 'apps/web/src'));
-      const workerExists = fs.existsSync(path.resolve(rootDir, 'apps/worker'));
+      const workerExists =
+        fs.existsSync(path.resolve(rootDir, 'apps/worker')) ||
+        fs.existsSync(path.resolve(rootDir, 'apps/gateway/src/worker-main.ts'));
 
       const isPhase1FullyRunnable =
         missingMandatory.length === 0 && webExecutableExists && workerExists;

@@ -668,3 +668,43 @@ Architecture v1.2 §14.2 specifies two-tier envelope encryption specifically to 
 5. **DEK Rotation Distinction:**
    - KEK rotation changes the wrapping key of the organization DEK (metadata update on `organizations`).
    - DEK rotation replaces the organization DEK itself, requiring every provider credential of that organization to be decrypted and re-encrypted with fresh IVs. DEK rotation is not authorized or implemented.
+
+---
+
+## 17. Worker and Web Runtime Security Boundaries (SW-P1-B01)
+
+Switchyard establishes strict security boundaries between the Gateway, Worker, and Web services (Architecture v1.2 §§12.1, 12.5, 19.1, 19.4, 20.1, 23.1).
+
+### 17.1 Worker Runtime Least Privilege & Isolation
+
+1. **Process Separation:**
+   - The worker runs as an independent daemon (`node apps/gateway/dist/worker-main.js`) separated from the Gateway API process.
+   - It exposes zero network ports (`ports: []`), published host ports, or HTTP listeners.
+   - Liveness/readiness is monitored via unprivileged local CLI probe (`node apps/gateway/dist/worker-main.js --health`) checking heartbeat age (<15s) and process liveness via PID signal probing (`process.kill(pid, 0)`).
+
+2. **PostgreSQL Role Boundary (`gateway_worker`):**
+   - Must connect strictly as `gateway_worker` (rejects superuser, `usesuper = false`, `rolbypassrls = false`).
+   - Strictly denied access to singleton control state: `SELECT 1 FROM gateway_control` throws SQLSTATE `42501` (permission denied).
+   - Denied access to sensitive vault columns: `provider_keys.ciphertext`, `provider_keys.iv`, `provider_keys.auth_tag`, `organizations.wrapped_dek`, `organizations.dek_iv`, and `organizations.dek_auth_tag` all throw SQLSTATE `42501`.
+   - Denied `INSERT` / `UPDATE` on `virtual_keys` and direct execution of privileged auth functions.
+
+3. **Redis ACL Identity (`switchyard_worker`):**
+   - Enforces a restricted Redis identity `switchyard_worker` configured with `-@all +ping +info +acl|whoami`.
+   - Prohibited from destructive, operational, and data commands (`FLUSHALL`, `FLUSHDB`, `CONFIG`, `KEYS`, `DEBUG`, `SHUTDOWN`, `REPLICAOF`, `ACL LIST`).
+   - Startup fails closed if connected as the unrestricted `default` user or if prohibited commands are permitted.
+
+4. **Credential Isolation:**
+   - Worker configuration validator (`workerConfigSchema`) rejects all vault key variables (`MASTER_KEK_*`, `ACTIVE_KEK_VERSION`).
+   - Security bypass flags (`BYPASS_RLS`, etc.) are unconditionally rejected.
+
+### 17.2 Web Frontend Runtime Security Boundary
+
+1. **Unprivileged Container Runtime:**
+   - Runs as unprivileged `USER node` in a hardened multi-stage container (`docker/web/Dockerfile`).
+   - Explicitly disables `x-powered-by` header.
+   - Bound strictly to host loopback (`127.0.0.1:${WEB_PORT:-3001}:3001`), never wildcard `0.0.0.0`.
+
+2. **No Data-Plane or Secret Exposure:**
+   - Web container possesses zero database credentials (`POSTGRES_*`), zero Redis credentials (`REDIS_*`), and zero vault keys (`MASTER_KEK_*`).
+   - Does not connect directly to PostgreSQL or Redis.
+   - Health endpoint `/health/ready` reports static machine-readable readiness without fabricating unauthenticated dependencies.

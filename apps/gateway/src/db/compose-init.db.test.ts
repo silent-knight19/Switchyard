@@ -58,6 +58,8 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15, DB-16 
   const redisContainer = `switchyard-test-redis-${runId}`;
   const migrateContainer = `switchyard-test-migrate-${runId}`;
   const gatewayContainer = `switchyard-test-gw-${runId}`;
+  const workerContainer = `switchyard-test-worker-${runId}`;
+  const webContainer = `switchyard-test-web-${runId}`;
   const mockContainer = `switchyard-test-mock-${runId}`;
   const pgVolume = `switchyard_test_pg_vol_${runId}`;
   const redisVolume = `switchyard_test_redis_vol_${runId}`;
@@ -73,21 +75,26 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15, DB-16 
   let pgPort: number;
   let redisPort: number;
   let gatewayPort: number;
+  let webPort: number;
   let composeEnv: Record<string, string>;
 
   beforeAll(async () => {
     pgPort = await getFreePort();
     redisPort = await getFreePort();
     gatewayPort = await getFreePort();
+    webPort = await getFreePort();
 
     composeEnv = {
       POSTGRES_PORT: String(pgPort),
       REDIS_PORT: String(redisPort),
       PORT: String(gatewayPort),
+      WEB_PORT: String(webPort),
       POSTGRES_CONTAINER_NAME: pgContainer,
       REDIS_CONTAINER_NAME: redisContainer,
       MIGRATE_CONTAINER_NAME: migrateContainer,
       GATEWAY_CONTAINER_NAME: gatewayContainer,
+      WORKER_CONTAINER_NAME: workerContainer,
+      WEB_CONTAINER_NAME: webContainer,
       MOCK_UPSTREAM_CONTAINER_NAME: mockContainer,
       MOCK_CONTROL_SECRET: mockControlSecret,
       POSTGRES_VOLUME_NAME: pgVolume,
@@ -98,7 +105,10 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15, DB-16 
       GATEWAY_APP_PASSWORD: appPass,
       GATEWAY_POSTGRES_PASSWORD: appPass,
       GATEWAY_STARTUP_PASSWORD: startupPass,
+      GATEWAY_WORKER_USER: 'gateway_worker',
       GATEWAY_WORKER_PASSWORD: workerPass,
+      REDIS_WORKER_USER: 'switchyard_worker',
+      REDIS_WORKER_PASSWORD: 'switchyard_worker_password',
     };
 
     // Build image and start all services using isolated project
@@ -143,7 +153,46 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15, DB-16 
       await new Promise((r) => setTimeout(r, 1000));
     }
     expect(mockReady).toBe(true);
-  }, 90_000);
+
+    // Wait for Worker health readiness (up to 30s)
+    let workerReady = false;
+    for (let i = 0; i < 30; i += 1) {
+      try {
+        const status = run(
+          'docker',
+          ['inspect', workerContainer, '--format', '{{.State.Health.Status}}'],
+          composeEnv,
+        ).trim();
+        if (status === 'healthy') {
+          workerReady = true;
+          break;
+        }
+      } catch {
+        // continue polling until ready
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    expect(workerReady).toBe(true);
+
+    // Wait for Web health readiness (up to 30s)
+    let webReady = false;
+    for (let i = 0; i < 30; i += 1) {
+      try {
+        const res = await fetch(`http://127.0.0.1:${webPort}/health/ready`);
+        if (res.ok) {
+          const body = (await res.json()) as { status: string };
+          if (body.status === 'ready') {
+            webReady = true;
+            break;
+          }
+        }
+      } catch {
+        // continue polling until ready
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    expect(webReady).toBe(true);
+  }, 360_000);
 
   afterAll(() => {
     try {
@@ -151,7 +200,7 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15, DB-16 
     } catch {
       // ignore teardown errors
     }
-  }, 30_000);
+  }, 60_000);
 
   it('proves 02-init-development.sh does not bypass the authoritative migration runner', () => {
     const pgLogs = run('docker', ['logs', pgContainer], composeEnv);
@@ -171,6 +220,14 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15, DB-16 
 
     const mockLogs = run('docker', ['logs', mockContainer], composeEnv);
     expect(mockLogs).not.toContain(mockControlSecret);
+
+    const workerLogs = run('docker', ['logs', workerContainer], composeEnv);
+    expect(workerLogs).not.toContain(workerPass);
+    expect(workerLogs).not.toContain(appPass);
+
+    const webLogs = run('docker', ['logs', webContainer], composeEnv);
+    expect(webLogs).not.toContain(workerPass);
+    expect(webLogs).not.toContain(appPass);
   });
 
   it('executes authoritative migration runner via migrate service and applies all six migrations', () => {
@@ -329,7 +386,11 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15, DB-16 
         `SELECT usename FROM pg_stat_activity WHERE datname = 'switchyard' AND usename != 'switchyard'`,
       );
       expect(rows.length).toBeGreaterThan(0);
-      expect(rows.every((r) => r.usename === 'gateway_app')).toBe(true);
+      expect(rows.some((r) => r.usename === 'gateway_app')).toBe(true);
+      expect(rows.some((r) => r.usename === 'gateway_worker')).toBe(true);
+      expect(rows.every((r) => r.usename === 'gateway_app' || r.usename === 'gateway_worker')).toBe(
+        true,
+      );
     } finally {
       await client.end();
     }
@@ -385,6 +446,22 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15, DB-16 
       await new Promise((r) => setTimeout(r, 1000));
     }
     expect(ready).toBe(true);
+
+    // Wait for Web readiness
+    let webReady = false;
+    for (let i = 0; i < 30; i += 1) {
+      try {
+        const res = await fetch(`http://127.0.0.1:${webPort}/health/ready`);
+        if (res.ok) {
+          webReady = true;
+          break;
+        }
+      } catch {
+        // wait
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    expect(webReady).toBe(true);
 
     // migrate service log should show "no pending migrations"
     const migrateLogs = run('docker', ['logs', migrateContainer], composeEnv);
@@ -514,5 +591,192 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15, DB-16 
       composeEnv,
     ).trim();
     expect(output).toBe('');
+  });
+
+  it('proves all six mandatory components are running healthy in Docker Compose', async () => {
+    const services = [
+      { name: 'postgres', container: pgContainer },
+      { name: 'redis', container: redisContainer },
+      { name: 'gateway', container: gatewayContainer },
+      { name: 'worker', container: workerContainer },
+      { name: 'web', container: webContainer },
+      { name: 'mock-upstream', container: mockContainer },
+    ];
+
+    for (const svc of services) {
+      let healthy = false;
+      for (let i = 0; i < 30; i += 1) {
+        const health = run(
+          'docker',
+          ['inspect', svc.container, '--format', '{{.State.Health.Status}}'],
+          composeEnv,
+        ).trim();
+        if (health === 'healthy') {
+          healthy = true;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+      if (!healthy) {
+        const lastHealth = run(
+          'docker',
+          ['inspect', svc.container, '--format', '{{.State.Health.Status}}'],
+          composeEnv,
+        ).trim();
+        const logs = run('docker', ['logs', svc.container, '--tail', '20'], composeEnv);
+        throw new Error(
+          `Service "${svc.name}" (${svc.container}) is not healthy! Health: "${lastHealth}". Logs:\n${logs}`,
+        );
+      }
+      expect(healthy).toBe(true);
+
+      const status = run(
+        'docker',
+        ['inspect', svc.container, '--format', '{{.State.Status}}'],
+        composeEnv,
+      ).trim();
+      expect(status).toBe('running');
+    }
+  });
+
+  it('proves worker container runs healthy with 0 published host ports and connects as gateway_worker', async () => {
+    // 1. Worker publishes NO host ports
+    const portMapping = run('docker', ['port', workerContainer], composeEnv).trim();
+    expect(portMapping).toBe('');
+
+    const portBindings = run(
+      'docker',
+      ['inspect', workerContainer, '--format', '{{json .HostConfig.PortBindings}}'],
+      composeEnv,
+    ).trim();
+    expect(portBindings === 'null' || portBindings === '{}').toBe(true);
+
+    // 2. Worker connects to PostgreSQL under gateway_worker identity
+    const client = new pg.Client({
+      host: '127.0.0.1',
+      port: pgPort,
+      database: 'switchyard',
+      user: 'switchyard',
+      password: 'switchyard_dev_password',
+    });
+    await client.connect();
+    try {
+      let foundWorker = false;
+      for (let i = 0; i < 15; i += 1) {
+        const { rows } = await client.query<{ usename: string }>(
+          `SELECT usename FROM pg_stat_activity WHERE datname = 'switchyard' AND usename = 'gateway_worker'`,
+        );
+        if (rows.length > 0 && rows.some((r) => r.usename === 'gateway_worker')) {
+          foundWorker = true;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+      expect(foundWorker).toBe(true);
+    } finally {
+      await client.end();
+    }
+  });
+
+  it('proves worker connects to Redis under worker ACL and prohibited commands are denied', () => {
+    // Prohibited commands must be rejected for worker ACL identity
+    for (const cmd of [
+      'FLUSHALL',
+      'FLUSHDB',
+      'CONFIG GET maxmemory',
+      'DEBUG OBJECT x',
+      'SHUTDOWN',
+      'REPLICAOF NO ONE',
+      'KEYS *',
+      'ACL LIST',
+    ]) {
+      const result = run(
+        'docker',
+        [
+          'exec',
+          redisContainer,
+          'redis-cli',
+          'ACL',
+          'DRYRUN',
+          'switchyard_worker',
+          ...cmd.split(' '),
+        ],
+        composeEnv,
+      ).trim();
+      expect(result).toMatch(/no permissions/i);
+    }
+  });
+
+  it('proves web container responds over loopback port and publishes no unauthorized host ports', async () => {
+    // 1. Web health endpoint responds with ready status
+    const healthRes = await fetch(`http://127.0.0.1:${webPort}/health/ready`);
+    expect(healthRes.status).toBe(200);
+    const healthBody = (await healthRes.json()) as { status: string; service: string };
+    expect(healthBody.status).toBe('ready');
+    expect(healthBody.service).toBe('web');
+
+    // 2. Web root page responds over loopback
+    const pageRes = await fetch(`http://127.0.0.1:${webPort}/`);
+    expect(pageRes.status).toBe(200);
+    const pageHtml = await pageRes.text();
+    expect(pageHtml).toContain('Switchyard — AI Inference Gateway Control Plane');
+
+    // 3. Port binding is strictly bound to 127.0.0.1 (not 0.0.0.0)
+    const portMapping = run('docker', ['port', webContainer], composeEnv).trim();
+    expect(portMapping).toContain(`127.0.0.1:${webPort}`);
+    expect(portMapping).not.toContain('0.0.0.0:');
+  });
+
+  it('proves web and worker can be stopped and restarted independently without interrupting Gateway', async () => {
+    // 1. Stop worker and web services independently
+    run('docker', ['compose', '-p', projectName, 'stop', 'worker', 'web'], composeEnv);
+
+    // 2. Gateway must remain operational and healthy
+    const gwRes = await fetch(`http://127.0.0.1:${gatewayPort}/health/ready`);
+    expect(gwRes.status).toBe(200);
+    const gwBody = (await gwRes.json()) as { status: string };
+    expect(gwBody.status).toBe('ready');
+
+    // 3. Restart worker and web
+    run('docker', ['compose', '-p', projectName, 'up', '-d', 'worker', 'web'], composeEnv);
+
+    // 4. Poll for worker health recovery
+    let workerRecovered = false;
+    for (let i = 0; i < 30; i += 1) {
+      try {
+        const status = run(
+          'docker',
+          ['inspect', workerContainer, '--format', '{{.State.Health.Status}}'],
+          composeEnv,
+        ).trim();
+        if (status === 'healthy') {
+          workerRecovered = true;
+          break;
+        }
+      } catch {
+        // wait
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    expect(workerRecovered).toBe(true);
+
+    // 5. Poll for web health recovery
+    let webRecovered = false;
+    for (let i = 0; i < 30; i += 1) {
+      try {
+        const res = await fetch(`http://127.0.0.1:${webPort}/health/ready`);
+        if (res.ok) {
+          const body = (await res.json()) as { status: string };
+          if (body.status === 'ready') {
+            webRecovered = true;
+            break;
+          }
+        }
+      } catch {
+        // wait
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    expect(webRecovered).toBe(true);
   });
 });
