@@ -168,6 +168,7 @@ export async function executeEdgeCase(
     }
 
     case 'oversized_line': {
+      // Intentionally oversized single line exceeding line threshold (65,536 bytes > 32KB limit)
       const padding = 'a'.repeat(65536);
       write(`data: {"id":"oversized-line","choices":[{"delta":{"content":"${padding}"}}]}\n\n`);
       write('data: [DONE]\n\n');
@@ -175,8 +176,15 @@ export async function executeEdgeCase(
     }
 
     case 'oversized_event': {
-      const padding = 'b'.repeat(131072);
-      write(`data: {"id":"oversized-event","choices":[{"delta":{"content":"${padding}"}}]}\n\n`);
+      // Intentionally oversized event composed of 32 individually bounded lines (each 4KB = 4,096 bytes).
+      // Each line is well below the 32KB line threshold.
+      // Aggregate event payload is 32 * 4,096 = 131,072 bytes (128KB), exceeding the 64KB event threshold.
+      const lineCount = 32;
+      const linePadding = 'b'.repeat(4096);
+      for (let i = 0; i < lineCount; i++) {
+        write(`data: {"line":${i},"chunk":"${linePadding}"}\n`);
+      }
+      write('\n'); // Single blank line terminates the multi-line event
       write('data: [DONE]\n\n');
       break;
     }

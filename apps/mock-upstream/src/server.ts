@@ -1,3 +1,5 @@
+import crypto from 'node:crypto';
+import events from 'node:events';
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import type { Socket } from 'node:net';
 import { parseMockConfig } from './config.js';
@@ -17,9 +19,12 @@ export interface MockServerOptions {
   host?: string;
   defaultFixture?: string;
   allowHeaderSelection?: boolean;
+  controlSecret?: string;
 }
 
 const MAX_OBSERVATIONS = 100;
+const SUPPORTED_MODELS = new Set(['mock-chat-v1']);
+const VALID_ROLES = new Set(['system', 'user', 'assistant']);
 
 export class MockServer {
   private readonly server: http.Server;
@@ -27,6 +32,7 @@ export class MockServer {
   private readonly activeSockets = new Set<Socket>();
   private readonly observations: AbortObservation[] = [];
   private readonly shutdownController = new AbortController();
+  private readonly controlSecret: string;
   private activeFixtureOverride: string | null = null;
   private defaultFixture: string;
   private readonly allowHeaderSelection: boolean;
@@ -46,6 +52,9 @@ export class MockServer {
     this.allowHeaderSelection = options.allowHeaderSelection ?? true;
     this.host = options.host ?? this.config.host;
     this.port = options.port ?? this.config.port;
+    this.controlSecret =
+      options.controlSecret ??
+      (this.config.controlSecret || crypto.randomBytes(32).toString('hex'));
 
     this.server = http.createServer((req, res) => {
       this.handleRequest(req, res).catch(() => {
@@ -120,6 +129,14 @@ export class MockServer {
     return `http://${this.host}:${this.port}`;
   }
 
+  public getControlSecret(): string {
+    return this.controlSecret;
+  }
+
+  public getShutdownListenerCount(): number {
+    return events.getEventListeners(this.shutdownController.signal, 'abort').length;
+  }
+
   public setActiveFixture(fixtureId: string | null): void {
     if (fixtureId !== null && !hasFixture(fixtureId)) {
       throw new Error(`Unknown fixture ID: ${fixtureId}`);
@@ -140,6 +157,29 @@ export class MockServer {
 
   public clearObservations(): void {
     this.observations.length = 0;
+  }
+
+  private isAuthorized(req: IncomingMessage): boolean {
+    const authHeader = req.headers['authorization'];
+    const controlKeyHeader = req.headers['x-test-control-key'];
+
+    let providedKey = '';
+    if (typeof controlKeyHeader === 'string') {
+      providedKey = controlKeyHeader.trim();
+    } else if (typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
+      providedKey = authHeader.slice(7).trim();
+    }
+
+    if (!providedKey || !this.controlSecret) {
+      return false;
+    }
+
+    const providedBuf = Buffer.from(providedKey, 'utf8');
+    const expectedBuf = Buffer.from(this.controlSecret, 'utf8');
+    if (providedBuf.length !== expectedBuf.length) {
+      return false;
+    }
+    return crypto.timingSafeEqual(providedBuf, expectedBuf);
   }
 
   private recordObservation(observation: AbortObservation): void {
@@ -228,6 +268,22 @@ export class MockServer {
     req: IncomingMessage,
     res: ServerResponse,
   ): Promise<void> {
+    if (!this.isAuthorized(req)) {
+      res.statusCode = 401;
+      res.setHeader('Content-Type', 'application/json');
+      res.end(
+        JSON.stringify({
+          error: {
+            message: 'Unauthorized test control request: valid test control key required.',
+            type: 'authentication_error',
+            param: null,
+            code: 'unauthorized',
+          },
+        }),
+      );
+      return;
+    }
+
     if (url === '/__test/abort-observations' && method === 'GET') {
       res.statusCode = 200;
       res.setHeader('Content-Type', 'application/json');
@@ -291,28 +347,76 @@ export class MockServer {
     const requestId = `obs-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
     const abortController = new AbortController();
 
+    const onShutdownAbort = (): void => {
+      abortController.abort();
+    };
+
     if (this.shutdownController.signal.aborted) {
       abortController.abort();
     } else {
-      this.shutdownController.signal.addEventListener('abort', () => abortController.abort(), {
+      this.shutdownController.signal.addEventListener('abort', onShutdownAbort, {
         once: true,
       });
     }
 
-    let rawBody = '';
+    let clientAborted = false;
+    let bytesWritten = 0;
+
+    const onClientClose = (): void => {
+      if (!res.writableEnded) {
+        clientAborted = true;
+        abortController.abort();
+      }
+    };
+
     try {
-      rawBody = await this.readRequestBody(req);
-    } catch (err: unknown) {
-      if (err instanceof Error && err.message === 'PAYLOAD_TOO_LARGE') {
-        res.statusCode = 413;
+      let rawBody = '';
+      try {
+        rawBody = await this.readRequestBody(req);
+      } catch (err: unknown) {
+        if (err instanceof Error && err.message === 'PAYLOAD_TOO_LARGE') {
+          res.statusCode = 413;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(
+            JSON.stringify({
+              error: {
+                message: 'Request body exceeds maximum allowed size.',
+                type: 'invalid_request_error',
+                param: null,
+                code: 'payload_too_large',
+              },
+            }),
+          );
+          this.recordObservation({
+            id: requestId,
+            fixtureId: 'none',
+            model: 'unknown',
+            stream: false,
+            outcome: 'rejected',
+            headersSent: res.headersSent,
+            bytesWritten: 0,
+            durationMs: Date.now() - startTime,
+            recordedAt: startTime,
+            error: 'PAYLOAD_TOO_LARGE',
+          });
+          return;
+        }
+        throw err;
+      }
+
+      let parsedBody: unknown;
+      try {
+        parsedBody = JSON.parse(rawBody);
+      } catch {
+        res.statusCode = 400;
         res.setHeader('Content-Type', 'application/json');
         res.end(
           JSON.stringify({
             error: {
-              message: 'Request body exceeds maximum allowed size.',
+              message: 'Invalid JSON in request body.',
               type: 'invalid_request_error',
               param: null,
-              code: 'payload_too_large',
+              code: 'invalid_json',
             },
           }),
         );
@@ -326,235 +430,291 @@ export class MockServer {
           bytesWritten: 0,
           durationMs: Date.now() - startTime,
           recordedAt: startTime,
-          error: 'PAYLOAD_TOO_LARGE',
+          error: 'INVALID_JSON',
         });
         return;
       }
-      throw err;
-    }
 
-    let parsedBody: Record<string, unknown>;
-    try {
-      parsedBody = JSON.parse(rawBody);
-    } catch {
-      res.statusCode = 400;
-      res.setHeader('Content-Type', 'application/json');
-      res.end(
-        JSON.stringify({
-          error: {
-            message: 'Invalid JSON in request body.',
-            type: 'invalid_request_error',
-            param: null,
-            code: 'invalid_json',
-          },
-        }),
-      );
-      this.recordObservation({
-        id: requestId,
-        fixtureId: 'none',
-        model: 'unknown',
-        stream: false,
-        outcome: 'rejected',
-        headersSent: res.headersSent,
-        bytesWritten: 0,
-        durationMs: Date.now() - startTime,
-        recordedAt: startTime,
-        error: 'INVALID_JSON',
-      });
-      return;
-    }
-
-    // Validate request structure
-    const model = typeof parsedBody.model === 'string' ? parsedBody.model : '';
-    if (!model || (!model.startsWith('mock-') && model !== 'gpt-4o' && model !== 'gpt-3.5-turbo')) {
-      res.statusCode = 400;
-      res.setHeader('Content-Type', 'application/json');
-      res.end(
-        JSON.stringify({
-          error: {
-            message: `The model '${model}' does not exist or is not supported by mock upstream.`,
-            type: 'invalid_request_error',
-            param: 'model',
-            code: 'model_not_found',
-          },
-        }),
-      );
-      this.recordObservation({
-        id: requestId,
-        fixtureId: 'none',
-        model,
-        stream: false,
-        outcome: 'rejected',
-        headersSent: res.headersSent,
-        bytesWritten: 0,
-        durationMs: Date.now() - startTime,
-        recordedAt: startTime,
-        error: 'MODEL_NOT_FOUND',
-      });
-      return;
-    }
-
-    const messages = parsedBody.messages;
-    if (!Array.isArray(messages) || messages.length === 0) {
-      res.statusCode = 400;
-      res.setHeader('Content-Type', 'application/json');
-      res.end(
-        JSON.stringify({
-          error: {
-            message: "Missing or empty required parameter: 'messages'.",
-            type: 'invalid_request_error',
-            param: 'messages',
-            code: 'missing_parameter',
-          },
-        }),
-      );
-      this.recordObservation({
-        id: requestId,
-        fixtureId: 'none',
-        model,
-        stream: false,
-        outcome: 'rejected',
-        headersSent: res.headersSent,
-        bytesWritten: 0,
-        durationMs: Date.now() - startTime,
-        recordedAt: startTime,
-        error: 'MISSING_MESSAGES',
-      });
-      return;
-    }
-
-    const stream = parsedBody.stream === true;
-
-    // Resolve fixture ID
-    let fixtureId: string | undefined;
-
-    // 1. Header selection (if enabled)
-    const headerFixture = req.headers['x-test-fixture-id'];
-    if (
-      this.allowHeaderSelection &&
-      typeof headerFixture === 'string' &&
-      headerFixture.length > 0
-    ) {
-      if (!hasFixture(headerFixture)) {
+      // Validate request object structure (reject null, primitives, arrays)
+      if (typeof parsedBody !== 'object' || parsedBody === null || Array.isArray(parsedBody)) {
         res.statusCode = 400;
         res.setHeader('Content-Type', 'application/json');
         res.end(
           JSON.stringify({
             error: {
-              message: `Unknown fixture ID: ${headerFixture}`,
+              message: 'Invalid request body: expected a JSON object.',
               type: 'invalid_request_error',
-              param: 'x-test-fixture-id',
-              code: 'fixture_not_found',
+              param: null,
+              code: 'invalid_payload',
             },
           }),
         );
         this.recordObservation({
           id: requestId,
-          fixtureId: headerFixture,
-          model,
-          stream,
+          fixtureId: 'none',
+          model: 'unknown',
+          stream: false,
           outcome: 'rejected',
           headersSent: res.headersSent,
           bytesWritten: 0,
           durationMs: Date.now() - startTime,
           recordedAt: startTime,
-          error: 'FIXTURE_NOT_FOUND',
+          error: 'INVALID_PAYLOAD',
         });
         return;
       }
-      fixtureId = headerFixture;
-    }
 
-    // 2. Active fixture override
-    if (!fixtureId && this.activeFixtureOverride) {
-      fixtureId = this.activeFixtureOverride;
-    }
+      const bodyObj = parsedBody as Record<string, unknown>;
 
-    // 3. Fallback to default fixture or stream/json default
-    if (!fixtureId) {
-      if (stream && !this.defaultFixture.startsWith('sse.')) {
-        fixtureId = 'sse.basic';
-      } else if (!stream && this.defaultFixture.startsWith('sse.')) {
-        fixtureId = 'json.basic';
-      } else {
-        fixtureId = this.defaultFixture;
+      // Validate model against approved allowlist (do not reflect untrusted inputs)
+      const modelVal = bodyObj.model;
+      if (typeof modelVal !== 'string' || !SUPPORTED_MODELS.has(modelVal)) {
+        res.statusCode = 400;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(
+          JSON.stringify({
+            error: {
+              message: 'The requested model is not supported by mock upstream.',
+              type: 'invalid_request_error',
+              param: 'model',
+              code: 'model_not_found',
+            },
+          }),
+        );
+        this.recordObservation({
+          id: requestId,
+          fixtureId: 'none',
+          model: 'unknown',
+          stream: false,
+          outcome: 'rejected',
+          headersSent: res.headersSent,
+          bytesWritten: 0,
+          durationMs: Date.now() - startTime,
+          recordedAt: startTime,
+          error: 'MODEL_NOT_FOUND',
+        });
+        return;
       }
-    }
+      const model = modelVal;
 
-    const fixture = getFixture(fixtureId);
-    if (!fixture) {
-      res.statusCode = 500;
-      res.setHeader('Content-Type', 'application/json');
-      res.end(
-        JSON.stringify({
-          error: {
-            message: `Resolved fixture not found in registry: ${fixtureId}`,
-            type: 'server_error',
-            param: null,
-            code: 'fixture_resolution_error',
-          },
-        }),
-      );
-      return;
-    }
-
-    // Handle client disconnect / abort
-    let clientAborted = false;
-    let bytesWritten = 0;
-
-    const onClientClose = (): void => {
-      if (!res.writableEnded) {
-        clientAborted = true;
-        abortController.abort();
+      // Validate messages array and its items
+      const messages = bodyObj.messages;
+      if (!Array.isArray(messages) || messages.length === 0) {
+        res.statusCode = 400;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(
+          JSON.stringify({
+            error: {
+              message: "Missing or empty required parameter: 'messages'.",
+              type: 'invalid_request_error',
+              param: 'messages',
+              code: 'missing_parameter',
+            },
+          }),
+        );
+        this.recordObservation({
+          id: requestId,
+          fixtureId: 'none',
+          model,
+          stream: false,
+          outcome: 'rejected',
+          headersSent: res.headersSent,
+          bytesWritten: 0,
+          durationMs: Date.now() - startTime,
+          recordedAt: startTime,
+          error: 'MISSING_MESSAGES',
+        });
+        return;
       }
-    };
-    req.on('close', onClientClose);
-    res.on('close', onClientClose);
 
-    try {
-      await this.executeFixture(res, fixture, abortController.signal, (bytes) => {
-        bytesWritten = bytes;
-      });
+      for (const msg of messages) {
+        if (
+          typeof msg !== 'object' ||
+          msg === null ||
+          Array.isArray(msg) ||
+          typeof msg.role !== 'string' ||
+          !VALID_ROLES.has(msg.role) ||
+          typeof msg.content !== 'string'
+        ) {
+          res.statusCode = 400;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(
+            JSON.stringify({
+              error: {
+                message:
+                  "Invalid message in 'messages' list: expected object with valid role and content string.",
+                type: 'invalid_request_error',
+                param: 'messages',
+                code: 'invalid_parameter',
+              },
+            }),
+          );
+          this.recordObservation({
+            id: requestId,
+            fixtureId: 'none',
+            model,
+            stream: false,
+            outcome: 'rejected',
+            headersSent: res.headersSent,
+            bytesWritten: 0,
+            durationMs: Date.now() - startTime,
+            recordedAt: startTime,
+            error: 'INVALID_MESSAGE_OBJECT',
+          });
+          return;
+        }
+      }
 
-      if (clientAborted || abortController.signal.aborted) {
+      const stream = bodyObj.stream === true;
+
+      // Resolve fixture ID
+      let fixtureId: string | undefined;
+
+      // 1. Header selection (requires valid authorization)
+      const headerFixture = req.headers['x-test-fixture-id'];
+      if (typeof headerFixture === 'string' && headerFixture.length > 0) {
+        if (!this.allowHeaderSelection || !this.isAuthorized(req)) {
+          res.statusCode = 401;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(
+            JSON.stringify({
+              error: {
+                message: 'Unauthorized fixture selection: valid test control key required.',
+                type: 'authentication_error',
+                param: 'x-test-fixture-id',
+                code: 'unauthorized',
+              },
+            }),
+          );
+          this.recordObservation({
+            id: requestId,
+            fixtureId: 'none',
+            model,
+            stream,
+            outcome: 'rejected',
+            headersSent: res.headersSent,
+            bytesWritten: 0,
+            durationMs: Date.now() - startTime,
+            recordedAt: startTime,
+            error: 'UNAUTHORIZED_FIXTURE_SELECTION',
+          });
+          return;
+        }
+
+        if (!hasFixture(headerFixture)) {
+          res.statusCode = 400;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(
+            JSON.stringify({
+              error: {
+                message: `Unknown fixture ID: ${headerFixture}`,
+                type: 'invalid_request_error',
+                param: 'x-test-fixture-id',
+                code: 'fixture_not_found',
+              },
+            }),
+          );
+          this.recordObservation({
+            id: requestId,
+            fixtureId: headerFixture,
+            model,
+            stream,
+            outcome: 'rejected',
+            headersSent: res.headersSent,
+            bytesWritten: 0,
+            durationMs: Date.now() - startTime,
+            recordedAt: startTime,
+            error: 'FIXTURE_NOT_FOUND',
+          });
+          return;
+        }
+        fixtureId = headerFixture;
+      }
+
+      // 2. Active fixture override (set by authorized test control)
+      if (!fixtureId && this.activeFixtureOverride) {
+        fixtureId = this.activeFixtureOverride;
+      }
+
+      // 3. Fallback to default fixture or stream/json default
+      if (!fixtureId) {
+        if (stream && !this.defaultFixture.startsWith('sse.')) {
+          fixtureId = 'sse.basic';
+        } else if (!stream && this.defaultFixture.startsWith('sse.')) {
+          fixtureId = 'json.basic';
+        } else {
+          fixtureId = this.defaultFixture;
+        }
+      }
+
+      const fixture = getFixture(fixtureId);
+      if (!fixture) {
+        res.statusCode = 500;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(
+          JSON.stringify({
+            error: {
+              message: `Resolved fixture not found in registry: ${fixtureId}`,
+              type: 'server_error',
+              param: null,
+              code: 'fixture_resolution_error',
+            },
+          }),
+        );
+        return;
+      }
+
+      res.on('close', onClientClose);
+
+      try {
+        await this.executeFixture(res, fixture, abortController.signal, (bytes) => {
+          bytesWritten = bytes;
+        });
+
+        if (clientAborted || abortController.signal.aborted) {
+          this.recordObservation({
+            id: requestId,
+            fixtureId,
+            model,
+            stream,
+            outcome: 'client_abort',
+            headersSent: res.headersSent,
+            bytesWritten,
+            durationMs: Date.now() - startTime,
+            recordedAt: startTime,
+          });
+        } else {
+          this.recordObservation({
+            id: requestId,
+            fixtureId,
+            model,
+            stream,
+            outcome: 'completed',
+            headersSent: res.headersSent,
+            bytesWritten,
+            durationMs: Date.now() - startTime,
+            recordedAt: startTime,
+          });
+        }
+      } catch (err: unknown) {
+        const isAbort = clientAborted || abortController.signal.aborted;
         this.recordObservation({
           id: requestId,
           fixtureId,
           model,
           stream,
-          outcome: 'client_abort',
+          outcome: isAbort ? 'client_abort' : 'server_fault',
           headersSent: res.headersSent,
           bytesWritten,
           durationMs: Date.now() - startTime,
           recordedAt: startTime,
+          error: err instanceof Error ? err.message : String(err),
         });
-      } else {
-        this.recordObservation({
-          id: requestId,
-          fixtureId,
-          model,
-          stream,
-          outcome: 'completed',
-          headersSent: res.headersSent,
-          bytesWritten,
-          durationMs: Date.now() - startTime,
-          recordedAt: startTime,
-        });
+      } finally {
+        res.removeListener('close', onClientClose);
       }
-    } catch (err: unknown) {
-      const isAbort = clientAborted || abortController.signal.aborted;
-      this.recordObservation({
-        id: requestId,
-        fixtureId,
-        model,
-        stream,
-        outcome: isAbort ? 'client_abort' : 'server_fault',
-        headersSent: res.headersSent,
-        bytesWritten,
-        durationMs: Date.now() - startTime,
-        recordedAt: startTime,
-        error: err instanceof Error ? err.message : String(err),
-      });
+    } finally {
+      this.shutdownController.signal.removeEventListener('abort', onShutdownAbort);
     }
   }
 

@@ -126,7 +126,7 @@ describe('SW-1.8.1: Deterministic Chat-Completions JSON and SSE Fixtures (Stage 
     });
   });
 
-  describe('2. Streaming SSE fixtures', () => {
+  describe('2. Streaming SSE fixtures and timing verification', () => {
     it('2.1 streaming request returns 200 with text/event-stream headers', async () => {
       const res = await harness.postChatCompletions({
         model: 'mock-chat-v1',
@@ -218,7 +218,7 @@ describe('SW-1.8.1: Deterministic Chat-Completions JSON and SSE Fixtures (Stage 
       expect(reconstructed).toBe('Chunk 1 Chunk 2 Chunk 3 Chunk 4 Chunk 5');
     });
 
-    it('2.5 TTFT delay is exercised before first token', async () => {
+    it('2.5 TTFT delay is measured at first observable content token', async () => {
       const start = Date.now();
       const res = await harness.postChatCompletions(
         {
@@ -229,16 +229,34 @@ describe('SW-1.8.1: Deterministic Chat-Completions JSON and SSE Fixtures (Stage 
         { 'x-test-fixture-id': 'sse.delayed-ttft' },
       );
 
-      const text = await res.text();
-      const elapsed = Date.now() - start;
+      expect(res.status).toBe(200);
+      const reader = res.body?.getReader();
+      expect(reader).toBeDefined();
 
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let firstContentTokenTime = 0;
+
+      if (reader) {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          if (!firstContentTokenTime && buffer.includes('Delayed')) {
+            firstContentTokenTime = Date.now();
+          }
+        }
+      }
+
+      // Assert TTFT was measured at first content token
+      expect(firstContentTokenTime).toBeGreaterThan(0);
+      const ttftElapsed = firstContentTokenTime - start;
       // Fixture has ttftMs = 30
-      expect(elapsed).toBeGreaterThanOrEqual(25);
-      expect(text).toContain('Delayed');
-      expect(text).toContain('data: [DONE]');
+      expect(ttftElapsed).toBeGreaterThanOrEqual(25);
+      expect(buffer).toContain('data: [DONE]');
     });
 
-    it('2.6 inter-chunk delay is exercised between chunks', async () => {
+    it('2.6 inter-chunk delay is exercised between content chunks', async () => {
       const start = Date.now();
       const res = await harness.postChatCompletions(
         {
@@ -259,7 +277,7 @@ describe('SW-1.8.1: Deterministic Chat-Completions JSON and SSE Fixtures (Stage 
     });
   });
 
-  describe('3. Validation, limits and security', () => {
+  describe('3. Validation, security, and access control', () => {
     it('3.1 rejects malformed JSON with 400 invalid_json', async () => {
       const res = await harness.postChatCompletions('{ invalid json');
       expect(res.status).toBe(400);
@@ -286,11 +304,13 @@ describe('SW-1.8.1: Deterministic Chat-Completions JSON and SSE Fixtures (Stage 
       });
       expect(res.status).toBe(400);
 
-      const data = (await res.json()) as { error: { code: string } };
+      const data = (await res.json()) as { error: { code: string; message: string } };
       expect(data.error.code).toBe('model_not_found');
+      // Must not reflect untrusted input
+      expect(data.error.message).not.toContain('unsupported-model-x');
     });
 
-    it('3.4 rejects unknown fixture ID header with 400 fixture_not_found', async () => {
+    it('3.4 rejects unknown fixture ID header with 400 fixture_not_found when authorized', async () => {
       const res = await harness.postChatCompletions(
         {
           model: 'mock-chat-v1',
@@ -316,35 +336,37 @@ describe('SW-1.8.1: Deterministic Chat-Completions JSON and SSE Fixtures (Stage 
       expect(data.error.code).toBe('payload_too_large');
     });
 
-    it('3.6 client abort stops pending stream and records observation', async () => {
+    it('3.6 client abort stops pending stream and records observation via event polling', async () => {
       await harness.reset();
       const controller = new AbortController();
 
-      // Initiate request with delayed TTFT and abort before headers are sent
-      const fetchPromise = harness.postChatCompletions(
-        {
-          model: 'mock-chat-v1',
-          messages: [{ role: 'user', content: 'Abort test' }],
-          stream: true,
-        },
-        { 'x-test-fixture-id': 'sse.delayed-ttft' },
-        controller.signal,
-      );
+      try {
+        const fetchPromise = harness.postChatCompletions(
+          {
+            model: 'mock-chat-v1',
+            messages: [{ role: 'user', content: 'Abort test' }],
+            stream: true,
+          },
+          { 'x-test-fixture-id': 'sse.delayed-ttft' },
+          controller.signal,
+        );
 
-      // Abort after 5ms (well before ttftMs = 30ms)
-      setTimeout(() => {
+        // Abort after 5ms (well before ttftMs = 30ms)
+        setTimeout(() => {
+          controller.abort();
+        }, 5);
+
+        await expect(fetchPromise).rejects.toThrow();
+
+        // Deterministic observation polling (MOCK-05)
+        const observations = await harness.waitForObservations(
+          (obs) => obs.length >= 1 && obs[obs.length - 1]?.outcome === 'client_abort',
+        );
+        const lastObs = observations[observations.length - 1];
+        expect(lastObs?.outcome).toBe('client_abort');
+      } finally {
         controller.abort();
-      }, 5);
-
-      await expect(fetchPromise).rejects.toThrow();
-
-      // Small pause to allow server to record close
-      await new Promise((r) => setTimeout(r, 40));
-
-      const observations = await harness.getObservations();
-      expect(observations.length).toBeGreaterThanOrEqual(1);
-      const lastObs = observations[observations.length - 1];
-      expect(lastObs?.outcome).toBe('client_abort');
+      }
     });
 
     it('3.7 production profile fails closed at initialization', () => {
@@ -363,6 +385,154 @@ describe('SW-1.8.1: Deterministic Chat-Completions JSON and SSE Fixtures (Stage 
       const isolatedHarness = await createMockHarness();
       expect(isolatedHarness.port).toBeGreaterThan(0);
       await isolatedHarness.stop();
+    });
+
+    // MOCK-01 Access Control Tests
+    it('3.9 unauthenticated test-control requests are rejected with 401', async () => {
+      // Direct fetch without authorization header
+      const res = await fetch(`${harness.url}/__test/abort-observations`);
+      expect(res.status).toBe(401);
+      const data = (await res.json()) as { error: { code: string } };
+      expect(data.error.code).toBe('unauthorized');
+    });
+
+    it('3.10 test-control requests with invalid credentials are rejected with 401', async () => {
+      const res = await fetch(`${harness.url}/__test/abort-observations`, {
+        headers: { 'X-Test-Control-Key': 'wrong-key-value' },
+      });
+      expect(res.status).toBe(401);
+      const data = (await res.json()) as { error: { code: string } };
+      expect(data.error.code).toBe('unauthorized');
+    });
+
+    it('3.11 unauthorized fixture-selection header x-test-fixture-id is rejected with 401', async () => {
+      // Explicitly pass empty control key to test unauthenticated header selection
+      const res = await harness.postChatCompletions(
+        {
+          model: 'mock-chat-v1',
+          messages: [{ role: 'user', content: 'Unauthorized test' }],
+        },
+        {
+          'x-test-fixture-id': 'error.500',
+          'X-Test-Control-Key': '', // explicitly unauthenticated
+        },
+      );
+      expect(res.status).toBe(401);
+      const data = (await res.json()) as { error: { code: string } };
+      expect(data.error.code).toBe('unauthorized');
+    });
+
+    it('3.12 ordinary mock requests without x-test-fixture-id succeed without authorization', async () => {
+      // Standard OpenAI request with no control key
+      const res = await fetch(`${harness.url}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'mock-chat-v1',
+          messages: [{ role: 'user', content: 'Standard caller' }],
+        }),
+      });
+      expect(res.status).toBe(200);
+      const data = (await res.json()) as { choices: Array<{ message: { content: string } }> };
+      expect(data.choices[0]?.message.content).toBe('Deterministic mock response.');
+    });
+
+    // MOCK-02 Listener Accumulation Tests
+    it('3.13 50 sequential successful requests do not accumulate shutdown listeners', async () => {
+      for (let i = 0; i < 50; i++) {
+        const res = await harness.postChatCompletions({
+          model: 'mock-chat-v1',
+          messages: [{ role: 'user', content: `Seq ${i}` }],
+          stream: false,
+        });
+        expect(res.status).toBe(200);
+        await res.json();
+      }
+
+      // Assert listener count on server shutdown signal is 0
+      expect(harness.server.getShutdownListenerCount()).toBe(0);
+    });
+
+    it('3.14 50 sequential rejected requests do not accumulate shutdown listeners', async () => {
+      for (let i = 0; i < 50; i++) {
+        const res = await harness.postChatCompletions('{ invalid json');
+        expect(res.status).toBe(400);
+      }
+
+      expect(harness.server.getShutdownListenerCount()).toBe(0);
+    });
+
+    // MOCK-04 JSON and Model Hardening Tests
+    it('3.15 rejects JSON null body with 400 invalid_payload', async () => {
+      const res = await harness.postChatCompletions('null');
+      expect(res.status).toBe(400);
+      const data = (await res.json()) as { error: { code: string } };
+      expect(data.error.code).toBe('invalid_payload');
+    });
+
+    it('3.16 rejects JSON array body with 400 invalid_payload', async () => {
+      const res = await harness.postChatCompletions('[]');
+      expect(res.status).toBe(400);
+      const data = (await res.json()) as { error: { code: string } };
+      expect(data.error.code).toBe('invalid_payload');
+    });
+
+    it('3.17 rejects JSON primitive body with 400 invalid_payload', async () => {
+      const res = await harness.postChatCompletions('"a primitive string"');
+      expect(res.status).toBe(400);
+      const data = (await res.json()) as { error: { code: string } };
+      expect(data.error.code).toBe('invalid_payload');
+    });
+
+    it('3.18 rejects unknown mock-* model with 400 model_not_found without reflection', async () => {
+      const res = await harness.postChatCompletions({
+        model: 'mock-chat-v2',
+        messages: [{ role: 'user', content: 'Testing unknown mock model' }],
+      });
+      expect(res.status).toBe(400);
+      const data = (await res.json()) as { error: { code: string; message: string } };
+      expect(data.error.code).toBe('model_not_found');
+      expect(data.error.message).not.toContain('mock-chat-v2');
+    });
+
+    it('3.19 rejects legacy gpt-4o and gpt-3.5-turbo models with 400 model_not_found', async () => {
+      const res = await harness.postChatCompletions({
+        model: 'gpt-4o',
+        messages: [{ role: 'user', content: 'Testing gpt-4o' }],
+      });
+      expect(res.status).toBe(400);
+      const data = (await res.json()) as { error: { code: string } };
+      expect(data.error.code).toBe('model_not_found');
+    });
+
+    it('3.20 rejects non-object item in messages list with 400 invalid_parameter', async () => {
+      const res = await harness.postChatCompletions({
+        model: 'mock-chat-v1',
+        messages: ['not an object'],
+      });
+      expect(res.status).toBe(400);
+      const data = (await res.json()) as { error: { code: string } };
+      expect(data.error.code).toBe('invalid_parameter');
+    });
+
+    it('3.21 rejects invalid role in messages list with 400 invalid_parameter', async () => {
+      const res = await harness.postChatCompletions({
+        model: 'mock-chat-v1',
+        messages: [{ role: 'admin_injection', content: 'Hi' }],
+      });
+      expect(res.status).toBe(400);
+      const data = (await res.json()) as { error: { code: string } };
+      expect(data.error.code).toBe('invalid_parameter');
+    });
+
+    it('3.22 rejects non-string content in messages list with 400 invalid_parameter', async () => {
+      const res = await harness.postChatCompletions({
+        model: 'mock-chat-v1',
+        messages: [{ role: 'user', content: 12345 }],
+      });
+      expect(res.status).toBe(400);
+      const data = (await res.json()) as { error: { code: string } };
+      expect(data.error.code).toBe('invalid_parameter');
     });
   });
 });

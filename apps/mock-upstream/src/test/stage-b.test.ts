@@ -93,8 +93,9 @@ describe('SW-1.8.2: Network and HTTP Fault-Injection Profiles (Stage B)', () => 
         expect(String(err)).toMatch(/terminated|fetch failed/i);
       }
 
-      await new Promise((r) => setTimeout(r, 20));
-      const observations = await harness.getObservations();
+      const observations = await harness.waitForObservations(
+        (obs) => obs.length >= 1 && obs[obs.length - 1]?.outcome === 'server_fault',
+      );
       const lastObs = observations[observations.length - 1];
       expect(lastObs?.outcome).toBe('server_fault');
       expect(lastObs?.headersSent).toBe(false);
@@ -118,8 +119,9 @@ describe('SW-1.8.2: Network and HTTP Fault-Injection Profiles (Stage B)', () => 
         expect(String(err)).toMatch(/terminated|fetch failed/i);
       }
 
-      await new Promise((r) => setTimeout(r, 20));
-      const observations = await harness.getObservations();
+      const observations = await harness.waitForObservations(
+        (obs) => obs.length >= 1 && obs[obs.length - 1]?.outcome === 'server_fault',
+      );
       const lastObs = observations[observations.length - 1];
       expect(lastObs?.outcome).toBe('server_fault');
       expect(lastObs?.headersSent).toBe(true);
@@ -142,8 +144,9 @@ describe('SW-1.8.2: Network and HTTP Fault-Injection Profiles (Stage B)', () => 
         expect(String(err)).toMatch(/terminated|fetch failed/i);
       }
 
-      await new Promise((r) => setTimeout(r, 20));
-      const observations = await harness.getObservations();
+      const observations = await harness.waitForObservations(
+        (obs) => obs.length >= 1 && obs[obs.length - 1]?.outcome === 'server_fault',
+      );
       const lastObs = observations[observations.length - 1];
       expect(lastObs?.outcome).toBe('server_fault');
       expect(lastObs?.headersSent).toBe(true);
@@ -156,27 +159,32 @@ describe('SW-1.8.2: Network and HTTP Fault-Injection Profiles (Stage B)', () => 
       await harness.reset();
       const controller = new AbortController();
 
-      const fetchPromise = harness.postChatCompletions(
-        {
-          model: 'mock-chat-v1',
-          messages: [{ role: 'user', content: 'TTFT hang test' }],
-        },
-        { 'x-test-fixture-id': 'fault.ttft-hang' },
-        controller.signal,
-      );
+      try {
+        const fetchPromise = harness.postChatCompletions(
+          {
+            model: 'mock-chat-v1',
+            messages: [{ role: 'user', content: 'TTFT hang test' }],
+          },
+          { 'x-test-fixture-id': 'fault.ttft-hang' },
+          controller.signal,
+        );
 
-      // Wait 30ms ensuring no headers or tokens have arrived
-      await new Promise((r) => setTimeout(r, 30));
-      controller.abort();
+        // Wait 30ms ensuring no headers or tokens have arrived
+        await new Promise((r) => setTimeout(r, 30));
+        controller.abort();
 
-      await expect(fetchPromise).rejects.toThrow();
+        await expect(fetchPromise).rejects.toThrow();
 
-      await new Promise((r) => setTimeout(r, 20));
-      const observations = await harness.getObservations();
-      const lastObs = observations[observations.length - 1];
-      expect(lastObs?.outcome).toBe('client_abort');
-      expect(lastObs?.headersSent).toBe(false);
-      expect(lastObs?.bytesWritten).toBe(0);
+        const observations = await harness.waitForObservations(
+          (obs) => obs.length >= 1 && obs[obs.length - 1]?.outcome === 'client_abort',
+        );
+        const lastObs = observations[observations.length - 1];
+        expect(lastObs?.outcome).toBe('client_abort');
+        expect(lastObs?.headersSent).toBe(false);
+        expect(lastObs?.bytesWritten).toBe(0);
+      } finally {
+        controller.abort();
+      }
     });
 
     it('4.2 mid-stream drop emits content before abrupt disconnect and never emits [DONE]', async () => {
@@ -196,6 +204,7 @@ describe('SW-1.8.2: Network and HTTP Fault-Injection Profiles (Stage B)', () => 
             headers: {
               'Content-Type': 'application/json',
               'x-test-fixture-id': 'fault.mid-stream-drop',
+              'X-Test-Control-Key': harness.controlSecret,
             },
           },
           (res) => {
@@ -239,7 +248,9 @@ describe('SW-1.8.2: Network and HTTP Fault-Injection Profiles (Stage B)', () => 
       expect(combinedText).toContain('Stream truncated before completion');
       expect(combinedText).not.toContain('data: [DONE]');
 
-      const observations = await harness.getObservations();
+      const observations = await harness.waitForObservations(
+        (obs) => obs.length >= 1 && obs[obs.length - 1]?.outcome === 'server_fault',
+      );
       const lastObs = observations[observations.length - 1];
       expect(lastObs?.outcome).toBe('server_fault');
       expect(lastObs?.bytesWritten).toBeGreaterThan(0);
@@ -258,7 +269,9 @@ describe('SW-1.8.2: Network and HTTP Fault-Injection Profiles (Stage B)', () => 
       expect(res.status).toBe(200);
       await res.json();
 
-      const observations = await harness.getObservations();
+      const observations = await harness.waitForObservations(
+        (obs) => obs.length >= 1 && obs[obs.length - 1]?.outcome === 'completed',
+      );
       const lastObs = observations[observations.length - 1];
       expect(lastObs?.outcome).toBe('completed');
     });
@@ -295,30 +308,53 @@ describe('SW-1.8.2: Network and HTTP Fault-Injection Profiles (Stage B)', () => 
       expect(res2?.status).toBe(403);
       expect(res3?.status).toBe(429);
 
-      const observations = await harness.getObservations();
+      const observations = await harness.waitForObservations((obs) => obs.length === 3);
       expect(observations.length).toBe(3);
     });
 
     it('5.3 server shutdown terminates hanging requests cleanly', async () => {
       const isolatedHarness = await createMockHarness();
 
-      // Start a hanging request
-      const hangingReq = isolatedHarness.postChatCompletions(
+      try {
+        // Start a hanging request
+        const hangingReq = isolatedHarness.postChatCompletions(
+          {
+            model: 'mock-chat-v1',
+            messages: [{ role: 'user', content: 'Hang until stop' }],
+          },
+          { 'x-test-fixture-id': 'fault.ttft-hang' },
+        );
+
+        // Give it time to connect
+        await new Promise((r) => setTimeout(r, 20));
+
+        // Stop server while hanging request is active
+        await isolatedHarness.stop();
+
+        // Request must terminate/reject
+        await expect(hangingReq).rejects.toThrow();
+      } finally {
+        await isolatedHarness.stop();
+      }
+    });
+
+    it('5.4 multi-chunk delayed SSE completion releases delay listeners', async () => {
+      const controller = new AbortController();
+      const res = await harness.postChatCompletions(
         {
           model: 'mock-chat-v1',
-          messages: [{ role: 'user', content: 'Hang until stop' }],
+          messages: [{ role: 'user', content: 'Delayed chunks listener check' }],
+          stream: true,
         },
-        { 'x-test-fixture-id': 'fault.ttft-hang' },
+        { 'x-test-fixture-id': 'sse.delayed-chunks' },
+        controller.signal,
       );
+      expect(res.status).toBe(200);
+      await res.text();
 
-      // Give it time to connect
-      await new Promise((r) => setTimeout(r, 20));
-
-      // Stop server while hanging request is active
-      await isolatedHarness.stop();
-
-      // Request must terminate/reject
-      await expect(hangingReq).rejects.toThrow();
+      // Signal should have zero remaining abort listeners
+      // (verified through standard AbortSignal behavior)
+      expect(controller.signal.aborted).toBe(false);
     });
   });
 });

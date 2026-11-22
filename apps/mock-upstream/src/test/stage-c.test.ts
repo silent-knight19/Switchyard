@@ -29,6 +29,7 @@ describe('SW-1.8.3: Streaming Protocol Edge-Case Fixtures (Stage C)', () => {
             headers: {
               'Content-Type': 'application/json',
               'x-test-fixture-id': 'sse.utf8-fragmented',
+              'X-Test-Control-Key': harness.controlSecret,
             },
           },
           (res) => {
@@ -277,8 +278,8 @@ describe('SW-1.8.3: Streaming Protocol Edge-Case Fixtures (Stage C)', () => {
     });
   });
 
-  describe('4. Oversized lines, events and large bodies', () => {
-    it('4.1 sse.oversized-line emits line exceeding standard buffer bounds (64KB)', async () => {
+  describe('4. Oversized lines, events and large bodies (MOCK-03 semantics)', () => {
+    it('4.1 sse.oversized-line emits a single data line exceeding line threshold (64KB)', async () => {
       const res = await harness.postChatCompletions(
         {
           model: 'mock-chat-v1',
@@ -289,11 +290,18 @@ describe('SW-1.8.3: Streaming Protocol Edge-Case Fixtures (Stage C)', () => {
       );
 
       const text = await res.text();
-      expect(text.length).toBeGreaterThanOrEqual(65536);
       expect(text).toContain('data: [DONE]');
+
+      // Parse individual lines
+      const lines = text.split('\n');
+      const oversizedLine = lines.find((l) => l.startsWith('data: {"id":"oversized-line"'));
+      expect(oversizedLine).toBeDefined();
+
+      // Assert single line exceeds 65,536 bytes (well above 32KB line threshold)
+      expect(oversizedLine?.length).toBeGreaterThanOrEqual(65536);
     });
 
-    it('4.2 sse.oversized-event emits multi-line event spanning 128KB', async () => {
+    it('4.2 sse.oversized-event spans 32 individually bounded lines (each < 32KB) totaling 128KB event', async () => {
       const res = await harness.postChatCompletions(
         {
           model: 'mock-chat-v1',
@@ -304,8 +312,25 @@ describe('SW-1.8.3: Streaming Protocol Edge-Case Fixtures (Stage C)', () => {
       );
 
       const text = await res.text();
-      expect(text.length).toBeGreaterThanOrEqual(131072);
       expect(text).toContain('data: [DONE]');
+
+      // In SSE, events are separated by blank lines (\n\n)
+      const events = text.split('\n\n').filter((e) => e.trim().length > 0);
+      const multiLineEvent = events[0];
+      expect(multiLineEvent).toBeDefined();
+
+      // Multi-line event contains multiple data lines
+      const dataLines = multiLineEvent?.split('\n') ?? [];
+      expect(dataLines.length).toBe(32);
+
+      // Verify every individual line is bounded below 32KB (MOCK-03 requirement)
+      for (const line of dataLines) {
+        expect(line.length).toBeLessThan(32768);
+        expect(line.startsWith('data: {"line":')).toBe(true);
+      }
+
+      // Verify the aggregate event exceeds 128KB (131,072 bytes > 64KB event threshold)
+      expect(multiLineEvent?.length).toBeGreaterThanOrEqual(131072);
     });
 
     it('4.3 response.large-bounded-body returns 256KB bounded non-streaming body', async () => {
@@ -324,6 +349,34 @@ describe('SW-1.8.3: Streaming Protocol Edge-Case Fixtures (Stage C)', () => {
       const data = (await res.json()) as { choices: Array<{ message: { content: string } }> };
       const content = data.choices[0]?.message.content ?? '';
       expect(content.length).toBe(256 * 1024);
+    });
+
+    it('4.4 oversized-line and oversized-event produce byte-identical output across repeated runs', async () => {
+      const resLine1 = await harness.postChatCompletions(
+        { model: 'mock-chat-v1', messages: [{ role: 'user', content: '1' }], stream: true },
+        { 'x-test-fixture-id': 'sse.oversized-line' },
+      );
+      const textLine1 = await resLine1.text();
+
+      const resLine2 = await harness.postChatCompletions(
+        { model: 'mock-chat-v1', messages: [{ role: 'user', content: '2' }], stream: true },
+        { 'x-test-fixture-id': 'sse.oversized-line' },
+      );
+      const textLine2 = await resLine2.text();
+      expect(textLine1).toBe(textLine2);
+
+      const resEvent1 = await harness.postChatCompletions(
+        { model: 'mock-chat-v1', messages: [{ role: 'user', content: '1' }], stream: true },
+        { 'x-test-fixture-id': 'sse.oversized-event' },
+      );
+      const textEvent1 = await resEvent1.text();
+
+      const resEvent2 = await harness.postChatCompletions(
+        { model: 'mock-chat-v1', messages: [{ role: 'user', content: '2' }], stream: true },
+        { 'x-test-fixture-id': 'sse.oversized-event' },
+      );
+      const textEvent2 = await resEvent2.text();
+      expect(textEvent1).toBe(textEvent2);
     });
   });
 

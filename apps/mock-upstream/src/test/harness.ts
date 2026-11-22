@@ -13,6 +13,7 @@ export class MockTestHarness {
   public url = '';
   public port = 0;
   public host = '127.0.0.1';
+  public controlSecret = '';
 
   constructor(options: MockServerOptions = {}) {
     this.server = new MockServer({
@@ -20,6 +21,7 @@ export class MockTestHarness {
       host: '127.0.0.1',
       ...options,
     });
+    this.controlSecret = this.server.getControlSecret();
   }
 
   public async start(): Promise<void> {
@@ -38,37 +40,81 @@ export class MockTestHarness {
     headers: Record<string, string> = {},
     signal?: AbortSignal,
   ): Promise<Response> {
+    const requestHeaders: Record<string, string> = {
+      'Content-Type': 'application/json',
+      ...headers,
+    };
+
+    // If test fixture is selected and caller hasn't explicitly supplied or omitted auth, attach control key
+    if (
+      requestHeaders['x-test-fixture-id'] !== undefined &&
+      requestHeaders['X-Test-Control-Key'] === undefined &&
+      requestHeaders['x-test-control-key'] === undefined &&
+      requestHeaders['Authorization'] === undefined &&
+      requestHeaders['authorization'] === undefined
+    ) {
+      requestHeaders['X-Test-Control-Key'] = this.controlSecret;
+    }
+
     const init: RequestInit = {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...headers,
-      },
+      headers: requestHeaders,
       body: typeof body === 'string' ? body : JSON.stringify(body),
       ...(signal !== undefined ? { signal } : {}),
     };
     return fetch(`${this.url}/v1/chat/completions`, init);
   }
 
-  public async getObservations(): Promise<AbortObservation[]> {
-    const res = await fetch(`${this.url}/__test/abort-observations`);
+  public async getObservations(controlKey = this.controlSecret): Promise<AbortObservation[]> {
+    const headers: Record<string, string> = {};
+    if (controlKey) {
+      headers['X-Test-Control-Key'] = controlKey;
+    }
+    const res = await fetch(`${this.url}/__test/abort-observations`, { headers });
     if (!res.ok) throw new Error(`Failed to fetch observations: ${res.status}`);
     const data = (await res.json()) as { observations: AbortObservation[] };
     return data.observations;
   }
 
-  public async reset(): Promise<void> {
-    const res = await fetch(`${this.url}/__test/reset`, { method: 'POST' });
+  public async reset(controlKey = this.controlSecret): Promise<void> {
+    const headers: Record<string, string> = {};
+    if (controlKey) {
+      headers['X-Test-Control-Key'] = controlKey;
+    }
+    const res = await fetch(`${this.url}/__test/reset`, { method: 'POST', headers });
     if (!res.ok) throw new Error(`Failed to reset mock harness: ${res.status}`);
   }
 
-  public async setActiveFixture(fixtureId: string): Promise<void> {
+  public async setActiveFixture(fixtureId: string, controlKey = this.controlSecret): Promise<void> {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (controlKey) {
+      headers['X-Test-Control-Key'] = controlKey;
+    }
     const res = await fetch(`${this.url}/__test/active-fixture`, {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify({ fixtureId }),
     });
     if (!res.ok) throw new Error(`Failed to set active fixture: ${res.status}`);
+  }
+
+  public async waitForObservations(
+    predicate: (obs: AbortObservation[]) => boolean,
+    timeoutMs = 1500,
+  ): Promise<AbortObservation[]> {
+    const startTime = Date.now();
+    while (Date.now() - startTime < timeoutMs) {
+      const observations = await this.getObservations();
+      if (predicate(observations)) {
+        return observations;
+      }
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    const finalObservations = await this.getObservations();
+    if (predicate(finalObservations)) {
+      return finalObservations;
+    }
+    throw new Error(`Timeout waiting for observations condition after ${timeoutMs}ms`);
   }
 
   /**

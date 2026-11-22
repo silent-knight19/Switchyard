@@ -82,21 +82,23 @@ export function buildUsageChunk(fixture: SseFixture): ChatCompletionChunk {
 
 function delay(ms: number, signal?: AbortSignal): Promise<void> {
   if (ms <= 0) return Promise.resolve();
+  if (signal?.aborted) return Promise.reject(new Error('Aborted'));
   return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      return reject(new Error('Aborted'));
-    }
-    const timer = setTimeout(() => {
+    let timer: NodeJS.Timeout | null = null;
+    const onAbort = (): void => {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      reject(new Error('Aborted'));
+    };
+
+    timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
       resolve();
     }, ms);
-    signal?.addEventListener(
-      'abort',
-      () => {
-        clearTimeout(timer);
-        reject(new Error('Aborted'));
-      },
-      { once: true },
-    );
+
+    signal?.addEventListener('abort', onAbort, { once: true });
   });
 }
 

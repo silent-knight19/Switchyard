@@ -3,6 +3,7 @@ export interface MockConfig {
   port: number;
   host: string;
   maxBodyBytes: number;
+  controlSecret: string;
 }
 
 export function parseMockConfig(env: Record<string, string | undefined> = process.env): MockConfig {
@@ -25,11 +26,13 @@ export function parseMockConfig(env: Record<string, string | undefined> = proces
 
   const host = env['MOCK_HOST'] ?? env['HOST'] ?? '127.0.0.1';
   const maxBodyBytes = 64 * 1024; // 64KB bounded limit
+  const controlSecret = env['MOCK_CONTROL_SECRET'] ?? '';
 
   return {
     nodeEnv,
     port,
     host,
     maxBodyBytes,
+    controlSecret,
   };
 }
