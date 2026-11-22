@@ -130,6 +130,33 @@ services:
       start_period: 5s
     stop_grace_period: 10s
 
+  mock-upstream:
+    build:
+      context: .
+      dockerfile: docker/mock-upstream/Dockerfile
+    container_name: ${MOCK_UPSTREAM_CONTAINER_NAME:-switchyard-mock-upstream}
+    restart: unless-stopped
+    environment:
+      NODE_ENV: development
+      PORT: 4000
+      HOST: 0.0.0.0
+      MOCK_CONTROL_SECRET: ${MOCK_CONTROL_SECRET:-}
+    networks:
+      - switchyard-network
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:4000/health/ready').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    stop_grace_period: 10s
+
 networks:
   switchyard-network:
     name: ${NETWORK_NAME:-switchyard-network}
