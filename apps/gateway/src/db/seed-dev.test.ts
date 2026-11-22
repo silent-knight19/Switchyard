@@ -165,10 +165,12 @@ function createDependencies(
     orgId: ORG_ID,
     adminUserId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
   }));
+  const verifyExistingEnvelope = vi.fn(async () => undefined);
   return {
     createPool,
     bootstrap,
     createVault: (keyring) => new EnvelopeVault(keyring),
+    verifyExistingEnvelope,
     ...overrides,
   } as SeedDevDependencies & {
     createPool: ReturnType<typeof vi.fn>;
@@ -504,6 +506,38 @@ describe('SW-P1-B02 seed CLI behavior', () => {
     expect(state.ended).toBe(true);
   });
 
+  it('requires envelope authentication before returning ALREADY_PRESENT', async () => {
+    const { pool } = createFakePool({
+      lookupRows: [[{ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', org_id: ORG_ID, role: 'admin' }]],
+    });
+    const verifier = vi.fn(async () => undefined);
+    const deps = createDependencies(pool, { verifyExistingEnvelope: verifier });
+    const outcome = await executeRun({ password: 'irrelevant-password', dependencies: deps });
+    expect(outcome.code).toBe(SEED_EXIT_SUCCESS);
+    expect(outcome.stdout).toContain('Status: ALREADY_PRESENT');
+    expect(verifier).toHaveBeenCalledOnce();
+    expect(deps.bootstrap).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when an existing DEK envelope cannot be authenticated', async () => {
+    const { pool } = createFakePool({
+      lookupRows: [[{ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', org_id: ORG_ID, role: 'admin' }]],
+    });
+    const deps = createDependencies(pool, {
+      verifyExistingEnvelope: vi.fn(async () => {
+        throw new SeedDevError(
+          'EXISTING_ENVELOPE_INVALID',
+          'The existing organization envelope is incompatible with the configured KEK',
+        );
+      }),
+    });
+    const outcome = await executeRun({ password: 'irrelevant-password', dependencies: deps });
+    expect(outcome.code).toBe(SEED_EXIT_FAILURE);
+    expect(outcome.stdout).toBe('');
+    expect(outcome.stderr).toContain('EXISTING_ENVELOPE_INVALID');
+    expect(deps.bootstrap).not.toHaveBeenCalled();
+  });
+
   it('returns CONFLICT for an email owned by another organization or a non-admin role', async () => {
     for (const row of [
       {
@@ -591,6 +625,62 @@ describe('SW-P1-B02 seed CLI behavior', () => {
     expect(result.stderr).not.toContain('CANARY_DB_PASSWORD');
     expect(result.stderr).not.toContain('CANARY_ADMIN_PASSWORD');
   });
+
+  it('allowlists arbitrary authentication and bootstrap failure codes before writing stderr', async () => {
+    const canary = 'CANARY_SECRET\\nINJECTED_LINE';
+    for (const error of [
+      Object.assign(new Error('untrusted'), { reason: canary }),
+      Object.assign(new Error('untrusted'), { reason: 'RATE_LIMITED\\nINJECTED_LINE' }),
+      new BootstrapError(canary, 'untrusted'),
+    ]) {
+      const { pool } = createFakePool({ lookupRows: [[]] });
+      const deps = createDependencies(pool, {
+        bootstrap: vi.fn(async () => {
+          throw error;
+        }),
+      });
+      const output = await executeRun({ password: 'CANARY_ADMIN_PASSWORD', dependencies: deps });
+      expect(output.code).toBe(SEED_EXIT_FAILURE);
+      expect(output.stderr).toContain('UNEXPECTED_ERROR');
+      expect(output.stderr).not.toContain('CANARY_SECRET');
+      expect(output.stderr).not.toContain('INJECTED_LINE');
+      expect(output.stdout).toBe('');
+    }
+
+    const { pool } = createFakePool({ lookupRows: [[]] });
+    const deps = createDependencies(pool, {
+      bootstrap: vi.fn(async () => {
+        throw Object.assign(new Error('untrusted'), { reason: 'SERVICE_UNAVAILABLE' });
+      }),
+    });
+    const allowed = await executeRun({ password: 'valid-password', dependencies: deps });
+    expect(allowed.stderr).toContain('SERVICE_UNAVAILABLE');
+  });
+
+  it('returns cleanup failure instead of claiming successful provisioning when pool.end rejects', async () => {
+    const { pool } = createFakePool({ lookupRows: [[]] });
+    pool.end = vi.fn(async () => {
+      throw new Error('CANARY_DB_PASSWORD');
+    });
+    const deps = createDependencies(pool);
+    const result = await executeRun({ password: 'valid-password', dependencies: deps });
+    expect(result.code).toBe(SEED_EXIT_FAILURE);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('DATABASE_CLEANUP_FAILED');
+    expect(result.stderr).not.toContain('CANARY_DB_PASSWORD');
+  });
+
+  it('bounds cleanup when pool.end never settles', async () => {
+    const { pool } = createFakePool({ lookupRows: [[]] });
+    pool.end = vi.fn(() => new Promise<void>(() => {}));
+    const deps = createDependencies(pool);
+    const started = Date.now();
+    const result = await executeRun({ password: 'valid-password', dependencies: deps });
+    expect(Date.now() - started).toBeLessThan(3_500);
+    expect(result.code).toBe(SEED_EXIT_FAILURE);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('DATABASE_CLEANUP_FAILED');
+  }, 6_000);
 
   it('fails closed before creating any pool for production or missing enablement', async () => {
     for (const env of [
