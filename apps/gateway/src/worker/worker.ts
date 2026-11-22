@@ -91,17 +91,18 @@ export async function executeDependencyProbe(
     hooks.onCleanup(cancelAndDetach);
   }
 
-  // 1. Database connectivity check under restricted worker role (bounded I/O; WRK-04)
+  // 1. Database connectivity check under restricted worker role (bounded I/O; WRK-04, WRK-07)
   const checkPostgres = async (): Promise<boolean> => {
     let connectTimer: NodeJS.Timeout | null = null;
     let queryTimer: NodeJS.Timeout | null = null;
+    let connectAbandoned = false;
     try {
       const connectPromise = pgPool.connect();
 
-      // Ensure late client arrival after probe timeout/cancel is destroyed immediately
+      // Ensure late client arrival after probe timeout/cancel/abandonment is destroyed immediately
       connectPromise
         .then((client) => {
-          if (isTimedOut || isCleanedUp) {
+          if (connectAbandoned || isTimedOut || isCleanedUp) {
             try {
               client.release(true);
             } catch {
@@ -139,8 +140,13 @@ export async function executeDependencyProbe(
 
       activePgClient = client;
 
+      const queryPromise = client.query('SELECT 1');
+      queryPromise.catch(() => {
+        /* ignore post-timeout query rejection */
+      });
+
       await Promise.race([
-        client.query('SELECT 1'),
+        queryPromise,
         new Promise<never>((_, reject) => {
           queryTimer = setTimeout(() => {
             reject(new Error('PG_QUERY_TIMEOUT'));
@@ -167,6 +173,7 @@ export async function executeDependencyProbe(
       dependencies.database = 'healthy';
       return true;
     } catch {
+      connectAbandoned = true;
       dependencies.database = 'unhealthy';
       if (activePgClient) {
         try {
@@ -178,6 +185,7 @@ export async function executeDependencyProbe(
       }
       return false;
     } finally {
+      connectAbandoned = true;
       if (connectTimer) {
         clearTimeout(connectTimer);
       }
@@ -195,11 +203,14 @@ export async function executeDependencyProbe(
     }
   };
 
-  // 2. Redis connectivity check under restricted worker ACL (bounded ping; WRK-04)
+  // 2. Redis connectivity check under restricted worker ACL (bounded ping; WRK-04, WRK-07)
   const checkRedis = async (): Promise<boolean> => {
     let pingTimer: NodeJS.Timeout | null = null;
     try {
       const pingPromise = redis.ping();
+      pingPromise.catch(() => {
+        /* ignore post-timeout ping rejection */
+      });
 
       const pong = await Promise.race([
         pingPromise,
@@ -284,9 +295,7 @@ export async function executeDependencyProbe(
   try {
     return await Promise.race([probeAction(), overallTimeoutPromise]);
   } finally {
-    if (overallTimer) {
-      clearTimeout(overallTimer);
-    }
+    cancelAndDetach();
   }
 }
 
@@ -363,7 +372,13 @@ export async function createWorker(
     }
     if (redis) {
       try {
-        await redis.quit();
+        await Promise.race([
+          redis.quit(),
+          new Promise<never>((_, reject) => {
+            const t = setTimeout(() => reject(new Error('REDIS_QUIT_TIMEOUT')), 1000);
+            t.unref();
+          }),
+        ]);
       } catch {
         try {
           redis.disconnect();
@@ -374,7 +389,13 @@ export async function createWorker(
     }
     if (pgPool) {
       try {
-        await pgPool.end();
+        await Promise.race([
+          pgPool.end(),
+          new Promise<never>((_, reject) => {
+            const t = setTimeout(() => reject(new Error('PG_POOL_END_TIMEOUT')), 1000);
+            t.unref();
+          }),
+        ]);
       } catch {
         /* ignore */
       }

@@ -1,6 +1,9 @@
 import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import net from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
 import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { loadMigrationFiles } from './migrate.js';
@@ -915,23 +918,77 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15, DB-16 
     expect(workerRecovered).toBe(true);
   });
 
-  it('proves worker shutdown remains bounded during an in-flight probe (WRK-04)', async () => {
+  it('proves worker achieves signal-driven graceful shutdown and clean recovery (WRK-04, WRK-08)', async () => {
     // 1. Pause isolated Redis container to force in-flight probes to hang on timeout
     run('docker', ['pause', redisContainer], composeEnv);
 
     try {
-      // 2. Measure worker stop duration while probe is in flight
+      // 2. Stop worker container with existing Compose grace period (10s)
       const t0 = Date.now();
-      run('docker', ['compose', '-p', projectName, 'stop', '-t', '5', 'worker'], composeEnv);
+      run('docker', ['compose', '-p', projectName, 'stop', '-t', '10', 'worker'], composeEnv);
       const stopDuration = Date.now() - t0;
 
-      // Assert shutdown completes gracefully within bounded grace period (< 8000ms)
-      expect(stopDuration).toBeLessThan(8000);
+      // 3. Inspect worker container exit code and OOM state (WRK-08)
+      const exitCodeStr = run(
+        'docker',
+        ['inspect', workerContainer, '--format', '{{.State.ExitCode}}'],
+        composeEnv,
+      ).trim();
+      const exitCode = parseInt(exitCodeStr, 10);
+
+      const oomKilled = run(
+        'docker',
+        ['inspect', workerContainer, '--format', '{{.State.OOMKilled}}'],
+        composeEnv,
+      ).trim();
+
+      const containerStatus = run(
+        'docker',
+        ['inspect', workerContainer, '--format', '{{.State.Status}}'],
+        composeEnv,
+      ).trim();
+
+      // Assert signal-driven graceful exit: exit code 0, not OOM-killed, exited status
+      expect(exitCode).toBe(0);
+      expect(oomKilled).toBe('false');
+      expect(containerStatus).toBe('exited');
+
+      // Distinguish signal-driven graceful exit from SIGKILL (137) after grace period
+      expect(exitCode).not.toBe(137);
+      expect(stopDuration).toBeLessThan(8000); // Well under the 10s grace period
+
+      // 4. Verify no worker health artifact remains falsely ready after shutdown (WRK-08)
+      const tempHealthPath = path.join(os.tmpdir(), `test-worker-health-${Date.now()}.json`);
+      let healthFileCopied = false;
+      try {
+        run(
+          'docker',
+          ['cp', `${workerContainer}:/tmp/switchyard-worker-health.json`, tempHealthPath],
+          composeEnv,
+        );
+        healthFileCopied = true;
+      } catch {
+        // Expected: /tmp/switchyard-worker-health.json was unlinked by worker cleanup during shutdown
+      }
+
+      if (healthFileCopied && fs.existsSync(tempHealthPath)) {
+        try {
+          const content = fs.readFileSync(tempHealthPath, 'utf8');
+          const data = JSON.parse(content) as { status?: string };
+          expect(data.status).not.toBe('ready');
+        } finally {
+          try {
+            fs.unlinkSync(tempHealthPath);
+          } catch {
+            /* ignore */
+          }
+        }
+      }
     } finally {
-      // 3. Unpause Redis container
+      // 5. Unpause Redis container
       run('docker', ['unpause', redisContainer], composeEnv);
 
-      // 4. Wait for Redis to return to healthy state
+      // 6. Wait for Redis to return to healthy state
       for (let i = 0; i < 20; i += 1) {
         try {
           const status = run(
@@ -948,10 +1005,11 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15, DB-16 
         await new Promise((r) => setTimeout(r, 1000));
       }
 
-      // 5. Restart worker for clean environment teardown
+      // 7. Restart worker container and verify clean recovery (WRK-08)
       run('docker', ['start', workerContainer], composeEnv);
 
       // Wait for worker to return to ready state
+      let workerRecovered = false;
       for (let i = 0; i < 20; i += 1) {
         try {
           const healthJson = run(
@@ -960,6 +1018,7 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15, DB-16 
             composeEnv,
           );
           if (healthJson.includes('"status":"ready"')) {
+            workerRecovered = true;
             break;
           }
         } catch {
@@ -967,6 +1026,15 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15, DB-16 
         }
         await new Promise((r) => setTimeout(r, 1000));
       }
+      expect(workerRecovered).toBe(true);
+
+      // Verify worker CLI health check exits 0 after recovery
+      const healthCheckOutput = run(
+        'docker',
+        ['exec', workerContainer, 'node', 'apps/gateway/dist/worker-main.js', '--health'],
+        composeEnv,
+      );
+      expect(healthCheckOutput).toBe('');
     }
   });
 });

@@ -69,6 +69,23 @@ describe('Worker Runtime Foundation & Review Remediation (SW-P1-B01)', () => {
     return { promise, resolve, reject };
   }
 
+  interface MockPgClientInstance {
+    id: number;
+    query: ReturnType<typeof vi.fn>;
+    release: ReturnType<typeof vi.fn>;
+    isDestroyed: boolean;
+    isReleased: boolean;
+  }
+
+  interface MockPgPoolTracker {
+    activeClients: Set<MockPgClientInstance>;
+    allClients: MockPgClientInstance[];
+    destroyedClients: MockPgClientInstance[];
+    releasedClients: MockPgClientInstance[];
+    waitingCount: number;
+    readonly activeClientsCount: number;
+  }
+
   function createMockPg(
     opts: {
       queryImpl?: (sql: string) => Promise<unknown> | undefined;
@@ -77,6 +94,18 @@ describe('Worker Runtime Foundation & Review Remediation (SW-P1-B01)', () => {
       queryRejection?: Error;
     } = {},
   ) {
+    let clientIdCounter = 1;
+    const tracker: MockPgPoolTracker = {
+      activeClients: new Set(),
+      allClients: [],
+      destroyedClients: [],
+      releasedClients: [],
+      waitingCount: 0,
+      get activeClientsCount() {
+        return tracker.activeClients.size;
+      },
+    };
+
     const defaultQuery = (sql: string) => {
       if (sql.includes('current_user')) {
         return Promise.resolve({
@@ -98,21 +127,38 @@ describe('Worker Runtime Foundation & Review Remediation (SW-P1-B01)', () => {
       return Promise.resolve({ rows: [{ '?column?': 1 }] });
     };
 
-    const mockPgClient = {
-      query: vi.fn().mockImplementation((sql: string) => {
-        if (opts.queryRejection) {
-          return Promise.reject(opts.queryRejection);
-        }
-        if (opts.queryImpl) {
-          const res = opts.queryImpl(sql);
-          if (res !== undefined) {
-            return res;
+    const createClientInstance = (id: number): MockPgClientInstance => {
+      const client: MockPgClientInstance = {
+        id,
+        query: vi.fn().mockImplementation((sql: string) => {
+          if (opts.queryRejection) {
+            return Promise.reject(opts.queryRejection);
           }
-        }
-        return defaultQuery(sql);
-      }),
-      release: vi.fn(),
+          if (opts.queryImpl) {
+            const res = opts.queryImpl(sql);
+            if (res !== undefined) {
+              return res;
+            }
+          }
+          return defaultQuery(sql);
+        }),
+        release: vi.fn().mockImplementation((destroy?: boolean) => {
+          tracker.activeClients.delete(client);
+          if (destroy) {
+            client.isDestroyed = true;
+            tracker.destroyedClients.push(client);
+          } else {
+            client.isReleased = true;
+            tracker.releasedClients.push(client);
+          }
+        }),
+        isDestroyed: false,
+        isReleased: false,
+      };
+      return client;
     };
+
+    const primaryClient = createClientInstance(0);
 
     const mockPgPool = {
       connect: vi.fn().mockImplementation(() => {
@@ -120,16 +166,41 @@ describe('Worker Runtime Foundation & Review Remediation (SW-P1-B01)', () => {
           return Promise.reject(opts.connectRejection);
         }
         if (opts.connectImpl) {
-          return opts.connectImpl();
+          tracker.waitingCount++;
+          const promise = opts.connectImpl();
+          promise
+            .then((client) => {
+              tracker.waitingCount = Math.max(0, tracker.waitingCount - 1);
+              if (client && typeof (client as MockPgClientInstance).release === 'function') {
+                tracker.activeClients.add(client as MockPgClientInstance);
+                tracker.allClients.push(client as MockPgClientInstance);
+              }
+            })
+            .catch(() => {
+              tracker.waitingCount = Math.max(0, tracker.waitingCount - 1);
+            });
+          return promise;
         }
-        return Promise.resolve(mockPgClient);
+        const client =
+          clientIdCounter === 1 ? primaryClient : createClientInstance(clientIdCounter);
+        clientIdCounter++;
+        tracker.activeClients.add(client);
+        tracker.allClients.push(client);
+        return Promise.resolve(client);
       }),
       end: vi.fn().mockResolvedValue(undefined),
       on: vi.fn(),
-      waitingCount: 0,
+      get waitingCount() {
+        return tracker.waitingCount;
+      },
     } as unknown as import('pg').Pool;
 
-    return { mockPgPool, mockPgClient };
+    return {
+      mockPgPool,
+      mockPgClient: primaryClient,
+      createClientInstance,
+      poolTracker: tracker,
+    };
   }
 
   function createMockRedis(
@@ -894,8 +965,8 @@ describe('Worker Runtime Foundation & Review Remediation (SW-P1-B01)', () => {
       await worker.stop();
     });
 
-    it('6. Multiple probe intervals during a persistent hang keep active operations bounded', async () => {
-      const { mockPgPool } = createMockPg({
+    it('6. Multiple probe intervals during a persistent hang keep active operations and pool clients bounded', async () => {
+      const { mockPgPool, poolTracker } = createMockPg({
         queryImpl: (sql) => {
           if (sql === 'SELECT 1') {
             return new Promise(() => {}); // persists hanging
@@ -916,7 +987,17 @@ describe('Worker Runtime Foundation & Review Remediation (SW-P1-B01)', () => {
       await worker.runHealthProbe(50);
 
       expect(worker.isReady()).toBe(false);
+
+      // Wrapper-level operations count returns to 0
       expect(worker.getActiveOperationsCount()).toBe(0);
+
+      // Underlying PostgreSQL pool resources are strictly cleaned up (WRK-07)
+      expect(poolTracker.activeClientsCount).toBe(0);
+      expect(poolTracker.waitingCount).toBe(0);
+      expect(poolTracker.destroyedClients).toHaveLength(3);
+      for (const client of poolTracker.destroyedClients) {
+        expect(client.release).toHaveBeenCalledWith(true);
+      }
 
       await worker.stop();
     });
@@ -1055,8 +1136,8 @@ describe('Worker Runtime Foundation & Review Remediation (SW-P1-B01)', () => {
       await worker.stop();
     });
 
-    it('12. Bounded number of underlying active operations and pool waiters', async () => {
-      const { mockPgPool } = createMockPg({
+    it('12. Bounded number of underlying active operations and pool waiters across repeated timeouts', async () => {
+      const { mockPgPool, poolTracker } = createMockPg({
         queryImpl: (sql) => {
           if (sql === 'SELECT 1') {
             return new Promise(() => {}); // never resolves
@@ -1075,8 +1156,135 @@ describe('Worker Runtime Foundation & Review Remediation (SW-P1-B01)', () => {
         await worker.runHealthProbe(30);
       }
 
+      // 1. Wrapper level active operations return to 0
       expect(worker.getActiveOperationsCount()).toBe(0);
-      expect(mockPgPool.waitingCount).toBe(0);
+
+      // 2. Underlying pool tracking proves no client leak or waiting pool starvation (WRK-07)
+      expect(poolTracker.activeClientsCount).toBe(0);
+      expect(poolTracker.waitingCount).toBe(0);
+      expect(poolTracker.destroyedClients).toHaveLength(5);
+      for (const client of poolTracker.destroyedClients) {
+        expect(client.release).toHaveBeenCalledWith(true);
+      }
+
+      await worker.stop();
+    });
+
+    it('13. Repeated connection acquisition timeouts destroy late clients and do not leak pool slots (WRK-07)', async () => {
+      const deferredConnects: Array<ReturnType<typeof createDeferred<unknown>>> = [];
+      const { mockPgPool, poolTracker, createClientInstance } = createMockPg({
+        connectImpl: () => {
+          const deferred = createDeferred<unknown>();
+          deferredConnects.push(deferred);
+          return deferred.promise;
+        },
+      });
+      const { mockRedis } = createMockRedis();
+
+      // Test direct executeDependencyProbe across 3 consecutive connect timeouts
+      for (let i = 0; i < 3; i++) {
+        const probe = await executeDependencyProbe(mockPgPool, mockRedis, 50);
+        expect(probe.ok).toBe(false);
+        expect(probe.dependencies.database).toBe('unhealthy');
+      }
+
+      expect(deferredConnects).toHaveLength(3);
+      expect(poolTracker.waitingCount).toBe(3);
+
+      // Simulate delayed arrival of all 3 connection acquisitions
+      const lateClients = [
+        createClientInstance(101),
+        createClientInstance(102),
+        createClientInstance(103),
+      ];
+      for (let i = 0; i < 3; i++) {
+        deferredConnects[i]!.resolve(lateClients[i]!);
+      }
+
+      await new Promise((r) => setTimeout(r, 20));
+
+      // Each late client must have been destroyed immediately
+      for (const client of lateClients) {
+        expect(client.release).toHaveBeenCalledWith(true);
+      }
+      expect(poolTracker.activeClientsCount).toBe(0);
+      expect(poolTracker.waitingCount).toBe(0);
+    });
+
+    it('14. Clear distinction between wrapper completion and underlying resource cleanup (WRK-07)', async () => {
+      const deferredQuery = createDeferred<unknown>();
+      const { mockPgPool, poolTracker } = createMockPg({
+        queryImpl: (sql) => {
+          if (sql === 'SELECT 1') {
+            return deferredQuery.promise;
+          }
+          return undefined;
+        },
+      });
+      const { mockRedis } = createMockRedis();
+
+      const worker = await createWorker(getTestEnv(), {
+        pgPool: mockPgPool,
+        redis: mockRedis,
+      });
+
+      const t0 = Date.now();
+      const probeResult = await worker.runHealthProbe(50);
+      const probeDuration = Date.now() - t0;
+
+      // 1. Wrapper completion assertion: probe finished boundedly
+      expect(probeDuration).toBeLessThan(150);
+      expect(probeResult.ok).toBe(false);
+      expect(probeResult.error).toBe('Worker readiness check timed out');
+      expect(worker.getActiveOperationsCount()).toBe(0);
+
+      // 2. Underlying resource cleanup assertion: active client destroyed and checked out count is 0
+      expect(poolTracker.activeClientsCount).toBe(0);
+      expect(poolTracker.waitingCount).toBe(0);
+      expect(poolTracker.destroyedClients.length).toBeGreaterThanOrEqual(1);
+
+      // 3. Resolve deferred query late and assert no secondary mutation occurs
+      deferredQuery.resolve({ rows: [{ '?column?': 1 }] });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(worker.isReady()).toBe(false);
+
+      await worker.stop();
+    });
+
+    it('15. Redis command timeout behavior terminates boundedly and marks dependency unhealthy (WRK-07)', async () => {
+      let failPingWithTimeout = false;
+      const { mockPgPool } = createMockPg();
+      const { mockRedis } = createMockRedis({
+        pingImpl: () => {
+          if (failPingWithTimeout) {
+            // Simulate ioredis command timeout error
+            return Promise.reject(new Error('Command timed out'));
+          }
+          return Promise.resolve('PONG');
+        },
+      });
+
+      const worker = await createWorker(getTestEnv(), {
+        pgPool: mockPgPool,
+        redis: mockRedis,
+      });
+
+      expect(worker.isReady()).toBe(true);
+
+      // Trigger timeout on Redis probe
+      failPingWithTimeout = true;
+      const probe = await worker.runHealthProbe(100);
+      expect(probe.ok).toBe(false);
+      expect(probe.dependencies.redis).toBe('unhealthy');
+      expect(worker.isReady()).toBe(false);
+      expect(worker.getActiveOperationsCount()).toBe(0);
+
+      // Recovery
+      failPingWithTimeout = false;
+      const recoveredProbe = await worker.runHealthProbe(100);
+      expect(recoveredProbe.ok).toBe(true);
+      expect(recoveredProbe.dependencies.redis).toBe('healthy');
+      expect(worker.isReady()).toBe(true);
 
       await worker.stop();
     });
