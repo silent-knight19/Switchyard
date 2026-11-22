@@ -1,4 +1,4 @@
-import fastify from 'fastify';
+import fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import type pg from 'pg';
 import pino from 'pino';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -12,6 +12,7 @@ import {
 import { installAuthorizationBoundary } from '../auth/authorization.js';
 import type { SessionService } from '../auth/session.js';
 import type { SessionValidationResult } from '../auth/types.js';
+import { getSafeRouteIdentifier } from '../logging/serializers.js';
 
 const ORG_A_ID = '11111111-1111-4111-8111-111111111111';
 const KEY_A_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
@@ -711,7 +712,7 @@ describe('ProviderKeyRoutes — HTTP Contract, Validation, RBAC & Headers', () =
     });
   });
 
-  describe('Real Request / Log Canary Privacy Probe (PVAULT-04 Part C)', () => {
+  describe('Real Request / Log Canary Privacy Probe (PVAULT-04 Part C, PVAULT-09 Part B)', () => {
     it('proves synthetic canary credentials never appear in application logs or HTTP responses across success and failure', async () => {
       const capturedLogLines: string[] = [];
       const testLogger = pino(
@@ -729,10 +730,41 @@ describe('ProviderKeyRoutes — HTTP Contract, Validation, RBAC & Headers', () =
         },
       );
 
-      const probeApp = fastify({ loggerInstance: testLogger });
+      const probeApp = fastify({
+        loggerInstance: testLogger,
+        disableRequestLogging: true,
+      });
+
       installAuthorizationBoundary(probeApp, {
         sessionService: mockSessionService as SessionService,
         trustedOrigin: TRUSTED_ORIGIN,
+      });
+
+      // Install production request lifecycle logging hooks
+      probeApp.addHook('onRequest', async (req) => {
+        const safeRoute = getSafeRouteIdentifier(req.url, req.routeOptions?.url);
+        testLogger.info(
+          {
+            requestId: req.id,
+            method: req.method,
+            route: safeRoute,
+          },
+          'Incoming request',
+        );
+      });
+
+      probeApp.addHook('onResponse', async (req, reply) => {
+        const safeRoute = getSafeRouteIdentifier(req.url, req.routeOptions?.url);
+        testLogger.info(
+          {
+            requestId: req.id,
+            method: req.method,
+            route: safeRoute,
+            statusCode: reply.statusCode,
+            responseTimeMs: reply.elapsedTime,
+          },
+          'Request completed',
+        );
       });
 
       const probeMockService = {
@@ -749,6 +781,7 @@ describe('ProviderKeyRoutes — HTTP Contract, Validation, RBAC & Headers', () =
 
       const canarySuccess = 'sk-synthetic-live-http-canary-success-998877';
       const canaryFailure = 'sk-synthetic-live-http-canary-failure-112233';
+      const canaryValidation = 'sk-synthetic-live-http-canary-valfail-445566';
 
       (probeMockService.createKey as ReturnType<typeof vi.fn>).mockResolvedValue({
         id: KEY_A_ID,
@@ -759,7 +792,7 @@ describe('ProviderKeyRoutes — HTTP Contract, Validation, RBAC & Headers', () =
         createdAt: '2026-11-22T10:00:00.000000Z',
       });
 
-      // 1. Controlled successful operation
+      // 1. Controlled successful operation (201 Created)
       const successRes = await probeApp.inject({
         method: 'POST',
         url: '/api/provider-keys',
@@ -774,7 +807,7 @@ describe('ProviderKeyRoutes — HTTP Contract, Validation, RBAC & Headers', () =
       expect(successRes.statusCode).toBe(201);
       expect(successRes.body).not.toContain(canarySuccess);
 
-      // 2. Controlled failure operation (service failure)
+      // 2. Controlled failure operation (service failure 503)
       (probeMockService.createKey as ReturnType<typeof vi.fn>).mockRejectedValue(
         new ProviderKeyManagementError('DATABASE_ERROR', 'Simulated database failure'),
       );
@@ -793,16 +826,91 @@ describe('ProviderKeyRoutes — HTTP Contract, Validation, RBAC & Headers', () =
       expect(failureRes.statusCode).toBe(503);
       expect(failureRes.body).not.toContain(canaryFailure);
 
-      // 3. Verify neither canary appears anywhere in captured application logs
+      // 3. Controlled validation failure operation (400 Bad Request with unexpected field)
+      const validationRes = await probeApp.inject({
+        method: 'POST',
+        url: '/api/provider-keys',
+        headers: authHeaders,
+        payload: {
+          provider: 'openai',
+          label: 'Validation Failing Key',
+          credential: canaryValidation,
+          unexpected_extra_field: 'disallowed',
+        },
+      });
+
+      expect(validationRes.statusCode).toBe(400);
+      expect(validationRes.body).not.toContain(canaryValidation);
+
+      // 4. Assert that logger actually captured output (absence check cannot pass vacuously)
+      expect(capturedLogLines.length).toBeGreaterThanOrEqual(6); // 2 hooks * 3 requests
+
+      // 5. Verify neither canary appears anywhere in captured application logs
       for (const logLine of capturedLogLines) {
         expect(logLine).not.toContain(canarySuccess);
         expect(logLine).not.toContain(canaryFailure);
+        expect(logLine).not.toContain(canaryValidation);
       }
     });
   });
 
-  describe('Safe Error Response Coverage (PVAULT-04 Part D)', () => {
-    it('covers safe 400 Invalid Input responses with Cache-Control: no-store', async () => {
+  describe('Route-Scoped Cache-Control Header & Safe Error Responses (PVAULT-04 Part D, PVAULT-09 Part A)', () => {
+    it('covers 200 OK success responses with Cache-Control: no-store and Pragma: no-cache', async () => {
+      (mockService.listKeys as ReturnType<typeof vi.fn>).mockResolvedValue({
+        items: [],
+        nextCursor: null,
+      });
+
+      const res = await app.inject({
+        method: 'GET',
+        url: '/api/provider-keys',
+        headers: authHeaders,
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.headers['cache-control']).toBe('no-store');
+      expect(res.headers['pragma']).toBe('no-cache');
+    });
+
+    it('covers 201 Created success responses with Cache-Control: no-store and Pragma: no-cache', async () => {
+      const dummyPayloadCred = 'synthetic-dummy-payload-credential';
+      (mockService.createKey as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: KEY_A_ID,
+        provider: 'openai',
+        label: 'Created Key',
+        keyHint: '****1234',
+        isActive: true,
+        createdAt: '2026-11-22T10:00:00.000000Z',
+      });
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/provider-keys',
+        headers: authHeaders,
+        payload: {
+          provider: 'openai',
+          label: 'Created Key',
+          credential: dummyPayloadCred,
+        },
+      });
+      expect(res.statusCode).toBe(201);
+      expect(res.headers['cache-control']).toBe('no-store');
+      expect(res.headers['pragma']).toBe('no-cache');
+    });
+
+    it('covers 204 No Content disable responses with Cache-Control: no-store and Pragma: no-cache', async () => {
+      (mockService.disableKey as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+
+      const res = await app.inject({
+        method: 'DELETE',
+        url: `/api/provider-keys/${KEY_A_ID}`,
+        headers: authHeaders,
+      });
+      expect(res.statusCode).toBe(204);
+      expect(res.headers['cache-control']).toBe('no-store');
+      expect(res.headers['pragma']).toBe('no-cache');
+    });
+
+    it('covers 400 Bad Request validation responses with Cache-Control: no-store and Pragma: no-cache', async () => {
       const res = await app.inject({
         method: 'POST',
         url: '/api/provider-keys',
@@ -811,12 +919,92 @@ describe('ProviderKeyRoutes — HTTP Contract, Validation, RBAC & Headers', () =
       });
       expect(res.statusCode).toBe(400);
       expect(res.headers['cache-control']).toBe('no-store');
+      expect(res.headers['pragma']).toBe('no-cache');
       const body = JSON.parse(res.body);
       expect(body.statusCode).toBe(400);
       expect(body.error).toBe('Bad Request');
     });
 
-    it('covers safe 403 Forbidden responses with Cache-Control: no-store', async () => {
+    it('covers pre-handler 401 Unauthorized responses with Cache-Control: no-store and Pragma: no-cache', async () => {
+      // 1. GET without session cookie
+      const getRes = await app.inject({
+        method: 'GET',
+        url: '/api/provider-keys',
+      });
+      expect(getRes.statusCode).toBe(401);
+      expect(getRes.headers['cache-control']).toBe('no-store');
+      expect(getRes.headers['pragma']).toBe('no-cache');
+      const getBody = JSON.parse(getRes.body);
+      expect(getBody.statusCode).toBe(401);
+      expect(getBody.error).toBe('Unauthorized');
+
+      // 2. POST with CSRF header but without session cookie
+      const postRes = await app.inject({
+        method: 'POST',
+        url: '/api/provider-keys',
+        headers: {
+          origin: TRUSTED_ORIGIN,
+          'x-csrf-token': 'mock-valid-csrf-token',
+        },
+        payload: {
+          provider: 'openai',
+          label: 'Unauth Key',
+          credential: 'sk-test-valid',
+        },
+      });
+      expect(postRes.statusCode).toBe(401);
+      expect(postRes.headers['cache-control']).toBe('no-store');
+      expect(postRes.headers['pragma']).toBe('no-cache');
+      const postBody = JSON.parse(postRes.body);
+      expect(postBody.statusCode).toBe(401);
+      expect(postBody.error).toBe('Unauthorized');
+    });
+
+    it('covers pre-handler 403 Forbidden member role rejection with Cache-Control: no-store and Pragma: no-cache', async () => {
+      const memberValidation: SessionValidationResult = {
+        valid: true,
+        user: {
+          id: USER_A_MEMBER_ID,
+          orgId: ORG_A_ID,
+          emailNormalized: 'member@switchyard.internal',
+          role: 'member',
+        },
+        session: {
+          sessionIdHash: Buffer.alloc(32, 1),
+          userId: USER_A_MEMBER_ID,
+          orgId: ORG_A_ID,
+          csrfTokenHash: Buffer.alloc(32, 2),
+          createdAt: new Date(),
+          lastSeenAt: new Date(),
+          idleExpiresAt: new Date(Date.now() + 100000),
+          absoluteExpiresAt: new Date(Date.now() + 100000),
+          revokedAt: null,
+        },
+      };
+
+      (
+        mockSessionService.resolveAndValidateSessionWithCsrf as ReturnType<typeof vi.fn>
+      ).mockResolvedValueOnce(memberValidation);
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/provider-keys',
+        headers: authHeaders,
+        payload: {
+          provider: 'openai',
+          label: 'Test',
+          credential: 'sk-test-valid',
+        },
+      });
+      expect(res.statusCode).toBe(403);
+      expect(res.headers['cache-control']).toBe('no-store');
+      expect(res.headers['pragma']).toBe('no-cache');
+      const body = JSON.parse(res.body);
+      expect(body.statusCode).toBe(403);
+      expect(body.error).toBe('Forbidden');
+    });
+
+    it('covers pre-handler 403 Forbidden CSRF/Origin rejection with Cache-Control: no-store and Pragma: no-cache', async () => {
       const res = await app.inject({
         method: 'POST',
         url: '/api/provider-keys',
@@ -831,12 +1019,14 @@ describe('ProviderKeyRoutes — HTTP Contract, Validation, RBAC & Headers', () =
         },
       });
       expect(res.statusCode).toBe(403);
+      expect(res.headers['cache-control']).toBe('no-store');
+      expect(res.headers['pragma']).toBe('no-cache');
       const body = JSON.parse(res.body);
       expect(body.statusCode).toBe(403);
       expect(body.error).toBe('Forbidden');
     });
 
-    it('covers safe 404 Not Found responses with Cache-Control: no-store', async () => {
+    it('covers safe 404 Not Found responses with Cache-Control: no-store and Pragma: no-cache', async () => {
       (mockService.replaceKey as ReturnType<typeof vi.fn>).mockRejectedValue(
         new ProviderKeyManagementError('KEY_NOT_FOUND', 'Provider key not found'),
       );
@@ -851,13 +1041,14 @@ describe('ProviderKeyRoutes — HTTP Contract, Validation, RBAC & Headers', () =
       });
       expect(res.statusCode).toBe(404);
       expect(res.headers['cache-control']).toBe('no-store');
+      expect(res.headers['pragma']).toBe('no-cache');
       const body = JSON.parse(res.body);
       expect(body.statusCode).toBe(404);
       expect(body.error).toBe('Not Found');
       expect(body.message).toBe('Provider key not found');
     });
 
-    it('covers safe 409 Conflict responses with Cache-Control: no-store', async () => {
+    it('covers safe 409 Conflict responses with Cache-Control: no-store and Pragma: no-cache', async () => {
       (mockService.replaceKey as ReturnType<typeof vi.fn>).mockRejectedValue(
         new ProviderKeyManagementError(
           'KEY_DISABLED',
@@ -875,12 +1066,13 @@ describe('ProviderKeyRoutes — HTTP Contract, Validation, RBAC & Headers', () =
       });
       expect(res.statusCode).toBe(409);
       expect(res.headers['cache-control']).toBe('no-store');
+      expect(res.headers['pragma']).toBe('no-cache');
       const body = JSON.parse(res.body);
       expect(body.statusCode).toBe(409);
       expect(body.error).toBe('Conflict');
     });
 
-    it('covers safe 503 Service Unavailable responses with Cache-Control: no-store', async () => {
+    it('covers safe 503 Service Unavailable responses with Cache-Control: no-store and Pragma: no-cache', async () => {
       (mockService.listKeys as ReturnType<typeof vi.fn>).mockRejectedValue(
         new ProviderKeyManagementError(
           'VAULT_UNAVAILABLE',
@@ -894,10 +1086,37 @@ describe('ProviderKeyRoutes — HTTP Contract, Validation, RBAC & Headers', () =
       });
       expect(res.statusCode).toBe(503);
       expect(res.headers['cache-control']).toBe('no-store');
+      expect(res.headers['pragma']).toBe('no-cache');
       const body = JSON.parse(res.body);
       expect(body.statusCode).toBe(503);
       expect(body.error).toBe('Service Unavailable');
       expect(body.message).toBe('Provider credential vault is unavailable');
+    });
+
+    it('does not alter Cache-Control on unrelated routes', async () => {
+      app.get(
+        '/api/unrelated-public',
+        {
+          config: {
+            authz: {
+              principal: 'browser',
+              minRole: 'admin',
+            },
+          },
+        },
+        async (_req: FastifyRequest, reply: FastifyReply) => {
+          return reply.status(200).send({ ok: true });
+        },
+      );
+
+      const res = await app.inject({
+        method: 'GET',
+        url: '/api/unrelated-public',
+        headers: authHeaders,
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.headers['cache-control']).toBeUndefined();
     });
   });
 });

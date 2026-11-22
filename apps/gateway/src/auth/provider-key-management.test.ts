@@ -51,9 +51,25 @@ describe('ProviderKeyManagement — Unit & Safety Tests', () => {
       expect(deriveKeyHint('🔑')).toBe('****');
     });
 
-    it('sanitizes control characters in the last four characters', () => {
+    it('sanitizes control characters in the last four characters globally (PVAULT-07)', () => {
+      // Single control characters
       expect(deriveKeyHint('secret\n123')).toBe('****123');
       expect(deriveKeyHint('prefix\x00abc')).toBe('****abc');
+
+      // Multiple control characters in the last four characters are all removed
+      expect(deriveKeyHint('prefix\x01\x02\x03a')).toBe('****a');
+      expect(deriveKeyHint('prefix\x01\x02ab')).toBe('****ab');
+
+      // Embedded NUL appearing after another control character cannot survive sanitization
+      expect(deriveKeyHint('prefix\x01\x00ab')).toBe('****ab');
+      expect(deriveKeyHint('prefix\x00\x00\x00\x00')).toBe('****');
+      expect(deriveKeyHint('long-secret-key-\r\n\t\x00')).toBe('****');
+
+      // Interleaved control characters and printable characters
+      expect(deriveKeyHint('prefix\x01A\x00B')).toBe('****AB');
+
+      // Prohibited control characters from C0, DEL, and C1 ranges are removed
+      expect(deriveKeyHint('prefix\x1F\x7F\x80\x9F')).toBe('****');
     });
   });
 

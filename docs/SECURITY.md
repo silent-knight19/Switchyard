@@ -574,16 +574,16 @@ DELETE /api/provider-keys/:id    # Disable credential (soft delete)
 - **Error Secrecy:** Malformed, invalid, or oversized credentials and untrusted input values are never echoed in HTTP error responses or logs.
 
 #### 16.1.4 Safe Key Hint Derivation (§11.5)
-- For credentials exceeding 4 characters, the service derives a hint consisting of fixed prefix `****` followed by at most the last 4 sanitized display characters (e.g. `****3456`). Control characters within the last 4 characters are stripped.
+- For credentials exceeding 4 characters, the service derives a hint consisting of fixed prefix `****` followed by at most the last 4 sanitized display characters (e.g. `****3456`). Control characters (C0 controls U+0000..U+001F, DEL U+007F, and C1 controls U+0080..U+009F) are globally stripped from the hint via `CONTROL_CHARS_GLOBAL_REGEX`, ensuring multiple control characters and embedded NUL bytes cannot survive or cause PostgreSQL text column persistence errors (PVAULT-07).
 - For short credentials (4 or fewer characters), the hint returns entirely masked `****` to prevent disclosing key length or secret values.
-- Key hints are computed in-memory; plaintext credential prefixes are never stored.
+- Key hints are computed in-memory; plaintext credential prefixes are never stored. The exact opaque credential bytes remain encryptable and decryptable without modification or normalization.
 
 #### 16.1.5 Bounded Keyset Pagination & Safe Metadata
 - `GET /api/provider-keys` queries keys inside `withTenant(pool, orgId)` ordered by `created_at DESC, id DESC`.
 - Keyset pagination uses opaque canonical base64url cursors `{ createdAt, id }` with microsecond UTC precision (`YYYY-MM-DDTHH:mm:ss.ffffffZ`).
 - Limit is bounded between 1 and 100 (default 20).
 - **Zero Decryption & Zero Secret Selection:** The SQL query selects non-secret columns only (`id`, `provider`, `label`, `key_hint`, `is_active`, `created_at`). `ciphertext`, `iv`, `auth_tag`, `wrapped_dek`, `dek_iv`, `dek_auth_tag`, and `kek_version` are never selected or exposed.
-- All management responses set `Cache-Control: no-store` and `Pragma: no-cache`.
+- **Route-Scoped Cache-Control Headers (PVAULT-09 Part A):** Encapsulated via an `onSend` lifecycle hook on the `/api/provider-keys` plugin scope, all responses from provider-key management routes unconditionally include `Cache-Control: no-store` and `Pragma: no-cache`. This header guarantee covers 200, 201, 204, 400, pre-handler 401 Unauthorized, pre-handler 403 Forbidden (both non-admin member role and CSRF/Origin rejections), 404, 409, and 503, without polluting unrelated Gateway routes.
 
 #### 16.1.6 Atomic Replacement, Concurrency & Rollback Guarantees
 - `PUT /api/provider-keys/:id` acquires a row lock (`SELECT ... FOR UPDATE`) inside the tenant transaction.
@@ -596,6 +596,7 @@ DELETE /api/provider-keys/:id    # Disable credential (soft delete)
   - **C3 (Replace before Disable):** When a replacement transaction holds the row lock, a competing disable blocks until replacement commits, then proceeds to deactivate the updated record.
   - **C4 (Failed Replacement Rollback):** An aborted/rolled-back replacement transaction leaves the previous ciphertext, IV, authentication tag, label, hint, and decryptability completely intact.
   - **C5 (Cross-Tenant Concurrency Resistance):** Tenant B cannot exploit concurrent mutation timing to replace or disable Tenant A's credential; PostgreSQL FORCE RLS isolates tenant rows unconditionally.
+  - **C6 (Service-Level Replacement Rollback - PVAULT-08):** Exercises the production `ProviderKeyManagementService.replaceKey()` transaction path under `withTenant(pool, orgId)`. Injects a controlled PostgreSQL failure during the replacement `UPDATE` before commit; proves that `replaceKey` reports failure, the previous database row (label, hint, ciphertext, IV, authentication tag, is_active) remains completely unchanged, the previous credential still decrypts byte-identically, and tenant connection context cleans up so subsequent valid service operations succeed normally.
 
 #### 16.1.7 Logical Disabling & Idempotency
 - `DELETE /api/provider-keys/:id` acquires a row lock and sets `is_active = false`.
@@ -617,10 +618,12 @@ DELETE /api/provider-keys/:id    # Disable credential (soft delete)
 - The returned plaintext Buffer from internal gateway decryption is caller-owned and must be zeroized by the caller immediately after authorized upstream dispatch.
 - **Node.js Runtime Limitation Disclosure:** While mutable Buffers are zeroized, immutable V8 JavaScript strings (instantiated during JSON body parsing) cannot be deterministically cleared by application code and persist until garbage collected. This architectural boundary is mitigated by bounded body limits, absence of request-body logging, and non-root process sandboxing.
 
-#### 16.2.2 Real Request / Log Privacy & Canary Probes
-- Focused privacy tests using actual registered provider management Fastify routes, real authorization boundaries, credential-bearing HTTP requests, and captured structured Pino logger output prove zero credential leakage across successful operations and controlled error conditions (validation errors, 400, 403, 404, 409, 503).
-- Synthetic canary credentials (`CANARY_SECRET_*`) are verified to be completely absent from captured application log lines, serialized HTTP responses, and safe error objects.
-- Pino redaction covers `credential`, `credentials`, `providerkey`, `key`, `password`, `token`, `secret`, `kek`, `dek`.
+#### 16.2.2 Real Request / Log Privacy & Canary Probes (PVAULT-04 Part C, PVAULT-09 Part B)
+- Route-level privacy tests (`apps/gateway/src/routes/provider-keys.test.ts`) exercise the Fastify request pipeline for `/api/provider-keys` across success (201), service failure (503), and payload validation error (400) under real Fastify `onRequest` and `onResponse` lifecycle logging hooks with captured Pino structured log output.
+- The test actively asserts that structured log events are captured (`capturedLogLines.length >= 6`), proving the logger was genuinely exercised and preventing vacuous test passes.
+- Synthetic canary credentials (`CANARY_SECRET_*`) are verified to be completely absent from captured application log lines, structured metadata fields, serialized HTTP responses, and safe error objects.
+- In addition, real PostgreSQL database integration privacy tests (`provider-key-management.db.test.ts` test B5) verify that service-level execution and error pathways never leak canary strings.
+- Pino redaction explicitly covers `credential`, `credentials`, `providerkey`, `key`, `password`, `token`, `secret`, `kek`, `dek`.
 
 #### 16.2.3 Worker Role Isolation Proven
 - Real PostgreSQL role tests confirm that `gateway_worker` is denied `SELECT` privileges on:

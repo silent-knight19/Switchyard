@@ -73,6 +73,7 @@ export const MAX_PAGE_LIMIT = 100;
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const CONTROL_CHARS_REGEX = /[\u0000-\u001F\u007F-\u009F]/;
+const CONTROL_CHARS_GLOBAL_REGEX = /[\u0000-\u001F\u007F-\u009F]/g;
 const CURSOR_TIMESTAMP_REGEX = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})\.(\d{6})Z$/;
 const BASE64URL_REGEX = /^[A-Za-z0-9_-]+$/;
 const MAX_CURSOR_LENGTH = 256;
@@ -125,7 +126,7 @@ export function deriveKeyHint(credential: string): string {
     return '****';
   }
   const lastFour = chars.slice(-4).join('');
-  const sanitizedLastFour = lastFour.replace(CONTROL_CHARS_REGEX, '');
+  const sanitizedLastFour = lastFour.replace(CONTROL_CHARS_GLOBAL_REGEX, '');
   return `****${sanitizedLastFour}`;
 }
 

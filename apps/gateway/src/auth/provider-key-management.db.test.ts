@@ -562,6 +562,46 @@ describe('SW-1.7-B: Provider Credential Vault Completion (Real PostgreSQL 16 Sui
       expect(Buffer.compare(afterRow!.auth_tag, beforeRow!.auth_tag)).toBe(0);
       expect(afterRow!.label).toBe(beforeRow!.label);
     });
+
+    it('A13. sanitizes multiple control characters and NUL in key hint without breaking PostgreSQL persistence or credential decryptability (PVAULT-07)', async () => {
+      const canaryWithControls = 'sk-opaque-test-with-controls-\x01\x00ab';
+      const res = await service.createKey(ORG_A, {
+        provider: 'openai',
+        label: 'Multi Control Char Test',
+        credential: canaryWithControls,
+      });
+
+      // Key hint must have all control characters stripped, resulting in ****ab
+      expect(res.keyHint).toBe('****ab');
+      expect(/[\u0000-\u001F\u007F-\u009F]/.test(res.keyHint)).toBe(false);
+
+      // Verify row in database: key_hint is successfully stored and contains no control characters
+      const row = await loadProviderRow(ORG_A, res.id);
+      expect(row).not.toBeNull();
+      expect(row!.key_hint).toBe('****ab');
+      expect(/[\u0000-\u001F\u007F-\u009F]/.test(row!.key_hint)).toBe(false);
+
+      // Verify decryptability: the encrypted ciphertext must preserve the exact original bytes including controls
+      const orgEnvelope = await loadOrgEnvelope(ORG_A);
+      const decrypted = vaultV1.decryptProviderCredential({
+        orgId: ORG_A,
+        providerKeyId: res.id,
+        provider: 'openai',
+        providerEnvelope: {
+          ciphertext: row!.ciphertext,
+          iv: row!.iv,
+          authTag: row!.auth_tag,
+        },
+        organizationEnvelope: orgEnvelope,
+      });
+
+      try {
+        expect(decrypted.toString('utf8')).toBe(canaryWithControls);
+        expect(Buffer.compare(decrypted, Buffer.from(canaryWithControls, 'utf8'))).toBe(0);
+      } finally {
+        decrypted.fill(0);
+      }
+    });
   });
 
   describe('STAGE B — SW-1.7.4 Decrypt-Path Scrubbing, Privacy & Hardening', () => {
@@ -1150,6 +1190,102 @@ describe('SW-1.7-B: Provider Credential Vault Completion (Real PostgreSQL 16 Sui
         }
       } finally {
         await clientA.end().catch(() => undefined);
+      }
+    });
+
+    it('C6. service-level replacement rollback: real service.replaceKey() rollback preserves prior record when PostgreSQL UPDATE fails (PVAULT-08)', async () => {
+      const canaryC6Orig = 'sk-c6-orig-888888';
+      const canaryC6Attempt = 'sk-c6-attempt-999999';
+      const canaryC6Final = 'sk-c6-final-123123';
+
+      // 1. Create a valid encrypted provider credential through the real service
+      const initialKey = await service.createKey(ORG_A, {
+        provider: 'openai',
+        label: 'C6 Initial Real Key',
+        credential: canaryC6Orig,
+      });
+
+      // 2. Save the previously committed database row
+      const beforeRow = await loadProviderRow(ORG_A, initialKey.id);
+      expect(beforeRow).not.toBeNull();
+      expect(beforeRow!.label).toBe('C6 Initial Real Key');
+
+      // 3. Set up a failure-injection trigger on provider_keys that fails when label matches test injection label
+      await adminClient.query(`
+        CREATE OR REPLACE FUNCTION trg_fn_fail_c6_update() RETURNS TRIGGER AS $$
+        BEGIN
+          IF NEW.label = 'TRIGGER_FAILURE_INJECTION_C6' THEN
+            RAISE EXCEPTION 'Simulated PostgreSQL failure during replacement UPDATE';
+          END IF;
+          RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+
+        CREATE TRIGGER trg_fail_c6_update
+        BEFORE UPDATE ON provider_keys
+        FOR EACH ROW EXECUTE FUNCTION trg_fn_fail_c6_update();
+      `);
+
+      try {
+        // 4. Call the actual service.replaceKey() method which exercises the production withTenant transaction
+        const replacePromise = service.replaceKey(ORG_A, initialKey.id, {
+          label: 'TRIGGER_FAILURE_INJECTION_C6',
+          credential: canaryC6Attempt,
+        });
+
+        // 5. Verify the service reports failure
+        await expect(replacePromise).rejects.toThrow(
+          'Simulated PostgreSQL failure during replacement UPDATE',
+        );
+
+        // 6. Verify the previous label, hint, ciphertext, IV, authentication tag and active state remain unchanged
+        const afterRow = await loadProviderRow(ORG_A, initialKey.id);
+        expect(afterRow).not.toBeNull();
+        expect(afterRow!.label).toBe(beforeRow!.label);
+        expect(afterRow!.key_hint).toBe(beforeRow!.key_hint);
+        expect(afterRow!.is_active).toBe(beforeRow!.is_active);
+        expect(Buffer.compare(afterRow!.ciphertext, beforeRow!.ciphertext)).toBe(0);
+        expect(Buffer.compare(afterRow!.iv, beforeRow!.iv)).toBe(0);
+        expect(Buffer.compare(afterRow!.auth_tag, beforeRow!.auth_tag)).toBe(0);
+
+        // 7. Verify the previous credential still decrypts correctly
+        const orgEnvelope = await loadOrgEnvelope(ORG_A);
+        const decrypted = vaultV1.decryptProviderCredential({
+          orgId: ORG_A,
+          providerKeyId: initialKey.id,
+          provider: 'openai',
+          providerEnvelope: {
+            ciphertext: afterRow!.ciphertext,
+            iv: afterRow!.iv,
+            authTag: afterRow!.auth_tag,
+          },
+          organizationEnvelope: orgEnvelope,
+        });
+
+        try {
+          expect(decrypted.toString('utf8')).toBe(canaryC6Orig);
+        } finally {
+          decrypted.fill(0);
+        }
+
+        // 8. Verify tenant context is cleaned up and database connection remains safe for reuse:
+        // Remove the failure trigger and execute a valid replacement through the same service
+        await adminClient.query('DROP TRIGGER IF EXISTS trg_fail_c6_update ON provider_keys');
+        await adminClient.query('DROP FUNCTION IF EXISTS trg_fn_fail_c6_update()');
+
+        const successRes = await service.replaceKey(ORG_A, initialKey.id, {
+          label: 'C6 Successful Valid Replace',
+          credential: canaryC6Final,
+        });
+        expect(successRes.id).toBe(initialKey.id);
+        expect(successRes.label).toBe('C6 Successful Valid Replace');
+
+        const finalRow = await loadProviderRow(ORG_A, initialKey.id);
+        expect(finalRow!.label).toBe('C6 Successful Valid Replace');
+        expect(finalRow!.is_active).toBe(true);
+      } finally {
+        await adminClient.query('DROP TRIGGER IF EXISTS trg_fail_c6_update ON provider_keys');
+        await adminClient.query('DROP FUNCTION IF EXISTS trg_fn_fail_c6_update()');
       }
     });
   });
