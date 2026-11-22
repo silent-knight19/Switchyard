@@ -422,6 +422,26 @@ describe('SW-P1-B02 Docker Compose explicit development seeding', () => {
     });
   }, 180_000);
 
+  it('rejects an incompatible KEK on repeat without changing the demo account', async () => {
+    const before = await readIdentitySnapshot();
+    const result = runSeeder(
+      demoEnvironment({ MASTER_KEK_V1: crypto.randomBytes(32).toString('base64url') }),
+      replacementPassword,
+    );
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('EXISTING_ENVELOPE_INVALID');
+    expect(await counts()).toEqual({ organizations: 1, users: 1 });
+
+    const after = await readIdentitySnapshot();
+    expect(after.passwordHash).toBe(before.passwordHash);
+    expect(after.envelope.wrappedDek.equals(before.envelope.wrappedDek)).toBe(true);
+    expect(after.envelope.dekIv.equals(before.envelope.dekIv)).toBe(true);
+    expect(after.envelope.dekAuthTag.equals(before.envelope.dekAuthTag)).toBe(true);
+    expect(after.orgName).toBe(before.orgName);
+    expect(after.budget).toBe(before.budget);
+  }, 120_000);
+
   it('reports a conflicting organization identity as CONFLICT without creating records', async () => {
     const result = runSeeder(
       demoEnvironment({
