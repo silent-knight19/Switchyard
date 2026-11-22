@@ -592,7 +592,7 @@ describe('SW-1.8.4 Stage D: Production Isolation and Acceptance Suite', () => {
       expect(data.choices[0]?.message.content).toBe('Deterministic mock response.');
     });
 
-    it('8.5.4 confirms absence of demo account seeder or hard-coded production accounts', () => {
+    it('8.5.4 confirms database init scripts contain no demo accounts or hard-coded production accounts', () => {
       const rootDir = fs.existsSync(path.resolve(process.cwd(), 'apps'))
         ? process.cwd()
         : path.resolve(process.cwd(), '../..');

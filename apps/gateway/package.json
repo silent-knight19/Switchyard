@@ -10,6 +10,7 @@
     "lint": "eslint . --no-error-on-unmatched-pattern",
     "migrate": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON src/db/migrate.ts --apply",
     "migrate:adopt-legacy": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON src/db/migrate.ts --apply --adopt-legacy",
+    "seed:dev": "pnpm build && node dist/db/seed-dev.js",
     "start": "node dist/index.js",
     "start:worker": "node dist/worker-main.js",
     "test": "vitest run --passWithNoTests",
