@@ -510,7 +510,7 @@ tracking the mandatory implementation dependencies across Phase 2:
 
 ## 15. Provider Credential Envelope Encryption (SW-1.7.1 & SW-1.7.2)
 
-Status: **IMPLEMENTED** — cryptographic foundation only. Administrative provider-credential routes remain deferred to SW-1.7.3, and final decrypt-path/backup-rotation audits remain deferred to SW-1.7.4.
+Status: **IMPLEMENTED** — cryptographic baseline.
 
 ### 15.1 Cryptographic Contract
 - **Algorithms:** AES-256-GCM for both DEK wrapping and provider-credential encryption. Key length is exactly 32 bytes, IV length exactly 12 bytes, authentication tag length exactly 16 bytes.
@@ -524,7 +524,7 @@ Status: **IMPLEMENTED** — cryptographic foundation only. Administrative provid
 - No KEK configuration leaves the vault uninitialised so existing Gateway startup and non-vault tests remain compatible.
 - Supplying any KEK value requires a valid `ACTIVE_KEK_VERSION` and a valid key for that version. Construction without valid material throws `VaultError(CONFIGURATION_ERROR)`.
 - No default, development, placeholder, or arbitrary fallback KEK is ever selected. Missing historical KEKs cause `UNKNOWN_KEK_VERSION`; they are never replaced by another configured version.
-- SW-1.7.3 must make valid KEK configuration mandatory before provider-credential management routes are enabled. There is no unencrypted or vault-disabled credential fallback.
+- SW-1.7.3 requires valid KEK configuration before provider-credential management routes are enabled. There is no unencrypted or vault-disabled credential fallback.
 
 ### 15.3 Tenant, Tamper and Substitution Resistance
 - Authenticated decryption fails when ciphertext is moved across organizations, provider-key record IDs, providers, IVs, tags, or wrapped-DEK envelopes.
@@ -538,4 +538,120 @@ Status: **IMPLEMENTED** — cryptographic foundation only. Administrative provid
 - Callers own plaintext input Buffers and returned decrypted Buffers and must clear them after authorised use.
 - JavaScript strings and runtime copies cannot be deterministically zeroized. Best-effort buffer clearing does not protect against heap snapshots, process compromise, copied buffers, or a compromised Node.js runtime.
 - Plaintext provider credentials, KEKs, and DEKs are never persisted in PostgreSQL, Redis, BullMQ, traces, Pino logs, error messages, or browser responses. Pino redaction explicitly covers `MASTER_KEK_*`, `wrapped_dek`, `dek_iv`, and `dek_auth_tag` naming variants.
-- No KEK rotation, DEK rotation, background rewrapping, caching, KMS integration, or provider dispatch is implemented in this work package.
+
+---
+
+## 16. Provider Credential Vault Completion, Administration & Security Hardening (SW-1.7.3 & SW-1.7.4)
+
+Status: **IMPLEMENTED** — complete provider credential management APIs, decrypt-path memory scrubbing verification, log privacy probes, and backup/rotation compatibility specifications.
+
+### 16.1 Admin-Only Provider Credential Management APIs (SW-1.7.3)
+
+Switchyard exposes administrative REST endpoints under `/api/provider-keys` for organization-owned provider credential lifecycle management:
+
+```text
+POST   /api/provider-keys        # Create encrypted provider credential
+GET    /api/provider-keys        # List safe metadata with keyset pagination
+PUT    /api/provider-keys/:id    # Atomically replace credential
+DELETE /api/provider-keys/:id    # Disable credential (soft delete)
+```
+
+#### 16.1.1 Authorization & Principal Separation
+- **Admin-Only Requirement:** Declares `config: { authz: { principal: 'browser', minRole: 'admin' } }`. Non-admin members receive HTTP 403 (`Forbidden`); anonymous callers receive HTTP 401 (`Unauthorized`).
+- **Principal Separation:** Data-plane virtual API keys (`Bearer sw_vk_...`) cannot access management endpoints. Requests bearing virtual key authorization headers receive HTTP 401.
+- **Tenant Context Authority:** The tenant identity is derived strictly from the authenticated browser session (`req.principal.orgId`). Client-supplied organization IDs in request bodies, URL paths, query parameters, or headers are prohibited and rejected.
+
+#### 16.1.2 Origin & CSRF Protection
+- Mutating operations (`POST`, `PUT`, `DELETE`) strictly enforce canonical `Origin` matching `BROWSER_ORIGIN` and constant-time verification of session-bound synchronizer tokens in `x-csrf-token`.
+- Requests with mismatched, missing, or forged CSRF tokens or untrusted origins are terminated before handler execution with HTTP 403.
+
+#### 16.1.3 Strict Request Validation & Credential Safety
+- Request bodies require strict JSON object formatting. Unexpected properties, duplicate headers, or query parameters on `POST`, `PUT`, and `DELETE` trigger immediate HTTP 400 (`Bad Request`) validation failures.
+- **Supported Providers:** Restricted strictly to `openai`. Unrecognized providers are rejected with HTTP 400.
+- **Label Validation:** 1 to 255 UTF-8 bytes; non-empty, non-whitespace, with prohibited control characters rejected.
+- **Credential Limits:** 1 to 4096 UTF-8 bytes. Never trimmed or normalized.
+- **Error Secrecy:** Malformed, invalid, or oversized credentials are never echoed in HTTP error responses or logs.
+
+#### 16.1.4 Safe Key Hint Derivation (§11.5)
+- For credentials exceeding 4 characters, the service derives a hint consisting of fixed prefix `****` followed by at most the last 4 sanitized display characters (e.g. `****3456`). Control characters within the last 4 characters are stripped.
+- For short credentials (4 or fewer characters), the hint returns entirely masked `****` to prevent disclosing key length or secret values.
+- Key hints are computed in-memory; plaintext credential prefixes are never stored.
+
+#### 16.1.5 Bounded Keyset Pagination & Safe Metadata
+- `GET /api/provider-keys` queries keys inside `withTenant(pool, orgId)` ordered by `created_at DESC, id DESC`.
+- keyste pagination uses opaque canonical base64url cursors `{ createdAt, id }` with microsecond UTC precision (`YYYY-MM-DDTHH:mm:ss.ffffffZ`).
+- Limit is bounded between 1 and 100 (default 20).
+- **Zero Decryption & Zero Secret Selection:** The SQL query selects non-secret columns only (`id`, `provider`, `label`, `key_hint`, `is_active`, `created_at`). `ciphertext`, `iv`, `auth_tag`, `wrapped_dek`, `dek_iv`, `dek_auth_tag`, and `kek_version` are never selected or exposed.
+- All management responses set `Cache-Control: no-store` and `Pragma: no-cache`.
+
+#### 16.1.6 Atomic Replacement & Row-Locking Concurrency
+- `PUT /api/provider-keys/:id` acquires a row lock (`SELECT ... FOR UPDATE`) inside the tenant transaction.
+- Attempting to replace a disabled credential (`is_active = false`) fails closed with HTTP 409 (`Conflict`).
+- Organization ownership and provider identity cannot be modified.
+- Generates a fresh random 12-byte IV and fresh 16-byte authentication tag through `EnvelopeVault.encryptProviderCredential`, updates the row atomically, and returns safe metadata only.
+
+#### 16.1.7 Logical Disabling & Idempotency
+- `DELETE /api/provider-keys/:id` acquires a row lock and sets `is_active = false`.
+- Encrypted ciphertext and tags are preserved; credentials are not decrypted or deleted from disk.
+- Repeated disable requests succeed idempotently with HTTP 204 (`No Content`).
+- Cross-tenant and nonexistent IDs return HTTP 404 with zero modified rows.
+
+#### 16.1.8 Startup & KEK Configuration Gating
+- Provider-key routes are registered at startup.
+- In environments where KEKs are not configured, non-vault operations (health, virtual keys, gateway proxy) remain functional. Credential management routes pass authentication and return controlled HTTP 503 (`Service Unavailable`: "Provider credential vault is unavailable").
+
+### 16.2 Decrypt-Path Scrubbing & Privacy Verification (SW-1.7.4)
+
+#### 16.2.1 Memory Scrubbing & Buffer Hygiene
+- In `ProviderKeyManagementService`, caller credentials are converted into temporary Node.js `Buffer` instances and wiped in a `finally` block via `.fill(0)` on both successful creation/replacement and all exception paths.
+- In `EnvelopeVault`, intermediate AES-GCM decipher chunks and unwrap buffers are zeroized in `finally` blocks upon both successful completion and authentication failures.
+- The returned plaintext Buffer from internal gateway decryption is caller-owned and must be zeroized by the caller immediately after authorized upstream dispatch.
+- **Node.js Runtime Limitation Disclosure:** While mutable Buffers are zeroized, immutable V8 JavaScript strings (instantiated during JSON body parsing) cannot be deterministically cleared by application code and persist until garbage collected. This architectural boundary is mitigated by bounded body limits, absence of request-body logging, and non-root process sandboxing.
+
+#### 16.2.2 Log Privacy & Canary Probes
+- Synthetic canary credentials (`CANARY_SECRET_*`) probed across structured Pino logs, Fastify error serialization, and PostgreSQL error handlers prove zero credential leakage across successful operations and controlled error conditions (validation errors, 400, 403, 404, 409, 503).
+- Pino redaction covers `credential`, `credentials`, `providerkey`, `key`, `password`, `token`, `secret`, `kek`, `dek`.
+
+#### 16.2.3 Worker Role Isolation Proven
+- Real PostgreSQL role tests confirm that `gateway_worker` is denied `SELECT` privileges on:
+  - `provider_keys.ciphertext`, `provider_keys.iv`, `provider_keys.auth_tag` (SQLSTATE `42501`)
+  - `organizations.wrapped_dek`, `organizations.dek_iv`, `organizations.dek_auth_tag` (SQLSTATE `42501`)
+- Background worker processes possess neither KEKs nor DEKs and can never read or decrypt provider secrets.
+
+### 16.3 Backup, Retention & Future KEK Rotation Compatibility (SW-1.7.4)
+
+#### 16.3.1 Database Backup Compatibility Constraints
+1. **Coupled Backup Requirement:** PostgreSQL database backups contain only wrapped DEKs and encrypted provider credentials. Restoring a database backup without the corresponding historical KEKs makes provider credentials permanently undecryptable.
+2. **Version Metadata Consistency:** Restored rows in `organizations` reference specific `kek_version` values. The KEK configuration in the target environment must include the historical KEK corresponding to each restored tenant record.
+3. **Identity Binding & AAD Immutability:** Ciphertext authentication tags depend on authenticated associated data:
+   - Organization DEK: `dek:<org_id>:v<kek_version>`
+   - Provider credential: `pk:<org_id>:<provider_key_id>:<provider>`
+   Restoring records under different organization IDs, provider-key IDs, or provider identifiers causes AES-GCM authentication failure. Records cannot be copied or transplanted between tenants.
+4. **Coordinated Retention:** Database backup retention schedules must be synchronized with KEK retention schedules.
+
+#### 16.3.2 Historical KEK Retention Requirements
+- Architecture v1.2 §14.2 requires historical KEKs to remain recoverable offline for at least the full database backup retention window (e.g. 30, 90, or 365 days depending on deployment policy).
+- Deleting an old KEK while database backups referencing that version still exist renders those backups permanently irrecoverable.
+- Loss of all secure copies of a KEK version causes total, irreversible loss of all credentials encrypted under that version.
+- Historical KEKs must be archived in secure, access-controlled offline storage and never committed to source control.
+- Environment-variable backed KEKs provide envelope confidentiality at rest; they are not equivalent to hardware security modules (HSM) or cloud KMS key policies.
+
+#### 16.3.3 Future KEK Rotation Compatibility & Operational Constraints
+Architecture v1.2 §14.2 specifies two-tier envelope encryption specifically to enable zero-downtime KEK rotation without re-encrypting provider credentials:
+1. **DEK Rewrapping (Target Implementation):**
+   - KEK rotation rewraps the 32-byte organization DEK only. Individual `provider_keys` rows remain unchanged.
+   - For each organization, unwrap `wrapped_dek` using historical KEK version `v_old`, generate a fresh 12-byte IV, re-encrypt the DEK with active KEK version `v_new`, and generate a fresh authentication tag.
+   - Persist update atomically using compare-and-swap:
+     ```sql
+     UPDATE organizations
+     SET wrapped_dek = $1, dek_iv = $2, dek_auth_tag = $3, kek_version = $4
+     WHERE id = $5 AND kek_version = $6;
+     ```
+2. **Batching & Idempotency:** The rotation migration must process organizations in bounded, configurable batches with deterministic transaction boundaries and retry safety.
+3. **Verification Before Deprecation:** An old KEK version must not be retired until a full-table query confirms zero rows in `organizations` remain at the old `kek_version`.
+4. **Distinction Between Implemented vs Future Work:**
+   - **Current Implementation:** Versioned KEK environment parsing, multi-version keyring coexistence (`MASTER_KEK_V1` and `MASTER_KEK_V2`), version-directed decryption, and historical compatibility verification.
+   - **Not Implemented in Current Release:** Automated KEK rotation CLI, background rewrapping workers, automated backup restoration tooling, and DEK rotation.
+5. **DEK Rotation Distinction:**
+   - KEK rotation changes the wrapping key of the organization DEK (metadata update on `organizations`).
+   - DEK rotation replaces the organization DEK itself, requiring every provider credential of that organization to be decrypted and re-encrypted with fresh IVs. DEK rotation is not authorized or implemented.

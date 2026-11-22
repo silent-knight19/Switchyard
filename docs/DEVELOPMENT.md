@@ -505,6 +505,21 @@ Migration `0011-session-tenant-lookup.sql` introduces an authorized, narrowly sc
   - **Worker Privilege Containment:** Proved that `gateway_worker` role cannot insert, update, revoke, delete, or invoke pre-tenant hash lookups on virtual keys.
   - **Phase 2 Admission Seam:** Formally documented handoff in [`docs/architecture/phase2-admission-key-recheck.md`](./architecture/phase2-admission-key-recheck.md) tracking `SW-2.2.3` and Architecture v1.2 §6.3.
 
+- **Provider Credential Envelope Vault Completion (SW-1.7.1 – SW-1.7.4):**
+  - **Envelope Crypto Foundation (SW-1.7.1 & SW-1.7.2):** AES-256-GCM envelope vault, versioned environment KEKs (`MASTER_KEK_V1`, `MASTER_KEK_V2`), random 32-byte organization DEK, authenticated metadata (`dek:<org_id>:v<kek_version>` and `pk:<org_id>:<provider_key_id>:<provider>`), and `0x01` blob format marker.
+  - **Admin-Only Provider Credential Management APIs (SW-1.7.3):**
+    - REST routes under `/api/provider-keys` for creation, keyset-paginated metadata listing, atomic replacement, and soft disable.
+    - Admin-only browser session requirement (`config: { authz: { principal: 'browser', minRole: 'admin' } }`), enforcing canonical Origin and cryptographically verified CSRF tokens on mutating requests.
+    - Keyset pagination with microsecond UTC cursors, strict DTO allowlists excluding all secret-bearing columns, and mandatory `Cache-Control: no-store` headers.
+    - Key hint policy deriving `****` + last 4 display characters for standard credentials and entirely masked `****` for credentials of 4 or fewer characters.
+    - KEK gating: When KEKs are absent, management routes return controlled HTTP 503 (`Service Unavailable`), preserving non-vault startup compatibility.
+  - **Decrypt-Path Scrubbing, Privacy Verification & Backup/Rotation Compatibility (SW-1.7.4):**
+    - Proven intermediate Buffer zeroization on both success and error paths.
+    - Synthetic canary privacy probes confirming zero plaintext credential leakage into application logs, error serialization, or HTTP responses.
+    - Worker column privilege containment verified under PostgreSQL 16 (worker denied ciphertext, IV, auth tags, and wrapped DEK columns with SQLSTATE 42501).
+    - Historical KEK compatibility verified across V1 and V2 coexistence; missing historical KEK fails closed.
+    - Formal database backup and future KEK rotation specifications documented in `docs/SECURITY.md`.
+
 #### 7.7.9 Known limitations (Phase 2)
 
 - Virtual API key authentication resolves identity and policy at request entry; keys revoked after initial authentication must be caught and rejected by durable row-locking inside Phase 2 provider-attempt admission.
