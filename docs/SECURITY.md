@@ -680,7 +680,9 @@ Switchyard establishes strict security boundaries between the Gateway, Worker, a
 1. **Process Separation:**
    - The worker runs as an independent daemon (`node apps/gateway/dist/worker-main.js`) separated from the Gateway API process.
    - It exposes zero network ports (`ports: []`), published host ports, or HTTP listeners.
-   - Liveness/readiness is monitored via unprivileged local CLI probe (`node apps/gateway/dist/worker-main.js --health`) checking heartbeat age (<15s) and process liveness via PID signal probing (`process.kill(pid, 0)`).
+   - Liveness/readiness is monitored via unprivileged local CLI probe (`node apps/gateway/dist/worker-main.js --health`).
+   - Readiness semantics (WRK-01): The worker maintains an active readiness state governed by continuous, bounded dependency probes (`SELECT 1` on PostgreSQL and `PING` on Redis). If either dependency fails or times out, readiness immediately transitions to `unhealthy`, returning non-zero from `--health`. Heartbeats are refreshed only after successful checks, preventing false-positive health during dependency loss.
+   - Canary redaction & safe logging (WRK-02, WRK-03): Configuration validation errors and worker startup logs use strict allowlisted error codes and safe serializers, preventing leakage of sensitive credentials or synthetic canaries in both development and production profiles. Worker logs identify strictly as `@switchyard/worker`.
 
 2. **PostgreSQL Role Boundary (`gateway_worker`):**
    - Must connect strictly as `gateway_worker` (rejects superuser, `usesuper = false`, `rolbypassrls = false`).

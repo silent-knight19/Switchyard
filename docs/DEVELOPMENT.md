@@ -603,3 +603,8 @@ Resolving Phase 1 acceptance blocker `ARCH-P1-01` (Architecture v1.2 §23), Swit
   ```bash
   docker compose up -d
   ```
+
+##### Worker Readiness & Observability Semantics (WRK-01, WRK-02, WRK-03):
+- **Readiness State:** Worker health is governed by continuous, bounded dependency probes (`WORKER_PROBE_INTERVAL_MS` default 5000ms, timeout 2000ms). Both PostgreSQL (`SELECT 1` under `gateway_worker`) and Redis (`PING` under `switchyard_worker`) must be healthy for the worker to report `ready`. If either dependency fails, readiness immediately drops to `unhealthy`, returning non-zero from `worker-main.js --health`. Readiness automatically recovers when dependencies are restored.
+- **Canary Redaction:** Configuration validation errors and startup logs strictly redact environment values and synthetic canaries using allowlisted error codes and safe serializers.
+- **Service Attribution:** Worker structured logs are identified with `service: "@switchyard/worker"` and `name: "@switchyard/worker"`, distinguishing worker daemon logs from Gateway server logs.

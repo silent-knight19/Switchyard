@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import { startWorker } from './worker/worker.js';
-import { getLogger } from './logging/index.js';
+import { getWorkerLogger } from './logging/index.js';
 
 function runHealthCheck(): void {
   const healthFile = process.env.WORKER_HEALTH_FILE || '/tmp/switchyard-worker-health.json';
@@ -53,9 +53,9 @@ if (process.argv.includes('--health')) {
   runHealthCheck();
 } else {
   startWorker().catch((err: unknown) => {
-    const logger = getLogger();
+    const logger = getWorkerLogger();
     logger.fatal(
-      { err: err instanceof Error ? err.message : String(err) },
+      { err: err instanceof Error ? err : new Error(String(err)) },
       'Worker fatal startup failure',
     );
     process.exit(1);

@@ -39,7 +39,9 @@ export function getSafeRouteIdentifier(
 
 export const SAFE_ERROR_TYPES = new Set([
   'StartupError',
+  'WorkerStartupError',
   'ConfigValidationError',
+  'WorkerConfigValidationError',
   'FastifyError',
   'ZodError',
   'DatabaseError',
@@ -102,6 +104,16 @@ export const SAFE_ERROR_CODES = new Set([
   'ERR_UPSTREAM_FAILURE',
   'ERR_NESTED_ROOT',
   'ERR_PAYLOAD_TOO_LARGE',
+  'WORKER_STARTUP_FAILED',
+  'HEALTH_FILE_INIT_FAILED',
+  'INVALID_WORKER_ROLE',
+  'WORKER_SUPERUSER_FORBIDDEN',
+  'WORKER_BYPASSRLS_FORBIDDEN',
+  'UNAUTHORIZED_GATEWAY_CONTROL_ACCESS',
+  'UNSAFE_WORKER_REDIS_ACL',
+  'DEFAULT_REDIS_USER_FORBIDDEN',
+  'PROBE_TIMEOUT',
+  'DEPENDENCY_UNHEALTHY',
 ]);
 
 export const SAFE_STARTUP_MESSAGES: Record<string, string> = {
@@ -158,6 +170,16 @@ export const SAFE_ERROR_MESSAGES = new Set([
   'Process signal received; shutting down',
   'Fatal error during graceful shutdown',
   'Payload too large',
+  'Worker fatal startup failure',
+  'Failed to initialize worker health file',
+  'Worker readiness check timed out',
+  'Worker dependency check failed',
+  "Worker must connect under 'gateway_worker' role",
+  'Worker role cannot have superuser privileges',
+  'Worker role cannot have BYPASSRLS privilege',
+  'Worker must not have access to gateway_control table or singleton state',
+  'Redis ping did not return PONG',
+  'Worker Redis ACL is not properly restricted: prohibited command was not rejected',
   '[CIRCULAR REFERENCE DETECTED]',
   'Administrative CONFIG command permitted in runtime identity',
   'Administrative KEYS command permitted in runtime identity',
@@ -203,6 +225,9 @@ export const SAFE_ISSUE_FIELDS = new Set([
   'DISABLE_AUTH',
   'INSECURE_MODE',
   'NODE_TLS_REJECT_UNAUTHORIZED',
+  'WORKER_HEALTH_FILE',
+  'WORKER_PROBE_INTERVAL_MS',
+  'WORKER_PROBE_TIMEOUT_MS',
 ]);
 
 export const SAFE_CUSTOM_ZOD_MESSAGES = new Set([
@@ -232,6 +257,10 @@ export const SAFE_CUSTOM_ZOD_MESSAGES = new Set([
   'KEK material must be canonical unpadded base64url encoding exactly 32 bytes',
   'KEK material must not be all zero bytes',
   'KEK V1 and KEK V2 must not contain identical key material',
+  "Worker must connect under the restricted 'gateway_worker' database role",
+  'Worker cannot use default or gateway_app Redis identity; a dedicated restricted worker ACL identity is required',
+  'Expected integer between 50 and 300000',
+  'Worker runtime must not have access to provider encryption keys or KEKs',
 ]);
 
 export interface SerializedError {

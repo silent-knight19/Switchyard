@@ -3,19 +3,28 @@ import path from 'node:path';
 import pg from 'pg';
 import { Redis } from 'ioredis';
 import { parseWorkerConfig, type WorkerConfig } from './config.js';
-import { createLogger, getLogger } from '../logging/index.js';
+import { getWorkerLogger } from '../logging/index.js';
+
+export interface DependencyStatus {
+  database: 'healthy' | 'unhealthy';
+  redis: 'healthy' | 'unhealthy';
+}
+
+export interface WorkerReadinessResult {
+  ok: boolean;
+  status: 'ready' | 'unhealthy' | 'shutting_down';
+  dependencies: DependencyStatus;
+  error?: string | undefined;
+}
 
 export interface WorkerContext {
   config: WorkerConfig;
   pgPool: pg.Pool;
   redis: Redis;
   isReady(): boolean;
-  checkReadiness(timeoutMs?: number): Promise<{
-    ok: boolean;
-    code?: string;
-    error?: string;
-    dependencies?: { database: string; redis: string };
-  }>;
+  getDependencyStatus(): DependencyStatus;
+  checkReadiness(timeoutMs?: number): Promise<WorkerReadinessResult>;
+  runHealthProbe(): Promise<WorkerReadinessResult>;
   stop(): Promise<void>;
 }
 
@@ -35,17 +44,99 @@ export class WorkerStartupError extends Error {
   }
 }
 
+export async function executeDependencyProbe(
+  pgPool: pg.Pool,
+  redis: Redis,
+  timeoutMs = 2000,
+): Promise<{
+  ok: boolean;
+  dependencies: DependencyStatus;
+  error?: string | undefined;
+}> {
+  const dependencies: DependencyStatus = {
+    database: 'unhealthy',
+    redis: 'unhealthy',
+  };
+
+  const probeAction = async (): Promise<{
+    ok: boolean;
+    dependencies: DependencyStatus;
+    error?: string | undefined;
+  }> => {
+    // 1. Database connectivity check under restricted worker role
+    let pgOk = false;
+    let pgClient: pg.PoolClient | null = null;
+    try {
+      pgClient = await pgPool.connect();
+      await pgClient.query('SELECT 1');
+      pgOk = true;
+      dependencies.database = 'healthy';
+    } catch {
+      dependencies.database = 'unhealthy';
+    } finally {
+      if (pgClient) {
+        try {
+          pgClient.release();
+        } catch {
+          /* ignore release errors */
+        }
+      }
+    }
+
+    // 2. Redis connectivity check under restricted worker ACL
+    let redisOk = false;
+    try {
+      const pong = await redis.ping();
+      if (pong === 'PONG') {
+        redisOk = true;
+        dependencies.redis = 'healthy';
+      } else {
+        dependencies.redis = 'unhealthy';
+      }
+    } catch {
+      dependencies.redis = 'unhealthy';
+    }
+
+    const ok = pgOk && redisOk;
+    return {
+      ok,
+      dependencies,
+      error: ok ? undefined : 'Worker dependency check failed',
+    };
+  };
+
+  let timer: NodeJS.Timeout | null = null;
+  const timeoutPromise = new Promise<{
+    ok: boolean;
+    dependencies: DependencyStatus;
+    error?: string | undefined;
+  }>((resolve) => {
+    timer = setTimeout(() => {
+      resolve({
+        ok: false,
+        dependencies,
+        error: 'Worker readiness check timed out',
+      });
+    }, timeoutMs);
+    timer.unref();
+  });
+
+  try {
+    return await Promise.race([probeAction(), timeoutPromise]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+}
+
 export async function createWorker(
   envOverride?: Record<string, string | undefined>,
   dependencies?: WorkerDependencies,
 ): Promise<WorkerContext> {
   // Step 1: Validate worker configuration
   const config = parseWorkerConfig(envOverride);
-
-  const logger = createLogger({
-    level: config.NODE_ENV === 'production' ? 'info' : 'debug',
-    environment: config.NODE_ENV,
-  });
+  const logger = getWorkerLogger();
 
   logger.info({ env: config.NODE_ENV }, 'Initializing Switchyard Worker runtime foundation');
 
@@ -54,6 +145,31 @@ export async function createWorker(
   let heartbeatTimer: NodeJS.Timeout | null = null;
   let isReadyState = false;
   let isStopping = false;
+  let isProbing = false;
+  let currentDependencies: DependencyStatus = {
+    database: 'unhealthy',
+    redis: 'unhealthy',
+  };
+
+  const writeHealthFileOrThrow = (
+    status: 'ready' | 'unhealthy' | 'shutting_down',
+    deps: DependencyStatus,
+    reason?: string,
+  ): void => {
+    const dir = path.dirname(config.WORKER_HEALTH_FILE);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    const payload = JSON.stringify({
+      status,
+      pid: process.pid,
+      timestamp: Date.now(),
+      worker: status === 'ready' ? 'operational' : 'degraded',
+      dependencies: deps,
+      ...(reason ? { reason } : {}),
+    });
+    fs.writeFileSync(config.WORKER_HEALTH_FILE, payload, 'utf8');
+  };
 
   const cleanup = async () => {
     if (heartbeatTimer) {
@@ -113,7 +229,7 @@ export async function createWorker(
       if (!userRow || userRow.usename !== 'gateway_worker') {
         throw new WorkerStartupError(
           'INVALID_WORKER_ROLE',
-          `Worker must connect under 'gateway_worker' role (connected as: '${userRow?.usename}')`,
+          "Worker must connect under 'gateway_worker' role",
         );
       }
       if (userRow.usesuper) {
@@ -154,6 +270,8 @@ export async function createWorker(
       pgClient.release();
     }
 
+    currentDependencies.database = 'healthy';
+
     // Step 3: Initialize and verify Redis connectivity under restricted worker ACL
     if (!redis) {
       redis = new Redis({
@@ -182,7 +300,7 @@ export async function createWorker(
     if (policy !== 'noeviction') {
       throw new WorkerStartupError(
         'UNSAFE_REDIS_POLICY',
-        `Unsafe Redis policy "${policy}": expected "noeviction"`,
+        'Unsafe Redis policy: expected "noeviction"',
       );
     }
 
@@ -207,7 +325,7 @@ export async function createWorker(
     if (currentRedisUser !== config.REDIS_USER) {
       throw new WorkerStartupError(
         'REDIS_USER_MISMATCH',
-        `Worker connected as "${currentRedisUser}" but expected "${config.REDIS_USER}"`,
+        'Redis runtime identity does not match configured user',
       );
     }
 
@@ -236,48 +354,102 @@ export async function createWorker(
       }
     }
 
-    // Step 4: Write initial readiness state file and start heartbeat
-    const updateHealthFile = (status: 'ready' | 'shutting_down') => {
+    currentDependencies.redis = 'healthy';
+
+    // Step 4: Write initial readiness state file (fails closed if initial file write fails)
+    try {
+      writeHealthFileOrThrow('ready', currentDependencies);
+    } catch {
+      throw new WorkerStartupError(
+        'HEALTH_FILE_INIT_FAILED',
+        'Failed to initialize worker health file',
+      );
+    }
+    isReadyState = true;
+
+    // Health probe execution logic with concurrency protection (WRK-01)
+    const runHealthProbe = async (
+      timeoutMs: number = config.WORKER_PROBE_TIMEOUT_MS,
+    ): Promise<WorkerReadinessResult> => {
+      if (isStopping) {
+        return {
+          ok: false,
+          status: 'shutting_down',
+          dependencies: currentDependencies,
+          error: 'Worker is shutting down',
+        };
+      }
+
+      if (isProbing) {
+        // Prevent overlapping probes: return current state
+        return {
+          ok: isReadyState,
+          status: isReadyState ? 'ready' : 'unhealthy',
+          dependencies: currentDependencies,
+        };
+      }
+
+      isProbing = true;
       try {
-        const dir = path.dirname(config.WORKER_HEALTH_FILE);
-        if (!fs.existsSync(dir)) {
-          fs.mkdirSync(dir, { recursive: true });
+        const check = await executeDependencyProbe(pgPool!, redis!, timeoutMs);
+        currentDependencies = check.dependencies;
+
+        if (isStopping) {
+          return {
+            ok: false,
+            status: 'shutting_down',
+            dependencies: currentDependencies,
+          };
         }
-        const payload = JSON.stringify({
-          status,
-          pid: process.pid,
-          timestamp: Date.now(),
-          worker: 'operational',
-        });
-        fs.writeFileSync(config.WORKER_HEALTH_FILE, payload, 'utf8');
-      } catch {
-        /* best-effort health file update */
+
+        if (check.ok) {
+          isReadyState = true;
+          try {
+            writeHealthFileOrThrow('ready', currentDependencies);
+          } catch {
+            /* best effort write on periodic heartbeat */
+          }
+          return {
+            ok: true,
+            status: 'ready',
+            dependencies: currentDependencies,
+          };
+        } else {
+          isReadyState = false;
+          try {
+            writeHealthFileOrThrow('unhealthy', currentDependencies, check.error);
+          } catch {
+            /* best effort write on periodic heartbeat */
+          }
+          return {
+            ok: false,
+            status: 'unhealthy',
+            dependencies: currentDependencies,
+            error: check.error,
+          };
+        }
+      } finally {
+        isProbing = false;
       }
     };
 
-    isReadyState = true;
-    updateHealthFile('ready');
-
-    // Heartbeat updates health timestamp every 5 seconds and keeps PG connection active
+    // Periodic heartbeat executes bounded dependency probe every WORKER_PROBE_INTERVAL_MS
     heartbeatTimer = setInterval(async () => {
-      if (isReadyState && !isStopping) {
-        updateHealthFile('ready');
-        if (pgPool) {
-          try {
-            await pgPool.query('SELECT 1');
-          } catch {
-            /* best-effort heartbeat query */
-          }
-        }
+      if (!isStopping) {
+        await runHealthProbe();
       }
-    }, 5000);
+    }, config.WORKER_PROBE_INTERVAL_MS);
     heartbeatTimer.unref();
 
     const stop = async () => {
       if (isStopping) return;
       isStopping = true;
       isReadyState = false;
-      updateHealthFile('shutting_down');
+      try {
+        writeHealthFileOrThrow('shutting_down', currentDependencies);
+      } catch {
+        /* best effort */
+      }
       await cleanup();
     };
 
@@ -286,42 +458,12 @@ export async function createWorker(
       pgPool,
       redis,
       isReady: () => isReadyState && !isStopping,
-      checkReadiness: async (timeoutMs = 2000) => {
-        if (!isReadyState || isStopping) {
-          return { ok: false, code: 'NOT_READY', error: 'Worker is not ready or stopping' };
-        }
-        try {
-          const timeoutPromise = new Promise<{ ok: false; code: string; error: string }>(
-            (resolve) => {
-              setTimeout(
-                () => resolve({ ok: false, code: 'TIMEOUT', error: 'Readiness check timed out' }),
-                timeoutMs,
-              ).unref();
-            },
-          );
-
-          const checkPromise = (async () => {
-            const pgClient = await pgPool!.connect();
-            try {
-              await pgClient.query('SELECT 1');
-            } finally {
-              pgClient.release();
-            }
-            const pong = await redis!.ping();
-            if (pong !== 'PONG') {
-              return { ok: false, code: 'REDIS_ERROR', error: 'Redis ping did not return PONG' };
-            }
-            return {
-              ok: true,
-              dependencies: { database: 'healthy', redis: 'healthy' },
-            };
-          })();
-
-          return await Promise.race([checkPromise, timeoutPromise]);
-        } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return { ok: false, code: 'DEPENDENCY_ERROR', error: msg };
-        }
+      getDependencyStatus: () => ({ ...currentDependencies }),
+      checkReadiness: async (timeoutMs?: number) => {
+        return await runHealthProbe(timeoutMs);
+      },
+      runHealthProbe: async () => {
+        return await runHealthProbe();
       },
       stop,
     };
@@ -336,7 +478,7 @@ export async function startWorker(
   dependencies?: WorkerDependencies,
 ): Promise<WorkerContext> {
   const context = await createWorker(envOverride, dependencies);
-  const logger = getLogger();
+  const logger = getWorkerLogger();
 
   logger.info(
     { pid: process.pid, healthFile: context.config.WORKER_HEALTH_FILE },

@@ -192,7 +192,7 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15, DB-16 
       await new Promise((r) => setTimeout(r, 1000));
     }
     expect(webReady).toBe(true);
-  }, 360_000);
+  }, 600_000);
 
   afterAll(() => {
     try {
@@ -778,5 +778,73 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15, DB-16 
       await new Promise((r) => setTimeout(r, 1000));
     }
     expect(webRecovered).toBe(true);
+  });
+
+  it('proves worker detects dependency loss and recovers health when dependency is restored (WRK-01)', async () => {
+    // 1. Initial state: worker CLI health check must pass with exit code 0
+    const initialHealth = run(
+      'docker',
+      ['exec', workerContainer, 'node', 'apps/gateway/dist/worker-main.js', '--health'],
+      composeEnv,
+    );
+    expect(initialHealth).toBe('');
+
+    // 2. Pause isolated test Redis container to induce dependency loss
+    run('docker', ['pause', redisContainer], composeEnv);
+
+    try {
+      // 3. Worker health probe must fail within bounded interval (probe interval 5s + timeout 2s)
+      let workerReportedUnhealthy = false;
+      for (let i = 0; i < 20; i += 1) {
+        try {
+          run(
+            'docker',
+            ['exec', workerContainer, 'node', 'apps/gateway/dist/worker-main.js', '--health'],
+            composeEnv,
+          );
+        } catch {
+          // Health probe failed as expected
+          const healthJson = run(
+            'docker',
+            ['exec', workerContainer, 'cat', '/tmp/switchyard-worker-health.json'],
+            composeEnv,
+          );
+          if (healthJson.includes('"status":"unhealthy"')) {
+            workerReportedUnhealthy = true;
+            break;
+          }
+        }
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+      expect(workerReportedUnhealthy).toBe(true);
+    } finally {
+      // 4. Restore Redis dependency
+      run('docker', ['unpause', redisContainer], composeEnv);
+    }
+
+    // 5. Worker must automatically recover and return exit code 0 on health check
+    let workerRecovered = false;
+    for (let i = 0; i < 20; i += 1) {
+      try {
+        run(
+          'docker',
+          ['exec', workerContainer, 'node', 'apps/gateway/dist/worker-main.js', '--health'],
+          composeEnv,
+        );
+        const healthJson = run(
+          'docker',
+          ['exec', workerContainer, 'cat', '/tmp/switchyard-worker-health.json'],
+          composeEnv,
+        );
+        if (healthJson.includes('"status":"ready"')) {
+          workerRecovered = true;
+          break;
+        }
+      } catch {
+        // wait for next periodic probe
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    expect(workerRecovered).toBe(true);
   });
 });

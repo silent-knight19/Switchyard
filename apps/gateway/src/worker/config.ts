@@ -1,12 +1,15 @@
 import { z } from 'zod';
+import { isSensitiveKey } from '../logging/redaction.js';
+import { formatSafeZodMessage } from '../logging/serializers.js';
 
 export class WorkerConfigValidationError extends Error {
-  public readonly issues: string[];
+  public readonly issues: readonly string[];
+  public readonly code = 'CONFIG_VALIDATION_FAILED';
 
   constructor(issues: string[]) {
     super(`Worker configuration validation failed: ${issues.join('; ')}`);
     this.name = 'WorkerConfigValidationError';
-    this.issues = issues;
+    this.issues = Object.freeze([...issues]);
     Object.setPrototypeOf(this, new.target.prototype);
   }
 }
@@ -22,12 +25,32 @@ const FORBIDDEN_SECURITY_FLAGS = [
   'INSECURE_MODE',
 ] as const;
 
+const SENSITIVE_FIELD_NAMES = new Set([
+  'POSTGRES_PASSWORD',
+  'REDIS_PASSWORD',
+  'MASTER_KEK_V1',
+  'MASTER_KEK_V2',
+  'ACTIVE_KEK_VERSION',
+]);
+
 const portNumber = z.string().transform((val, ctx) => {
   const num = Number(val);
   if (!Number.isInteger(num) || num < 1 || num > 65535) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       message: 'Expected integer between 1 and 65535',
+    });
+    return z.NEVER;
+  }
+  return num;
+});
+
+const positiveInt = z.string().transform((val, ctx) => {
+  const num = Number(val);
+  if (!Number.isInteger(num) || num < 50 || num > 300000) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'Expected integer between 50 and 300000',
     });
     return z.NEVER;
   }
@@ -65,6 +88,10 @@ export const workerEnvSchema = z
 
     // Health file path for heartbeat and status check
     WORKER_HEALTH_FILE: z.string().default('/tmp/switchyard-worker-health.json'),
+
+    // Bounded probe timings (Architecture v1.2 §20, §23)
+    WORKER_PROBE_INTERVAL_MS: positiveInt.default(5000),
+    WORKER_PROBE_TIMEOUT_MS: positiveInt.default(2000),
   })
   .passthrough();
 
@@ -82,6 +109,8 @@ export interface WorkerConfig {
   REDIS_MAXMEMORY_POLICY: string;
   REDIS_TLS: boolean;
   WORKER_HEALTH_FILE: string;
+  WORKER_PROBE_INTERVAL_MS: number;
+  WORKER_PROBE_TIMEOUT_MS: number;
 }
 
 export function parseWorkerConfig(
@@ -106,20 +135,24 @@ export function parseWorkerConfig(
     }
   }
 
-  // Check 3: Schema parse
+  // Check 3: Schema parse using safe formatting to prevent raw value leakage
   const parseResult = workerEnvSchema.safeParse(rawEnv);
   if (!parseResult.success) {
     for (const issue of parseResult.error.issues) {
-      const fieldPath = issue.path.join('.');
-      issues.push(`${fieldPath}: ${issue.message}`);
+      const fieldPath = issue.path.join('.') || 'environment';
+      const isSensitive = SENSITIVE_FIELD_NAMES.has(fieldPath) || isSensitiveKey(fieldPath);
+      const safeMessage = isSensitive
+        ? 'Invalid value provided for sensitive credential'
+        : formatSafeZodMessage(issue);
+      issues.push(`${fieldPath}: ${safeMessage}`);
     }
   }
 
-  // Check 4: Invariant - PostgreSQL identity must strictly be gateway_worker
+  // Check 4: Invariant - PostgreSQL identity must strictly be gateway_worker (never interpolate raw user input)
   const pgUser = rawEnv.POSTGRES_USER ?? 'gateway_worker';
   if (pgUser !== 'gateway_worker') {
     issues.push(
-      `Worker must connect under the restricted 'gateway_worker' database role (attempted: '${pgUser}')`,
+      "POSTGRES_USER: Worker must connect under the restricted 'gateway_worker' database role",
     );
   }
 
@@ -127,7 +160,7 @@ export function parseWorkerConfig(
   const redisUser = rawEnv.REDIS_USER ?? 'switchyard_worker';
   if (redisUser === 'default' || redisUser === 'gateway_app') {
     issues.push(
-      `Worker cannot use '${redisUser}' Redis identity; a dedicated restricted worker ACL identity is required`,
+      'REDIS_USER: Worker cannot use default or gateway_app Redis identity; a dedicated restricted worker ACL identity is required',
     );
   }
 
