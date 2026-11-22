@@ -12,6 +12,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "lint": "pnpm -r --filter=!switchyard lint",
+    "seed:dev": "pnpm --filter @switchyard/gateway build && node apps/gateway/dist/db/seed-dev.js",
     "test": "pnpm -r --filter=!switchyard test",
     "test:db": "pnpm --filter @switchyard/gateway test:db",
     "test:integration": "INTEGRATION_TESTS=required pnpm -r --filter=!switchyard test",

@@ -612,3 +612,115 @@ Resolving Phase 1 acceptance blocker `ARCH-P1-01` (Architecture v1.2 §23), Swit
 - **Production Credential Validation (WRK-06):** In production profiles (`NODE_ENV=production`), default development credentials (`switchyard_worker_password`, `switchyard_dev_password`, `switchyard_app_password`, `password`, `postgres`, `admin`, `root`) are rejected fail-closed. Sensitive credentials are never echoed in error messages or logs.
 - **Canary Redaction (WRK-02):** Configuration validation errors and startup logs strictly redact environment values and synthetic canaries using allowlisted error codes and safe serializers.
 - **Service Attribution (WRK-03):** Worker structured logs are identified with `service: "@switchyard/worker"` and `name: "@switchyard/worker"`, distinguishing worker daemon logs from Gateway server logs.
+
+#### 7.7.12 Explicit Development-Only Demo Account Seeding (SW-P1-B02)
+
+The demo seeder provisions one organization and one initial administrator for local development. It is an explicit, short-lived foreground CLI and reuses the production bootstrap contract (`app_private.create_organization_with_admin` via `bootstrapOrganizationWithAdmin`) and the production envelope vault (`EnvelopeVault.createOrganizationEnvelope`). Docker Compose, migrations, the Gateway entrypoint, and the worker never invoke it, so a clean clone starts with zero organizations and zero users.
+
+##### Prerequisites
+
+1. PostgreSQL is running and the role bootstrap plus migrations have been applied (`pnpm --filter @switchyard/gateway bootstrap:roles`, then `pnpm migrate` from the repository root, or `docker compose up`).
+2. `POSTGRES_PASSWORD` is the password of the restricted `gateway_app` runtime role.
+3. A valid KEK is configured. The seeder uses `MASTER_KEK_V1`/`MASTER_KEK_V2` and `ACTIVE_KEK_VERSION` exactly like the Gateway vault.
+
+##### Required configuration
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `NODE_ENV` | yes | Must be exactly `development`; `production`, `test`, and missing values fail closed before any connection. |
+| `DEMO_SEEDING_ENABLED` | yes | Must be exactly `true`. No default enablement. |
+| `DEMO_ORG_ID` | yes | Canonical lowercase UUID. Reusing the same value makes invocations idempotent. |
+| `DEMO_ORG_NAME` | yes | 1–255 characters, no control characters. Only applied on first creation. |
+| `DEMO_ADMIN_EMAIL` | yes | Canonical email: trimmed, lowercase, at most 255 characters. |
+| `DEMO_MONTHLY_BUDGET_MICRODOLLARS` | no | Nonnegative base-10 integer up to `1000000000000000`; defaults to `0`. Only applied on first creation. |
+| `DEMO_SEEDING_TARGET` | no | `local` (default) or `compose`. See target restrictions below. |
+| `POSTGRES_HOST` | no | `127.0.0.1`, `localhost`, or `::1` for `local`; exactly `postgres` for `compose`. |
+| `POSTGRES_PORT` | no | Defaults to `5432`. |
+| `POSTGRES_DB` | no | Defaults to `switchyard`. |
+| `POSTGRES_USER` | yes | Must be exactly `gateway_app`; privileged, migrator, executor, and worker roles are rejected. |
+| `POSTGRES_PASSWORD` | yes | Password for `gateway_app`. Never printed. |
+| `MASTER_KEK_V1` / `MASTER_KEK_V2`, `ACTIVE_KEK_VERSION` | yes | Same canonical 32-byte base64url KEK contract as the Gateway. |
+
+Connection overrides (`DATABASE_URL`, `PG*`, `MIGRATE_POSTGRES_*`, `BOOTSTRAP_POSTGRES_*`) are rejected rather than prioritized. After connecting, the seeder also verifies the effective `current_user`/`session_user` is the non-superuser, non-`BYPASSRLS` `gateway_app` role.
+
+##### Host (local PostgreSQL) invocation
+
+```bash
+export NODE_ENV=development
+export DEMO_SEEDING_ENABLED=true
+export DEMO_ORG_ID=11111111-1111-4111-8111-111111111111
+export DEMO_ORG_NAME="Local Demo Organization"
+export DEMO_ADMIN_EMAIL=demo-admin@example.test
+export POSTGRES_USER=gateway_app
+export POSTGRES_PASSWORD=...
+export MASTER_KEK_V1=...        # 32 random bytes, base64url
+export ACTIVE_KEK_VERSION=1
+
+# Read the administrator password from stdin. Use printf, not echo: a trailing
+# newline is part of the password because input is never trimmed.
+printf '%s' "$DEMO_ADMIN_PASSWORD" | pnpm seed:dev
+```
+
+`pnpm seed:dev` compiles the Gateway package and then executes the compiled CLI, so it always reflects the current source. In the Docker Compose runner image, invoke the already-compiled `apps/gateway/dist/db/seed-dev.js` directly (shown below).
+
+##### Approved Docker Compose invocation
+
+Inside the Compose network the database host is `postgres`, so `DEMO_SEEDING_TARGET=compose` is required. The command must attach to the existing `gateway` service definition (which already supplies `NODE_ENV=development`, `POSTGRES_HOST=postgres`, the `gateway_app` role and the database password) and must pass the demo/KEK variables explicitly:
+
+```bash
+docker compose up -d
+
+export DEMO_ORG_ID=11111111-1111-4111-8111-111111111111
+export DEMO_ORG_NAME="Local Demo Organization"
+export DEMO_ADMIN_EMAIL=demo-admin@example.test
+export DEMO_SEEDING_TARGET=compose
+export MASTER_KEK_V1=...
+export ACTIVE_KEK_VERSION=1
+
+# -e NAME (without a value) copies the variable from the exported environment, so the
+# KEK is not exposed in the process argument list.
+printf '%s' "$DEMO_ADMIN_PASSWORD" | docker compose run --rm --no-deps -T \
+  -e NODE_ENV=development \
+  -e DEMO_SEEDING_ENABLED=true \
+  -e DEMO_ORG_ID \
+  -e DEMO_ORG_NAME \
+  -e DEMO_ADMIN_EMAIL \
+  -e DEMO_SEEDING_TARGET \
+  -e MASTER_KEK_V1 \
+  -e ACTIVE_KEK_VERSION \
+  gateway node apps/gateway/dist/db/seed-dev.js
+```
+
+`-T` disables TTY allocation so the password arrives on a pipe. No default password exists, command-line arguments are rejected, and interactive stdin is refused because the CLI does not implement a no-echo prompt.
+
+##### Idempotency and conflict semantics
+
+| Status | Meaning | Database effect |
+|---|---|---|
+| `CREATED` | No account with `DEMO_ADMIN_EMAIL` existed; organization and admin were created atomically. | One organization and one admin inserted. Only the first run applies the name, budget, envelope, and password. |
+| `ALREADY_PRESENT` | The canonical email already belongs to an `admin` in `DEMO_ORG_ID`. | No writes. Password, role, name, budget, and envelope are preserved. |
+| `CONFLICT` | The email belongs to another organization, a non-admin role, or the organization UUID is already taken. | No writes. Resolve the collision manually; the seeder never adopts, promotes, or rewrites identities. |
+
+Concurrent invocations converge on exactly one organization and one admin: the database function is atomic, and a duplicate-key race is re-verified before reporting `ALREADY_PRESENT` or `CONFLICT`.
+
+##### Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | `CREATED` or `ALREADY_PRESENT`. |
+| `1` | Operational failure (connection, privilege, or unexpected database error). Only an allowlisted error code is printed. |
+| `2` | Invalid configuration, unsupported arguments, or invalid/empty/oversized password. Rejected before any database connection. |
+| `3` | `CONFLICT`. The network/configuration were valid; no data was changed. |
+
+##### Verification
+
+- `apps/gateway/src/db/seed-dev.test.ts` — configuration matrix, bounded stdin handling, exit codes, secret redaction, and absence of HTTP/Redis/singleton-lock dependencies.
+- `apps/gateway/src/db/seed-dev.db.test.ts` — real PostgreSQL 16: first creation, login through `AuthenticationService`, DEK envelope round-trip and tamper resistance, RLS, idempotent repeat, concurrency, conflicts, and zero orphan records.
+- `apps/gateway/src/db/seed-dev.compose.db.test.ts` — isolated six-service Compose project: no implicit seeding, explicit `CREATED`, repeat `ALREADY_PRESENT`, `CONFLICT`, production rejection, restart persistence, and secret-free worker/web environments.
+
+##### Limitations
+
+- The seeder provisions one demo organization and one admin. It is not a general user-management or registration API.
+- Re-running does not rotate the password or update name/budget. Use the normal authenticated administrative flows for later changes.
+- The password arrives as an immutable JavaScript string and cannot be deterministically zeroized; temporary byte buffers are cleared, but V8 strings persist until garbage collection.
+- Loss of the KEK used at creation makes the organization DEK unrecoverable, exactly as for any Gateway-created organization.

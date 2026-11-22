@@ -714,3 +714,61 @@ Switchyard establishes strict security boundaries between the Gateway, Worker, a
    - Web container possesses zero database credentials (`POSTGRES_*`), zero Redis credentials (`REDIS_*`), and zero vault keys (`MASTER_KEK_*`).
    - Does not connect directly to PostgreSQL or Redis.
    - Health endpoint `/health/ready` reports static machine-readable readiness without fabricating unauthenticated dependencies.
+
+---
+
+## 18. Development-Only Demo Account Seeding (SW-P1-B02)
+
+This section defines the security boundary for the explicit `pnpm seed:dev` CLI that provisions one local demo organization and administrator. It is a development convenience, not a runtime feature, authentication bypass, or registration API.
+
+### 18.1 Threat Model
+
+| Threat | Control |
+|---|---|
+| Seeder accidentally run against production | `NODE_ENV` must be exactly `development`; `production` is rejected first, before KEK parsing, stdin reads, or database connections. `DEMO_SEEDING_ENABLED=true` is mandatory. |
+| Seeder starts implicitly with Compose or migrations | The seeder is a separate executables entrypoint, wired only to the explicit `seed:dev` scripts. No Compose service, migration, Gateway startup path, or worker path references it. |
+| Seeder redirected to an attacker or shared database | Host targets are limited to loopback (`127.0.0.1`, `localhost`, `::1`). The only non-loopback host accepted is `postgres`, and only with `DEMO_SEEDING_TARGET=compose`. Connection-string and `PG*` overrides are rejected. |
+| Seeder connects with excessive privileges | `POSTGRES_USER` must be `gateway_app`. After connecting, the effective `current_user` and `session_user` must both be `gateway_app`, `rolsuper=false`, and `rolbypassrls=false`. |
+| Default, empty, weak, or oversized administrator password | No default password exists. The password is accepted only from non-interactive stdin, bounded at 128 UTF-8 bytes during collection, must be valid strict UTF-8, and must pass the authoritative authentication password validation. |
+| Password leak through argv, shell history, or process listings | Command-line arguments are rejected outright. The password is never accepted as an environment variable, flag, or positional argument. |
+| Secret leakage in stdout/stderr or error objects | Output contains only the status, organization UUID, and allowlisted error codes. Passwords, Argon2 verifiers, KEK material, database passwords, wrapped DEKs, IVs, auth tags, connection strings, and driver messages are never printed. |
+| Placeholder or predictable DEK material | The seeder calls the production `EnvelopeVault.createOrganizationEnvelope` with the active KEK. It cannot persist zeroed, random-in-test, or placeholder envelope bytes. |
+| Identity collision or privilege adoption | An existing email is adopted only when it is already an `admin` in the requested `DEMO_ORG_ID`. Otherwise the result is `CONFLICT` with zero writes. The seeder never promotes members or rewrites another organization's account. |
+| Duplicate records under concurrent runs | Organization plus admin creation is one atomic `SECURITY DEFINER` database call. A duplicate-key race is re-verified and classified without a second write. |
+| Partial provisioning | The privileged function inserts `organizations` and `users` in one transaction. Any failure, including duplicate organization UUID, rolls both back, so no orphan admin can exist. |
+
+### 18.2 Profile and Target Enforcement Order
+
+Validation fails closed in this order: `NODE_ENV=production` rejection, non-development rejection, explicit enable flag, UUID/name/email/budget validation, KEK validation, target selection, connection-override rejection, and database host/role/credential checks. Production rejection therefore occurs before any secret is read or any socket is opened.
+
+`DEMO_SEEDING_TARGET=local` is the default and allows only loopback. `DEMO_SEEDING_TARGET=compose` allows only the container hostname `postgres`, which is only routable inside the approved Compose network. This is an explicit operator assertion of topology, not an automatic detection mechanism; a user who maps the name `postgres` to a remote host can still redirect a local client, so the supported path is the approved Compose invocation with the `gateway` service.
+
+### 18.3 Password Handling
+
+- Input is read from stdin in bounded chunks; a chunk that would exceed 128 bytes aborts the read immediately rather than buffering it.
+- Input is decoded as fatal UTF-8. Invalid byte sequences are rejected without echoing the bytes.
+- Input is never trimmed, normalized, case-folded, or otherwise transformed. A trailing newline from `echo` is part of the password, so documentation requires `printf '%s'`.
+- The existing `validatePasswordInput` and Argon2id configuration (`m=19456, t=2, p=1`) from the authentication service are reused; the seeder does not implement its own hashing.
+- Mutable byte buffers are zeroized on success and failure. The resulting immutable JavaScript string cannot be deterministically zeroized, is not logged, and is released to garbage collection after use. This is the same runtime limitation documented for request-body strings in §16.2.1.
+
+### 18.4 KEK, DEK, and Database Identity
+
+The seeder parses the KEK through `inspectKekEnvironment`, rejecting absent, malformed, all-zero, and version-inconsistent configuration. It creates a genuine 32-byte organization DEK, wraps it with the active KEK and a fresh IV, and stores the real wrapped DEK, IV, and authentication tag. The envelope remains tenant-bound through the existing `dek:<org_id>:v<kek_version>` AAD and is proven in integration tests to decrypt only under the correct organization and KEK.
+
+The seeder never starts the HTTP server, never acquires the Gateway singleton advisory lock, and never constructs a Redis client or login rate limiter. It uses the restricted `gateway_app` pool for the privileged bootstrap call; no owner, migrator, executor, or superuser credentials are accepted.
+
+### 18.5 Idempotency and Conflict Safety
+
+An existing canonical email is looked up through the restricted pre-tenant function `app_private.lookup_user_for_login`, and only `id`, `org_id`, and `role` are selected. The result is `ALREADY_PRESENT` only when `org_id` equals `DEMO_ORG_ID` and `role` is `admin`. Everything else is `CONFLICT` with zero changes. Re-running never resets a password, changes a role, updates the budget or name, or rewraps the DEK, and the `CONFLICT` exit code is distinct (`3`) from operational failure (`1`).
+
+### 18.6 Verification Evidence
+
+- Unit tests prove the rejection matrix, bounded non-TTY stdin, exit codes, absence of HTTP/Redis/singleton-lock dependencies, and canary-free output.
+- Real PostgreSQL tests prove creation, `AuthenticationService` login, envelope round-trip, wrong-tenant/wrong-KEK/tamper failure, RLS, idempotent no-op repeats, concurrency, conflict behavior, and rollback with zero orphan rows.
+- The isolated Compose acceptance test proves that all six services start without a demo account, the CLI is the only provisioning path, repeat and conflict behavior hold over the real container network, restart preserves the identity, production execution is rejected before mutation, and Worker/Web containers receive no KEK, demo-seeding, provider, or database secrets.
+
+### 18.7 Residual Limitations
+
+- The CLI is a local-development tool. It is not authenticated over HTTP, is not a multi-user provisioning API, and must not be packaged as a production administration endpoint.
+- Re-running does not rotate the administrator password; password rotation uses the normal authenticated flows and must not be inferred from a repeat `ALREADY_PRESENT`.
+- Operator discipline remains part of the boundary for the `compose` target: the fixed `postgres` hostname and `gateway_app` role prevent accidental remote targets, but DNS/host override control of the developer workstation is out of scope for an application-level CLI.
