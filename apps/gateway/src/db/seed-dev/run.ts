@@ -217,7 +217,12 @@ function writeOperationalFailure(stderr: OutputWriter, error: unknown): void {
     return;
   }
   if (error instanceof BootstrapError) {
-    stderr.write(`Demo seeding failed: ${error.code}\n`);
+    const safeCodes = new Set([
+      'INVALID_ORG_NAME', 'INVALID_BUDGET', 'INVALID_KEK_VERSION',
+      'INVALID_DEK_MATERIAL', 'BOOTSTRAP_FAILED', 'DUPLICATE_RESOURCE',
+      'INVALID_INPUT', 'BOOTSTRAP_DATABASE_ERROR',
+    ]);
+    stderr.write(`Demo seeding failed: ${safeCodes.has(error.code) ? error.code : 'UNEXPECTED_ERROR'}\n`);
     return;
   }
   const authReason =
