@@ -58,6 +58,7 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15, DB-16 
   const redisContainer = `switchyard-test-redis-${runId}`;
   const migrateContainer = `switchyard-test-migrate-${runId}`;
   const gatewayContainer = `switchyard-test-gw-${runId}`;
+  const mockContainer = `switchyard-test-mock-${runId}`;
   const pgVolume = `switchyard_test_pg_vol_${runId}`;
   const redisVolume = `switchyard_test_redis_vol_${runId}`;
   const networkName = `switchyard-test-net-${runId}`;
@@ -67,6 +68,7 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15, DB-16 
   const appPass = 'app \'pass with spaces\' and "quotes"'; // gitleaks:allow
   const startupPass = "startup'quote; SELECT '1';"; // gitleaks:allow
   const workerPass = "worker 'pass' with spaces & symbols"; // gitleaks:allow
+  const mockControlSecret = 'f'.repeat(64); // gitleaks:allow
 
   let pgPort: number;
   let redisPort: number;
@@ -86,6 +88,8 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15, DB-16 
       REDIS_CONTAINER_NAME: redisContainer,
       MIGRATE_CONTAINER_NAME: migrateContainer,
       GATEWAY_CONTAINER_NAME: gatewayContainer,
+      MOCK_UPSTREAM_CONTAINER_NAME: mockContainer,
+      MOCK_CONTROL_SECRET: mockControlSecret,
       POSTGRES_VOLUME_NAME: pgVolume,
       REDIS_VOLUME_NAME: redisVolume,
       NETWORK_NAME: networkName,
@@ -119,6 +123,26 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15, DB-16 
       await new Promise((r) => setTimeout(r, 1000));
     }
     expect(ready).toBe(true);
+
+    // Wait for Mock Upstream health readiness (up to 30s)
+    let mockReady = false;
+    for (let i = 0; i < 30; i += 1) {
+      try {
+        const status = run(
+          'docker',
+          ['inspect', mockContainer, '--format', '{{.State.Health.Status}}'],
+          composeEnv,
+        ).trim();
+        if (status === 'healthy') {
+          mockReady = true;
+          break;
+        }
+      } catch {
+        // continue polling until ready
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    expect(mockReady).toBe(true);
   }, 90_000);
 
   afterAll(() => {
@@ -144,6 +168,9 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15, DB-16 
     expect(pgLogs).not.toContain(appPass);
     expect(pgLogs).not.toContain(startupPass);
     expect(pgLogs).not.toContain(workerPass);
+
+    const mockLogs = run('docker', ['logs', mockContainer], composeEnv);
+    expect(mockLogs).not.toContain(mockControlSecret);
   });
 
   it('executes authoritative migration runner via migrate service and applies all six migrations', () => {
@@ -380,5 +407,112 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15, DB-16 
     } finally {
       await client.end();
     }
+  });
+
+  it('proves mock-upstream container runs healthy with no published host ports', () => {
+    const inspectStatus = run(
+      'docker',
+      ['inspect', mockContainer, '--format', '{{.State.Status}}'],
+      composeEnv,
+    ).trim();
+    expect(inspectStatus).toBe('running');
+
+    const inspectHealth = run(
+      'docker',
+      ['inspect', mockContainer, '--format', '{{.State.Health.Status}}'],
+      composeEnv,
+    ).trim();
+    expect(inspectHealth).toBe('healthy');
+
+    const portMapping = run('docker', ['port', mockContainer], composeEnv).trim();
+    expect(portMapping).toBe('');
+
+    const portBindings = run(
+      'docker',
+      ['inspect', mockContainer, '--format', '{{json .HostConfig.PortBindings}}'],
+      composeEnv,
+    ).trim();
+    expect(portBindings === 'null' || portBindings === '{}').toBe(true);
+  });
+
+  it('proves authorized access to mock-upstream over the private Compose network', () => {
+    const script = [
+      "fetch('http://mock-upstream:4000/v1/chat/completions', {",
+      "  method: 'POST',",
+      "  headers: { 'Content-Type': 'application/json' },",
+      '  body: JSON.stringify({',
+      "    model: 'mock-chat-v1',",
+      "    messages: [{ role: 'user', content: 'private net check' }]",
+      '  })',
+      '})',
+      '.then(r => r.json())',
+      '.then(d => {',
+      "  if (d.object === 'chat.completion') process.exit(0);",
+      '  else process.exit(1);',
+      '})',
+      '.catch(() => process.exit(2));',
+    ].join(' ');
+
+    const output = run(
+      'docker',
+      ['exec', gatewayContainer, 'node', '-e', script],
+      composeEnv,
+    ).trim();
+    expect(output).toBe('');
+  });
+
+  it('proves unauthorized test-control request to mock-upstream over private network returns 401', () => {
+    const script = [
+      "fetch('http://mock-upstream:4000/__test/abort-observations')",
+      '.then(r => {',
+      '  if (r.status === 401) process.exit(0);',
+      '  else process.exit(1);',
+      '})',
+      '.catch(() => process.exit(2));',
+    ].join(' ');
+
+    const output = run(
+      'docker',
+      ['exec', gatewayContainer, 'node', '-e', script],
+      composeEnv,
+    ).trim();
+    expect(output).toBe('');
+  });
+
+  it('proves authorized request can select a deterministic HTTP fault fixture over private network', () => {
+    const script = [
+      "fetch('http://mock-upstream:4000/v1/chat/completions', {",
+      "  method: 'POST',",
+      '  headers: {',
+      "    'Content-Type': 'application/json',",
+      "    'x-test-fixture-id': 'error.500',",
+      "    'Authorization': 'Bearer ' + process.env.TEST_CONTROL_SECRET",
+      '  },',
+      '  body: JSON.stringify({',
+      "    model: 'mock-chat-v1',",
+      "    messages: [{ role: 'user', content: 'fault test' }]",
+      '  })',
+      '})',
+      '.then(r => {',
+      '  if (r.status === 500) process.exit(0);',
+      '  else process.exit(1);',
+      '})',
+      '.catch(() => process.exit(2));',
+    ].join(' ');
+
+    const output = run(
+      'docker',
+      [
+        'exec',
+        '-e',
+        `TEST_CONTROL_SECRET=${mockControlSecret}`,
+        gatewayContainer,
+        'node',
+        '-e',
+        script,
+      ],
+      composeEnv,
+    ).trim();
+    expect(output).toBe('');
   });
 });
