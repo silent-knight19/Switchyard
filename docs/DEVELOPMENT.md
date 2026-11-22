@@ -698,7 +698,7 @@ printf '%s' "$DEMO_ADMIN_PASSWORD" | docker compose run --rm --no-deps -T \
 | Status | Meaning | Database effect |
 |---|---|---|
 | `CREATED` | No account with `DEMO_ADMIN_EMAIL` existed; organization and admin were created atomically. | One organization and one admin inserted. Only the first run applies the name, budget, envelope, and password. |
-| `ALREADY_PRESENT` | The canonical email already belongs to an `admin` in `DEMO_ORG_ID`. | No writes. Password, role, name, budget, and envelope are preserved. |
+| `ALREADY_PRESENT` | The canonical email already belongs to an `admin` in `DEMO_ORG_ID`, and the configured KEK authenticates the stored organization DEK envelope. | No writes. Password, role, name, budget, and envelope are preserved. |
 | `CONFLICT` | The email belongs to another organization, a non-admin role, or the organization UUID is already taken. | No writes. Resolve the collision manually; the seeder never adopts, promotes, or rewrites identities. |
 
 Concurrent invocations converge on exactly one organization and one admin: the database function is atomic, and a duplicate-key race is re-verified before reporting `ALREADY_PRESENT` or `CONFLICT`.
@@ -708,7 +708,7 @@ Concurrent invocations converge on exactly one organization and one admin: the d
 | Code | Meaning |
 |---|---|
 | `0` | `CREATED` or `ALREADY_PRESENT`. |
-| `1` | Operational failure (connection, privilege, or unexpected database error). Only an allowlisted error code is printed. |
+| `1` | Operational failure (connection, privilege, incompatible stored KEK/envelope, bounded cleanup failure, or unexpected database error). Only controlled error codes are printed. |
 | `2` | Invalid configuration, unsupported arguments, or invalid/empty/oversized password. Rejected before any database connection. |
 | `3` | `CONFLICT`. The network/configuration were valid; no data was changed. |
 
@@ -723,4 +723,5 @@ Concurrent invocations converge on exactly one organization and one admin: the d
 - The seeder provisions one demo organization and one admin. It is not a general user-management or registration API.
 - Re-running does not rotate the password or update name/budget. Use the normal authenticated administrative flows for later changes.
 - The password arrives as an immutable JavaScript string and cannot be deterministically zeroized; temporary byte buffers are cleared, but V8 strings persist until garbage collection.
-- Loss of the KEK used at creation makes the organization DEK unrecoverable, exactly as for any Gateway-created organization.
+- Loss of the KEK used at creation makes the organization DEK unrecoverable, exactly as for any Gateway-created organization. A repeat invocation with an incompatible KEK fails closed instead of reporting `ALREADY_PRESENT`.
+- The CLI bounds pool shutdown and requests active connection closure on timeout; complete transport cancellation cannot be guaranteed if the underlying driver is permanently stuck. Cleanup failure is reported as nonzero, never success.
