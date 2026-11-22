@@ -80,7 +80,7 @@ export function buildUsageChunk(fixture: SseFixture): ChatCompletionChunk {
   };
 }
 
-function delay(ms: number, signal?: AbortSignal): Promise<void> {
+export function delay(ms: number, signal?: AbortSignal): Promise<void> {
   if (ms <= 0) return Promise.resolve();
   if (signal?.aborted) return Promise.reject(new Error('Aborted'));
   return new Promise((resolve, reject) => {
@@ -90,6 +90,7 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
         clearTimeout(timer);
         timer = null;
       }
+      signal?.removeEventListener('abort', onAbort);
       reject(new Error('Aborted'));
     };
 

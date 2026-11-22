@@ -137,6 +137,29 @@ Rules:
 - Focused tests: `pnpm --filter @switchyard/gateway test src/vault/kek.test.ts src/vault/envelope.test.ts`.
 - Real PostgreSQL evidence: `pnpm --filter @switchyard/gateway test:db` (includes `src/vault/envelope.db.test.ts`).
 
+#### 7.2.2 Deterministic Mock Upstream Configuration (SW-1.8-A)
+
+The private mock upstream (`apps/mock-upstream`) provides deterministic, seed/config-driven chat-completion responses, network faults, and SSE streaming edge cases for testing without external AI provider dependencies.
+
+| Variable | Required | Purpose |
+| :--- | :---: | :--- |
+| `MOCK_PORT` | Optional (default: `4000`) | Internal port for mock upstream |
+| `MOCK_HOST` | Optional (default: `127.0.0.1` locally, `0.0.0.0` in Docker) | Host bind address |
+| `MOCK_CONTROL_SECRET` | Optional | Private test-control secret (32 random bytes, exactly 64 hexadecimal characters) |
+
+Rules and private integration test workflow:
+- The mock upstream container is attached to `switchyard-network` and **does not publish host ports** (`ports:` is omitted in Compose), maintaining strict private network isolation.
+- When `MOCK_CONTROL_SECRET` is omitted or empty, the service automatically generates a random 32-byte (64 hex character) secret at startup.
+- Authorized integration test runners can supply a known secret to both the test runner and the Compose service via `.env` or environment:
+  ```bash
+  export MOCK_CONTROL_SECRET=$(openssl rand -hex 32)
+  docker compose up -d mock-upstream
+  ```
+- If explicitly supplied, `MOCK_CONTROL_SECRET` must be exactly 64 hexadecimal characters (`^[0-9a-fA-F]{64}$`). Any invalid/short/malformed value is rejected at startup with a descriptive error that never reflects the secret value.
+- Authorized test clients authenticate to private control endpoints (`/__test/*`) and the `x-test-fixture-id` header using `X-Test-Control-Key: <secret>` or `Authorization: Bearer <secret>`. Missing or incorrect credentials return HTTP 401.
+- Standard OpenAI-compatible callers (`POST /v1/chat/completions`) without fixture selection headers do not require authentication and return standard deterministic responses.
+- `NODE_ENV=production` refuses startup unconditionally.
+
 ### 7.3 Service Management Commands
 
 #### Safe Startup

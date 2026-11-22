@@ -1,6 +1,9 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { createMockHarness, type MockTestHarness } from './harness.js';
+import { createMockHarness, MockTestHarness } from './harness.js';
 import { MockServer } from '../server.js';
+import { parseMockConfig } from '../config.js';
 import { SUCCESS_JSON_FIXTURES } from '../fixtures/success.js';
 
 describe('SW-1.8.1: Deterministic Chat-Completions JSON and SSE Fixtures (Stage A)', () => {
@@ -533,6 +536,170 @@ describe('SW-1.8.1: Deterministic Chat-Completions JSON and SSE Fixtures (Stage 
       expect(res.status).toBe(400);
       const data = (await res.json()) as { error: { code: string } };
       expect(data.error.code).toBe('invalid_parameter');
+    });
+
+    // MOCK-06 Compose and Control Secret Configuration Tests
+    it('3.23 default configuration generates 64-character hexadecimal control secret', async () => {
+      const defaultServer = new MockServer();
+      const secret = defaultServer.getControlSecret();
+      expect(secret).toMatch(/^[0-9a-f]{64}$/);
+    });
+
+    it('3.24 explicit valid 64-hex control secret is accepted', async () => {
+      const validSecret = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'; // gitleaks:allow
+      const server = new MockServer({ controlSecret: validSecret });
+      expect(server.getControlSecret()).toBe(validSecret);
+
+      const parsed = parseMockConfig({ MOCK_CONTROL_SECRET: validSecret });
+      expect(parsed.controlSecret).toBe(validSecret);
+    });
+
+    it('3.25 empty or whitespace-only configured secret generates random 64-hex token', async () => {
+      const server = new MockServer({ controlSecret: '   ' });
+      expect(server.getControlSecret()).toMatch(/^[0-9a-f]{64}$/);
+
+      const parsed = parseMockConfig({ MOCK_CONTROL_SECRET: '   ' });
+      expect(parsed.controlSecret).toBe('');
+    });
+
+    it('3.26 malformed control secret (short, non-hex, too long) is rejected at configuration time', () => {
+      expect(() => parseMockConfig({ MOCK_CONTROL_SECRET: 'short' })).toThrow(
+        /Invalid MOCK_CONTROL_SECRET/,
+      );
+      expect(() => parseMockConfig({ MOCK_CONTROL_SECRET: 'g'.repeat(64) })).toThrow(
+        /Invalid MOCK_CONTROL_SECRET/,
+      );
+      expect(() => parseMockConfig({ MOCK_CONTROL_SECRET: 'a'.repeat(63) })).toThrow(
+        /Invalid MOCK_CONTROL_SECRET/,
+      );
+      expect(() => parseMockConfig({ MOCK_CONTROL_SECRET: 'a'.repeat(65) })).toThrow(
+        /Invalid MOCK_CONTROL_SECRET/,
+      );
+      expect(() => new MockServer({ controlSecret: 'not-valid-hex' })).toThrow(
+        /Invalid controlSecret/,
+      );
+    });
+
+    it('3.27 invalid secret error does not reflect the secret string', () => {
+      const sensitiveLeakCandidate = 'my_super_secret_unauthorized_token_value_12345';
+      try {
+        parseMockConfig({ MOCK_CONTROL_SECRET: sensitiveLeakCandidate });
+        expect.unreachable('Should have thrown configuration error');
+      } catch (err: unknown) {
+        expect(err).toBeInstanceOf(Error);
+        expect((err as Error).message).not.toContain(sensitiveLeakCandidate);
+      }
+    });
+
+    it('3.28 private test client with configured key can select fault fixture', async () => {
+      const knownKey = 'a'.repeat(64);
+      const customHarness = new MockTestHarness({ controlSecret: knownKey });
+      await customHarness.start();
+
+      try {
+        const res = await customHarness.postChatCompletions(
+          {
+            model: 'mock-chat-v1',
+            messages: [{ role: 'user', content: 'Fault test with key' }],
+          },
+          {
+            'x-test-fixture-id': 'error.500',
+            'X-Test-Control-Key': knownKey,
+          },
+        );
+        expect(res.status).toBe(500);
+      } finally {
+        await customHarness.stop();
+      }
+    });
+
+    it('3.29 private test client with configured key can query abort observations', async () => {
+      const knownKey = 'b'.repeat(64);
+      const customHarness = new MockTestHarness({ controlSecret: knownKey });
+      await customHarness.start();
+
+      try {
+        const obs = await customHarness.getObservations(knownKey);
+        expect(Array.isArray(obs)).toBe(true);
+      } finally {
+        await customHarness.stop();
+      }
+    });
+
+    it('3.30 unauthorized client cannot query abort observations or select fixtures', async () => {
+      const knownKey = 'c'.repeat(64);
+      const customHarness = new MockTestHarness({ controlSecret: knownKey });
+      await customHarness.start();
+
+      try {
+        // Missing key
+        await expect(customHarness.getObservations('')).rejects.toThrow(/401/);
+
+        // Incorrect key
+        const wrongKey = 'd'.repeat(64);
+        await expect(customHarness.getObservations(wrongKey)).rejects.toThrow(/401/);
+
+        // Unauthorized fixture selection
+        const res = await fetch(`${customHarness.url}/v1/chat/completions`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-test-fixture-id': 'error.500',
+            'X-Test-Control-Key': wrongKey,
+          },
+          body: JSON.stringify({
+            model: 'mock-chat-v1',
+            messages: [{ role: 'user', content: 'Unauthorized fixture selection' }],
+          }),
+        });
+        expect(res.status).toBe(401);
+      } finally {
+        await customHarness.stop();
+      }
+    });
+
+    it('3.31 normal chat completions succeed without any control secret', async () => {
+      const knownKey = 'e'.repeat(64);
+      const customHarness = new MockTestHarness({ controlSecret: knownKey });
+      await customHarness.start();
+
+      try {
+        // Direct fetch without X-Test-Control-Key or Authorization header
+        const res = await fetch(`${customHarness.url}/v1/chat/completions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: 'mock-chat-v1',
+            messages: [{ role: 'user', content: 'Standard request' }],
+          }),
+        });
+        expect(res.status).toBe(200);
+        const data = (await res.json()) as { choices: Array<{ message: { content: string } }> };
+        expect(data.choices[0]?.message.content).toBe('Deterministic mock response.');
+      } finally {
+        await customHarness.stop();
+      }
+    });
+
+    it('3.32 docker-compose.yml forwards MOCK_CONTROL_SECRET and does not publish a host port', () => {
+      const candidates = [
+        path.resolve(process.cwd(), 'docker-compose.yml'),
+        path.resolve(process.cwd(), '../../docker-compose.yml'),
+      ];
+      const composePath = candidates.find((p) => fs.existsSync(p));
+      expect(composePath).toBeDefined();
+      const composeContent = fs.readFileSync(composePath!, 'utf8');
+
+      // Locate mock-upstream service block
+      const mockServiceMatch = composeContent.match(/mock-upstream:[\s\S]*?(?=\n\s\s\w|$)/);
+      expect(mockServiceMatch).toBeDefined();
+      const mockServiceBlock = mockServiceMatch?.[0] ?? '';
+
+      // Must forward MOCK_CONTROL_SECRET
+      expect(mockServiceBlock).toContain('MOCK_CONTROL_SECRET: ${MOCK_CONTROL_SECRET:-}');
+
+      // Must not publish ports
+      expect(mockServiceBlock).not.toMatch(/\bports:/);
     });
   });
 });

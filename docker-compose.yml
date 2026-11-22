@@ -140,6 +140,7 @@ services:
       NODE_ENV: development
       PORT: 4000
       HOST: 0.0.0.0
+      MOCK_CONTROL_SECRET: ${MOCK_CONTROL_SECRET:-}
     networks:
       - switchyard-network
     healthcheck:

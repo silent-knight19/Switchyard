@@ -33,6 +33,7 @@ export class MockServer {
   private readonly observations: AbortObservation[] = [];
   private readonly shutdownController = new AbortController();
   private readonly controlSecret: string;
+  private lastRequestAbortSignal?: AbortSignal;
   private activeFixtureOverride: string | null = null;
   private defaultFixture: string;
   private readonly allowHeaderSelection: boolean;
@@ -52,9 +53,25 @@ export class MockServer {
     this.allowHeaderSelection = options.allowHeaderSelection ?? true;
     this.host = options.host ?? this.config.host;
     this.port = options.port ?? this.config.port;
-    this.controlSecret =
-      options.controlSecret ??
-      (this.config.controlSecret || crypto.randomBytes(32).toString('hex'));
+
+    const CONTROL_SECRET_HEX_REGEX = /^[0-9a-fA-F]{64}$/;
+    if (options.controlSecret !== undefined) {
+      const explicit = options.controlSecret.trim();
+      if (explicit.length > 0) {
+        if (!CONTROL_SECRET_HEX_REGEX.test(explicit)) {
+          throw new Error(
+            'Invalid controlSecret: must be exactly 32 bytes encoded as 64 hexadecimal characters',
+          );
+        }
+        this.controlSecret = explicit.toLowerCase();
+      } else {
+        this.controlSecret = crypto.randomBytes(32).toString('hex');
+      }
+    } else if (this.config.controlSecret) {
+      this.controlSecret = this.config.controlSecret;
+    } else {
+      this.controlSecret = crypto.randomBytes(32).toString('hex');
+    }
 
     this.server = http.createServer((req, res) => {
       this.handleRequest(req, res).catch(() => {
@@ -135,6 +152,12 @@ export class MockServer {
 
   public getShutdownListenerCount(): number {
     return events.getEventListeners(this.shutdownController.signal, 'abort').length;
+  }
+
+  public getLastRequestSignalListenerCount(): number {
+    return this.lastRequestAbortSignal
+      ? events.getEventListeners(this.lastRequestAbortSignal, 'abort').length
+      : 0;
   }
 
   public setActiveFixture(fixtureId: string | null): void {
@@ -346,6 +369,7 @@ export class MockServer {
     const startTime = Date.now();
     const requestId = `obs-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
     const abortController = new AbortController();
+    this.lastRequestAbortSignal = abortController.signal;
 
     const onShutdownAbort = (): void => {
       abortController.abort();

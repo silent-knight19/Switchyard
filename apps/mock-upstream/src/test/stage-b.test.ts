@@ -1,7 +1,10 @@
+import events from 'node:events';
 import http from 'node:http';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { createMockHarness, MockTestHarness, type RefusedTarget } from './harness.js';
 import { HTTP_ERROR_FIXTURES } from '../fixtures/faults.js';
+import { delay, sendSseResponse } from '../response/sse.js';
+import { SUCCESS_SSE_FIXTURES } from '../fixtures/success.js';
 
 describe('SW-1.8.2: Network and HTTP Fault-Injection Profiles (Stage B)', () => {
   let harness: MockTestHarness;
@@ -338,23 +341,147 @@ describe('SW-1.8.2: Network and HTTP Fault-Injection Profiles (Stage B)', () => 
       }
     });
 
-    it('5.4 multi-chunk delayed SSE completion releases delay listeners', async () => {
+    // MOCK-07 Real SSE Listener Cleanup and Abort Signal Instrumentation Tests
+    it('5.4 delay() detaches abort listeners upon normal completion and cancellation', async () => {
+      // 1. Normal resolution: listener is attached during delay and detached upon completion
+      const controller1 = new AbortController();
+      const delayPromise = delay(15, controller1.signal);
+      expect(events.getEventListeners(controller1.signal, 'abort').length).toBe(1);
+      await delayPromise;
+      expect(events.getEventListeners(controller1.signal, 'abort').length).toBe(0);
+
+      // 2. Cancellation: abort listener fires, clears pending timer, and detaches
+      const controller2 = new AbortController();
+      const abortDelayPromise = delay(500, controller2.signal);
+      expect(events.getEventListeners(controller2.signal, 'abort').length).toBe(1);
+      controller2.abort();
+      await expect(abortDelayPromise).rejects.toThrow('Aborted');
+      expect(events.getEventListeners(controller2.signal, 'abort').length).toBe(0);
+
+      // 3. Pre-aborted signal: rejects immediately without attaching listeners
+      const controller3 = new AbortController();
+      controller3.abort();
+      await expect(delay(100, controller3.signal)).rejects.toThrow('Aborted');
+      expect(events.getEventListeners(controller3.signal, 'abort').length).toBe(0);
+    });
+
+    it('5.5 sendSseResponse() across multiple delayed chunks detaches all abort listeners upon completion', async () => {
       const controller = new AbortController();
+      const fixture = SUCCESS_SSE_FIXTURES['sse.delayed-chunks']!;
+      expect(fixture).toBeDefined();
+
+      const mockRes = {
+        statusCode: 200,
+        setHeader: () => {},
+        flushHeaders: () => {},
+        write: () => true,
+        end: () => {},
+        writableEnded: false,
+        destroyed: false,
+      } as unknown as http.ServerResponse;
+
+      const result = await sendSseResponse(mockRes, fixture, controller.signal);
+      expect(result.completed).toBe(true);
+
+      // Verify zero residual abort listeners on controller.signal after 5 delayed chunks
+      expect(events.getEventListeners(controller.signal, 'abort').length).toBe(0);
+    });
+
+    it('5.6 sendSseResponse() mid-stream abort clears pending timer and detaches all abort listeners', async () => {
+      const controller = new AbortController();
+      const fixture = SUCCESS_SSE_FIXTURES['sse.delayed-chunks']!;
+      expect(fixture).toBeDefined();
+
+      const mockRes = {
+        statusCode: 200,
+        setHeader: () => {},
+        flushHeaders: () => {},
+        write: () => true,
+        end: () => {},
+        writableEnded: false,
+        destroyed: false,
+      } as unknown as http.ServerResponse;
+
+      const sendPromise = sendSseResponse(mockRes, fixture, controller.signal);
+
+      // Wait 15ms so the first delay is active, then abort
+      await new Promise((r) => setTimeout(r, 15));
+      controller.abort();
+
+      const result = await sendPromise;
+      expect(result.completed).toBe(false);
+
+      // Verify zero residual abort listeners remain
+      expect(events.getEventListeners(controller.signal, 'abort').length).toBe(0);
+    });
+
+    it('5.7 multiple sequential delayed requests leave zero residual abort listeners', async () => {
+      const fixture = SUCCESS_SSE_FIXTURES['sse.delayed-chunks']!;
+      expect(fixture).toBeDefined();
+
+      const mockRes = {
+        statusCode: 200,
+        setHeader: () => {},
+        flushHeaders: () => {},
+        write: () => true,
+        end: () => {},
+        writableEnded: false,
+        destroyed: false,
+      } as unknown as http.ServerResponse;
+
+      for (let i = 0; i < 5; i++) {
+        const controller = new AbortController();
+        const result = await sendSseResponse(mockRes, fixture, controller.signal);
+        expect(result.completed).toBe(true);
+        expect(events.getEventListeners(controller.signal, 'abort').length).toBe(0);
+      }
+    });
+
+    it('5.8 end-to-end HTTP delayed SSE request leaves zero per-request abort listeners', async () => {
+      // 1. Successful completion leaves 0 per-request signal listeners
       const res = await harness.postChatCompletions(
         {
           model: 'mock-chat-v1',
-          messages: [{ role: 'user', content: 'Delayed chunks listener check' }],
+          messages: [{ role: 'user', content: 'Delayed chunks e2e' }],
+          stream: true,
+        },
+        { 'x-test-fixture-id': 'sse.delayed-chunks' },
+      );
+      expect(res.status).toBe(200);
+      await res.text();
+      expect(harness.server.getLastRequestSignalListenerCount()).toBe(0);
+
+      // 2. Client abort leaves 0 per-request signal listeners
+      const controller = new AbortController();
+      const resAbort = await harness.postChatCompletions(
+        {
+          model: 'mock-chat-v1',
+          messages: [{ role: 'user', content: 'Delayed chunks abort e2e' }],
           stream: true,
         },
         { 'x-test-fixture-id': 'sse.delayed-chunks' },
         controller.signal,
       );
-      expect(res.status).toBe(200);
-      await res.text();
+      expect(resAbort.status).toBe(200);
+      const textPromise = resAbort.text();
+      controller.abort();
+      await expect(textPromise).rejects.toThrow();
 
-      // Signal should have zero remaining abort listeners
-      // (verified through standard AbortSignal behavior)
-      expect(controller.signal.aborted).toBe(false);
+      // Allow server to finalize client-abort observation
+      await new Promise((r) => setTimeout(r, 40));
+      expect(harness.server.getLastRequestSignalListenerCount()).toBe(0);
+    });
+
+    it('5.9 intentional failure proof: lingering abort listener fails zero-listener assertion', () => {
+      const testController = new AbortController();
+      const dummyListener = (): void => {};
+
+      testController.signal.addEventListener('abort', dummyListener);
+      expect(events.getEventListeners(testController.signal, 'abort').length).toBe(1);
+
+      // Clean up dummy listener
+      testController.signal.removeEventListener('abort', dummyListener);
+      expect(events.getEventListeners(testController.signal, 'abort').length).toBe(0);
     });
   });
 });
