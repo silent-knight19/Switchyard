@@ -533,7 +533,8 @@ Status: **IMPLEMENTED** — cryptographic foundation only. Administrative provid
 - Cross-tenant reads remain denied by FORCE RLS under `withTenant()`. `gateway_worker` retains only non-secret metadata grants; selecting `wrapped_dek`, `dek_iv`, `dek_auth_tag`, `ciphertext`, `iv`, or `auth_tag` fails with SQLSTATE `42501`.
 
 ### 15.4 Memory and Privacy Limitations
-- Temporary mutable DEK buffers are cleared with `.fill(0)` after use; intermediate decryption chunks are cleared on authentication failure.
+- The keyring never returns a mutable reference to its process-lifetime KEK material. `KekKeyring.resolve()` returns an independent copy, and the vault performs cryptographic operations through `withKey()`, which clears that copy in a `finally` block on success and every exception path. Callers of `resolve()` directly must clear the returned copy after use.
+- Temporary mutable DEK buffers and intermediate decryption chunks are cleared with `.fill(0)` after successful operations and on authentication failure. The final plaintext Buffer returned to the caller is a separate allocation and remains intact until the caller clears it.
 - Callers own plaintext input Buffers and returned decrypted Buffers and must clear them after authorised use.
 - JavaScript strings and runtime copies cannot be deterministically zeroized. Best-effort buffer clearing does not protect against heap snapshots, process compromise, copied buffers, or a compromised Node.js runtime.
 - Plaintext provider credentials, KEKs, and DEKs are never persisted in PostgreSQL, Redis, BullMQ, traces, Pino logs, error messages, or browser responses. Pino redaction explicitly covers `MASTER_KEK_*`, `wrapped_dek`, `dek_iv`, and `dek_auth_tag` naming variants.

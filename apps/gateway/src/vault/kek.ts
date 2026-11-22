@@ -139,6 +139,10 @@ export class KekKeyring {
 
   /**
    * Resolve exactly the requested KEK version. There is no fallback to another configured key.
+   *
+   * The returned Buffer is an independent copy owned by the caller. Mutating it cannot alter the
+   * keyring's process-lifetime material. The caller MUST clear the copy after use; prefer
+   * {@link withKey}, which performs that cleanup with exception-safe semantics.
    */
   public resolve(version: number): Buffer {
     if (version !== 1 && version !== 2) {
@@ -148,7 +152,21 @@ export class KekKeyring {
     if (key === undefined) {
       throw new VaultError('UNKNOWN_KEK_VERSION', 'KEK version is not configured');
     }
-    return key;
+    return Buffer.from(key);
+  }
+
+  /**
+   * Run a synchronous cryptographic operation with an independent KEK copy that is always cleared
+   * afterwards, including when the operation throws. The keyring retains ownership of its internal
+   * material; callers never receive a mutable reference to it.
+   */
+  public withKey<T>(version: number, operation: (kek: Buffer) => T): T {
+    const kek = this.resolve(version);
+    try {
+      return operation(kek);
+    } finally {
+      kek.fill(0);
+    }
   }
 }
 
@@ -181,9 +199,10 @@ export function inspectKekEnvironment(env: KekEnvironment): KekEnvironmentInspec
   for (const version of SUPPORTED_KEK_VERSIONS) {
     const field: KekField = version === 1 ? 'MASTER_KEK_V1' : 'MASTER_KEK_V2';
     const raw = version === 1 ? env.MASTER_KEK_V1 : env.MASTER_KEK_V2;
-    if (raw === undefined || raw === '') {
+    if (raw === undefined) {
       // An absent historical key is allowed; the active-version check below enforces presence
-      // whenever that version is actually required.
+      // whenever that version is actually required. An explicitly supplied empty or
+      // whitespace-only value is not absent: it is invalid material and is rejected by decodeKek.
       continue;
     }
 

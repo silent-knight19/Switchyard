@@ -427,7 +427,9 @@ describe('SW-1.2.2 Central Zod Configuration', () => {
       expect(config.ACTIVE_KEK_VERSION).toBe('1');
       const keyring = createKekKeyringFromEnvironment(config);
       expect(keyring.activeVersion).toBe(1);
-      expect(keyring.resolve(1)).toHaveLength(32);
+      const resolved = keyring.resolve(1);
+      expect(resolved).toHaveLength(32);
+      resolved.fill(0);
     });
 
     it('19c. accepts valid V1+V2 configuration with active version 2', () => {
@@ -506,7 +508,56 @@ describe('SW-1.2.2 Central Zod Configuration', () => {
       ).toThrowError(ConfigValidationError);
     });
 
-    it('19h. never echoes KEK values in configuration validation errors', () => {
+    it('19h. accepts valid V2-only configuration', () => {
+      const config = loadConfig({
+        ...VALID_DEV_ENV,
+        MASTER_KEK_V2: KEK_V2,
+        ACTIVE_KEK_VERSION: '2',
+      });
+      const keyring = createKekKeyringFromEnvironment(config);
+      expect(keyring.activeVersion).toBe(2);
+      expect(keyring.has(2)).toBe(true);
+      expect(keyring.has(1)).toBe(false);
+    });
+
+    it('19i. rejects explicitly empty or whitespace-only inactive KEK values', () => {
+      expect(() =>
+        loadConfig({
+          ...VALID_DEV_ENV,
+          MASTER_KEK_V1: KEK_V1,
+          MASTER_KEK_V2: '',
+          ACTIVE_KEK_VERSION: '1',
+        }),
+      ).toThrowError(ConfigValidationError);
+
+      expect(() =>
+        loadConfig({
+          ...VALID_DEV_ENV,
+          MASTER_KEK_V1: '',
+          MASTER_KEK_V2: KEK_V2,
+          ACTIVE_KEK_VERSION: '2',
+        }),
+      ).toThrowError(ConfigValidationError);
+
+      expect(() =>
+        loadConfig({
+          ...VALID_DEV_ENV,
+          MASTER_KEK_V1: KEK_V1,
+          MASTER_KEK_V2: '   ',
+          ACTIVE_KEK_VERSION: '1',
+        }),
+      ).toThrowError(ConfigValidationError);
+
+      expect(() =>
+        loadConfig({
+          ...VALID_DEV_ENV,
+          MASTER_KEK_V1: ' '.repeat(43),
+          ACTIVE_KEK_VERSION: '1',
+        }),
+      ).toThrowError(ConfigValidationError);
+    });
+
+    it('19j. never echoes KEK values in configuration validation errors', () => {
       const canary = 'synthetic_config_kek_canary_5d2f8a1c';
       try {
         loadConfig({

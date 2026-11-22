@@ -136,7 +136,11 @@ function assertProviderEnvelope(value: unknown): ProviderCredentialEnvelope {
     throw new VaultError('UNSUPPORTED_FORMAT', INVALID_PROVIDER_ENVELOPE_MESSAGE);
   }
   const envelope = value as Partial<ProviderCredentialEnvelope>;
-  if (!Buffer.isBuffer(envelope.ciphertext) || envelope.ciphertext.length < 2) {
+  if (
+    !Buffer.isBuffer(envelope.ciphertext) ||
+    envelope.ciphertext.length < 2 ||
+    envelope.ciphertext.length > MAX_PROVIDER_CREDENTIAL_BYTES + 1
+  ) {
     throw new VaultError('UNSUPPORTED_FORMAT', INVALID_PROVIDER_ENVELOPE_MESSAGE);
   }
   if (envelope.ciphertext[0] !== ENVELOPE_FORMAT_VERSION) {
@@ -180,35 +184,36 @@ export class EnvelopeVault {
   public createOrganizationEnvelope(orgId: string): OrganizationDekEnvelope {
     const trustedOrgId = assertOrganizationId(orgId);
     const kekVersion = this.keyring.activeVersion;
-    const kek = this.keyring.resolve(kekVersion);
 
-    const dek = crypto.randomBytes(DEK_BYTES);
-    try {
-      const iv = crypto.randomBytes(AES_GCM_IV_BYTES);
-      const cipher = crypto.createCipheriv('aes-256-gcm', kek, iv, {
-        authTagLength: AES_GCM_TAG_BYTES,
-      });
-      cipher.setAAD(dekAad(trustedOrgId, kekVersion));
-      const encrypted = Buffer.concat([cipher.update(dek), cipher.final()]);
-      const authTag = cipher.getAuthTag();
+    return this.keyring.withKey(kekVersion, (kek) => {
+      const dek = crypto.randomBytes(DEK_BYTES);
+      try {
+        const iv = crypto.randomBytes(AES_GCM_IV_BYTES);
+        const cipher = crypto.createCipheriv('aes-256-gcm', kek, iv, {
+          authTagLength: AES_GCM_TAG_BYTES,
+        });
+        cipher.setAAD(dekAad(trustedOrgId, kekVersion));
+        const encrypted = Buffer.concat([cipher.update(dek), cipher.final()]);
+        const authTag = cipher.getAuthTag();
 
-      if (
-        encrypted.length !== DEK_BYTES ||
-        iv.length !== AES_GCM_IV_BYTES ||
-        authTag.length !== AES_GCM_TAG_BYTES
-      ) {
-        throw new VaultError('CONFIGURATION_ERROR', 'Organization DEK wrapping failed');
+        if (
+          encrypted.length !== DEK_BYTES ||
+          iv.length !== AES_GCM_IV_BYTES ||
+          authTag.length !== AES_GCM_TAG_BYTES
+        ) {
+          throw new VaultError('CONFIGURATION_ERROR', 'Organization DEK wrapping failed');
+        }
+
+        return {
+          kekVersion,
+          wrappedDek: Buffer.concat([Buffer.from([ENVELOPE_FORMAT_VERSION]), encrypted]),
+          dekIv: iv,
+          dekAuthTag: authTag,
+        };
+      } finally {
+        dek.fill(0);
       }
-
-      return {
-        kekVersion,
-        wrappedDek: Buffer.concat([Buffer.from([ENVELOPE_FORMAT_VERSION]), encrypted]),
-        dekIv: iv,
-        dekAuthTag: authTag,
-      };
-    } finally {
-      dek.fill(0);
-    }
+    });
   }
 
   /**
@@ -269,12 +274,15 @@ export class EnvelopeVault {
       try {
         chunks.push(decipher.update(providerEnvelope.ciphertext.subarray(1)));
         chunks.push(decipher.final());
+        // Buffer.concat allocates the caller-owned result before the finally block clears the
+        // redundant intermediate chunks.
         return Buffer.concat(chunks);
       } catch {
+        throw new VaultError('AUTHENTICATION_FAILED', 'Provider credential authentication failed');
+      } finally {
         for (const chunk of chunks) {
           chunk.fill(0);
         }
-        throw new VaultError('AUTHENTICATION_FAILED', 'Provider credential authentication failed');
       }
     } finally {
       dek.fill(0);
@@ -290,32 +298,33 @@ export class EnvelopeVault {
     organizationEnvelope: OrganizationDekEnvelope,
   ): Buffer {
     const envelope = assertOrganizationEnvelope(organizationEnvelope);
-    const kek = this.keyring.resolve(envelope.kekVersion);
 
-    const decipher = crypto.createDecipheriv('aes-256-gcm', kek, envelope.dekIv, {
-      authTagLength: AES_GCM_TAG_BYTES,
-    });
-    decipher.setAAD(dekAad(orgId, envelope.kekVersion));
-    decipher.setAuthTag(envelope.dekAuthTag);
+    return this.keyring.withKey(envelope.kekVersion, (kek) => {
+      const decipher = crypto.createDecipheriv('aes-256-gcm', kek, envelope.dekIv, {
+        authTagLength: AES_GCM_TAG_BYTES,
+      });
+      decipher.setAAD(dekAad(orgId, envelope.kekVersion));
+      decipher.setAuthTag(envelope.dekAuthTag);
 
-    let dek: Buffer;
-    const chunks: Buffer[] = [];
-    try {
-      chunks.push(decipher.update(envelope.wrappedDek.subarray(1)));
-      chunks.push(decipher.final());
-      dek = Buffer.concat(chunks);
-    } catch {
-      for (const chunk of chunks) {
-        chunk.fill(0);
+      const chunks: Buffer[] = [];
+      try {
+        chunks.push(decipher.update(envelope.wrappedDek.subarray(1)));
+        chunks.push(decipher.final());
+        // Buffer.concat allocates the returned DEK before the finally block clears the redundant
+        // intermediate chunks.
+        const dek = Buffer.concat(chunks);
+        if (dek.length !== DEK_BYTES) {
+          dek.fill(0);
+          throw new VaultError('AUTHENTICATION_FAILED', 'Organization DEK authentication failed');
+        }
+        return dek;
+      } catch {
+        throw new VaultError('AUTHENTICATION_FAILED', 'Organization DEK authentication failed');
+      } finally {
+        for (const chunk of chunks) {
+          chunk.fill(0);
+        }
       }
-      throw new VaultError('AUTHENTICATION_FAILED', 'Organization DEK authentication failed');
-    }
-
-    if (dek.length !== DEK_BYTES) {
-      dek.fill(0);
-      throw new VaultError('AUTHENTICATION_FAILED', 'Organization DEK authentication failed');
-    }
-
-    return dek;
+    });
   }
 }

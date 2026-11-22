@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { Writable } from 'node:stream';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { createLogger } from '../logging/index.js';
 import {
   AES_GCM_IV_BYTES,
@@ -61,6 +61,51 @@ function cloneProviderEnvelope(envelope: ProviderCredentialEnvelope): {
     iv: Buffer.from(envelope.iv),
     authTag: Buffer.from(envelope.authTag),
   };
+}
+
+function providerEnvelopeWithCiphertextLength(length: number): ProviderCredentialEnvelope {
+  const ciphertext =
+    length === 1
+      ? Buffer.alloc(1, ENVELOPE_FORMAT_VERSION)
+      : Buffer.concat([Buffer.from([ENVELOPE_FORMAT_VERSION]), Buffer.alloc(length - 1, 0x41)]);
+  return {
+    ciphertext,
+    iv: Buffer.alloc(AES_GCM_IV_BYTES, 1),
+    authTag: Buffer.alloc(AES_GCM_TAG_BYTES, 2),
+  };
+}
+
+function captureDecipherChunks(): {
+  chunks: Buffer[];
+  restore: () => void;
+} {
+  const chunks: Buffer[] = [];
+  const realCreateDecipheriv = crypto.createDecipheriv;
+  const spy = vi
+    .spyOn(crypto, 'createDecipheriv')
+    .mockImplementation((algorithm, key, iv, options) => {
+      const decipher = realCreateDecipheriv(algorithm, key, iv, options);
+      return new Proxy(decipher, {
+        get(target, property, receiver) {
+          if (property === 'update') {
+            return (data: Buffer) => {
+              const output = target.update(data);
+              chunks.push(output);
+              return output;
+            };
+          }
+          if (property === 'final') {
+            return () => {
+              const output = target.final();
+              chunks.push(output);
+              return output;
+            };
+          }
+          return Reflect.get(target, property, receiver);
+        },
+      });
+    });
+  return { chunks, restore: () => spy.mockRestore() };
 }
 
 function independentUnwrapDek(
@@ -736,5 +781,228 @@ describe('SW-1.7.2 provider credential encryption', () => {
 
     expect(raw).not.toContain(canaryText);
     expect(raw).toContain('[REDACTED]');
+  });
+});
+
+describe('SW-1.7.1/SW-1.7.2 remediation', () => {
+  it('keeps working after a caller mutates a resolved KEK copy', () => {
+    const keyring = new KekKeyring({ activeVersion: 1, keys: { 1: Buffer.from(KEK_V1) } });
+    const vault = new EnvelopeVault(keyring);
+    const envelope = vault.createOrganizationEnvelope(ORG_A);
+
+    const resolved = keyring.resolve(1);
+    resolved.fill(0xff);
+    resolved.fill(0);
+
+    const providerEnvelope = encryptWithVault(vault, ORG_A, envelope);
+    const plaintext = vault.decryptProviderCredential({
+      orgId: ORG_A,
+      providerKeyId: PROVIDER_KEY_A,
+      provider: 'openai',
+      providerEnvelope,
+      organizationEnvelope: envelope,
+    });
+    expect(plaintext.equals(CANARY)).toBe(true);
+    plaintext.fill(0);
+  });
+
+  it('clears temporary KEK copies after successful and failed vault operations', () => {
+    const keyring = new KekKeyring({ activeVersion: 1, keys: { 1: Buffer.from(KEK_V1) } });
+    const vault = new EnvelopeVault(keyring);
+    const resolvedCopies: Buffer[] = [];
+    const realResolve = keyring.resolve.bind(keyring);
+    const spy = vi.spyOn(keyring, 'resolve').mockImplementation((version) => {
+      const copy = realResolve(version);
+      resolvedCopies.push(copy);
+      return copy;
+    });
+
+    try {
+      const envelope = vault.createOrganizationEnvelope(ORG_A);
+      expect(resolvedCopies).toHaveLength(1);
+      expect(resolvedCopies[0]?.every((byte) => byte === 0)).toBe(true);
+
+      resolvedCopies.length = 0;
+      const providerEnvelope = encryptWithVault(vault, ORG_A, envelope);
+      expect(resolvedCopies).toHaveLength(1);
+      expect(resolvedCopies[0]?.every((byte) => byte === 0)).toBe(true);
+
+      resolvedCopies.length = 0;
+      const plaintext = vault.decryptProviderCredential({
+        orgId: ORG_A,
+        providerKeyId: PROVIDER_KEY_A,
+        provider: 'openai',
+        providerEnvelope,
+        organizationEnvelope: envelope,
+      });
+      expect(plaintext.equals(CANARY)).toBe(true);
+      plaintext.fill(0);
+      expect(resolvedCopies).toHaveLength(1);
+      expect(resolvedCopies[0]?.every((byte) => byte === 0)).toBe(true);
+
+      resolvedCopies.length = 0;
+      const tamperedTag = cloneProviderEnvelope(providerEnvelope);
+      tamperedTag.authTag[0] = (tamperedTag.authTag[0] as number) ^ 0xff;
+      expectVaultError(
+        () =>
+          vault.decryptProviderCredential({
+            orgId: ORG_A,
+            providerKeyId: PROVIDER_KEY_A,
+            provider: 'openai',
+            providerEnvelope: tamperedTag,
+            organizationEnvelope: envelope,
+          }),
+        'AUTHENTICATION_FAILED',
+      );
+      expect(resolvedCopies).toHaveLength(1);
+      expect(resolvedCopies[0]?.every((byte) => byte === 0)).toBe(true);
+
+      resolvedCopies.length = 0;
+      const tamperedDek = cloneOrgEnvelope(envelope);
+      tamperedDek.wrappedDek[1] = (tamperedDek.wrappedDek[1] as number) ^ 0xff;
+      expectVaultError(() => encryptWithVault(vault, ORG_A, tamperedDek), 'AUTHENTICATION_FAILED');
+      expect(resolvedCopies).toHaveLength(1);
+      expect(resolvedCopies[0]?.every((byte) => byte === 0)).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('clears intermediate plaintext chunks after successful decryption', () => {
+    const vault = createVault(1);
+    const envelope = vault.createOrganizationEnvelope(ORG_A);
+    const providerEnvelope = encryptWithVault(vault, ORG_A, envelope);
+    const capture = captureDecipherChunks();
+
+    try {
+      const plaintext = vault.decryptProviderCredential({
+        orgId: ORG_A,
+        providerKeyId: PROVIDER_KEY_A,
+        provider: 'openai',
+        providerEnvelope,
+        organizationEnvelope: envelope,
+      });
+      expect(plaintext.equals(CANARY)).toBe(true);
+      plaintext.fill(0);
+
+      expect(capture.chunks.length).toBeGreaterThanOrEqual(2);
+      for (const chunk of capture.chunks) {
+        expect(chunk.every((byte) => byte === 0)).toBe(true);
+      }
+    } finally {
+      capture.restore();
+    }
+  });
+
+  it('clears intermediate plaintext chunks after authentication failure', () => {
+    const vault = createVault(1);
+    const envelope = vault.createOrganizationEnvelope(ORG_A);
+    const providerEnvelope = encryptWithVault(vault, ORG_A, envelope);
+    const tampered = cloneProviderEnvelope(providerEnvelope);
+    tampered.authTag[0] = (tampered.authTag[0] as number) ^ 0xff;
+    const capture = captureDecipherChunks();
+
+    try {
+      expectVaultError(
+        () =>
+          vault.decryptProviderCredential({
+            orgId: ORG_A,
+            providerKeyId: PROVIDER_KEY_A,
+            provider: 'openai',
+            providerEnvelope: tampered,
+            organizationEnvelope: envelope,
+          }),
+        'AUTHENTICATION_FAILED',
+      );
+
+      expect(capture.chunks.length).toBeGreaterThanOrEqual(2);
+      for (const chunk of capture.chunks) {
+        expect(chunk.every((byte) => byte === 0)).toBe(true);
+      }
+    } finally {
+      capture.restore();
+    }
+  });
+
+  it('rejects provider ciphertext outside the 2..4097-byte structural bound', () => {
+    const vault = createVault(1);
+    const envelope = vault.createOrganizationEnvelope(ORG_A);
+
+    for (const length of [1, MAX_PROVIDER_CREDENTIAL_BYTES + 2, 10_000]) {
+      expectVaultError(
+        () =>
+          vault.decryptProviderCredential({
+            orgId: ORG_A,
+            providerKeyId: PROVIDER_KEY_A,
+            provider: 'openai',
+            providerEnvelope: providerEnvelopeWithCiphertextLength(length),
+            organizationEnvelope: envelope,
+          }),
+        'UNSUPPORTED_FORMAT',
+      );
+    }
+
+    // Structurally valid boundary lengths reach authenticated decryption and fail there.
+    for (const length of [2, MAX_PROVIDER_CREDENTIAL_BYTES + 1]) {
+      expectVaultError(
+        () =>
+          vault.decryptProviderCredential({
+            orgId: ORG_A,
+            providerKeyId: PROVIDER_KEY_A,
+            provider: 'openai',
+            providerEnvelope: providerEnvelopeWithCiphertextLength(length),
+            organizationEnvelope: envelope,
+          }),
+        'AUTHENTICATION_FAILED',
+      );
+    }
+  });
+
+  it('round-trips a maximum-length 4096-byte provider credential', () => {
+    const vault = createVault(1);
+    const envelope = vault.createOrganizationEnvelope(ORG_A);
+    const maxPlaintext = Buffer.alloc(MAX_PROVIDER_CREDENTIAL_BYTES, 0x5a);
+
+    const providerEnvelope = encryptWithVault(vault, ORG_A, envelope, maxPlaintext);
+    expect(providerEnvelope.ciphertext).toHaveLength(MAX_PROVIDER_CREDENTIAL_BYTES + 1);
+
+    const plaintext = vault.decryptProviderCredential({
+      orgId: ORG_A,
+      providerKeyId: PROVIDER_KEY_A,
+      provider: 'openai',
+      providerEnvelope,
+      organizationEnvelope: envelope,
+    });
+    expect(plaintext.equals(maxPlaintext)).toBe(true);
+    plaintext.fill(0);
+  });
+
+  it('never exposes KEK material in returned envelopes or errors', () => {
+    const vault = createVault(1);
+    const envelope = vault.createOrganizationEnvelope(ORG_A);
+    const providerEnvelope = encryptWithVault(vault, ORG_A, envelope);
+    const kekBase64 = KEK_V1.toString('base64url');
+    const kekHex = KEK_V1.toString('hex');
+
+    for (const serialized of [JSON.stringify(envelope), JSON.stringify(providerEnvelope)]) {
+      expect(serialized).not.toContain(kekBase64);
+      expect(serialized).not.toContain(kekHex);
+    }
+
+    const tampered = cloneProviderEnvelope(providerEnvelope);
+    tampered.authTag[0] = (tampered.authTag[0] as number) ^ 0xff;
+    const error = expectVaultError(
+      () =>
+        vault.decryptProviderCredential({
+          orgId: ORG_A,
+          providerKeyId: PROVIDER_KEY_A,
+          provider: 'openai',
+          providerEnvelope: tampered,
+          organizationEnvelope: envelope,
+        }),
+      'AUTHENTICATION_FAILED',
+    );
+    expect(error.message).not.toContain(kekBase64);
+    expect(JSON.stringify(error)).not.toContain(kekBase64);
   });
 });

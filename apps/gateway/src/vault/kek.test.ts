@@ -50,8 +50,26 @@ describe('SW-1.7.1 versioned KEK configuration', () => {
     expect(inspection.status).toBe('valid');
     if (inspection.status === 'valid') {
       expect(inspection.keyring.activeVersion).toBe(1);
-      expect(inspection.keyring.resolve(1).toString('base64url')).toBe(encoded);
+      const resolved = inspection.keyring.resolve(1);
+      expect(resolved.toString('base64url')).toBe(encoded);
+      resolved.fill(0);
       expect(() => inspection.keyring.resolve(2)).toThrowError(VaultError);
+    }
+  });
+
+  it('accepts a valid V2-only keyring', () => {
+    const encoded = randomKek();
+    const inspection = inspectKekEnvironment({
+      MASTER_KEK_V2: encoded,
+      ACTIVE_KEK_VERSION: '2',
+    });
+    expect(inspection.status).toBe('valid');
+    if (inspection.status === 'valid') {
+      expect(inspection.keyring.activeVersion).toBe(2);
+      const resolved = inspection.keyring.resolve(2);
+      expect(resolved.toString('base64url')).toBe(encoded);
+      resolved.fill(0);
+      expect(() => inspection.keyring.resolve(1)).toThrowError(VaultError);
     }
   });
 
@@ -64,8 +82,12 @@ describe('SW-1.7.1 versioned KEK configuration', () => {
     expect(inspection.status).toBe('valid');
     if (inspection.status === 'valid') {
       expect(inspection.keyring.activeVersion).toBe(2);
-      expect(inspection.keyring.resolve(1)).toHaveLength(32);
-      expect(inspection.keyring.resolve(2)).toHaveLength(32);
+      const resolvedV1 = inspection.keyring.resolve(1);
+      const resolvedV2 = inspection.keyring.resolve(2);
+      expect(resolvedV1).toHaveLength(32);
+      expect(resolvedV2).toHaveLength(32);
+      resolvedV1.fill(0);
+      resolvedV2.fill(0);
     }
   });
 
@@ -155,8 +177,29 @@ describe('SW-1.7.1 versioned KEK configuration', () => {
     });
   });
 
-  it('rejects empty KEK values when configuration is present', () => {
-    expectInvalid({ MASTER_KEK_V1: '', ACTIVE_KEK_VERSION: '1' }, 'ACTIVE_KEK_VERSION');
+  it('rejects explicitly empty or whitespace-only KEK values, including inactive versions', () => {
+    const valid = randomKek();
+
+    // An explicitly empty active KEK is invalid, not absent.
+    expectInvalid({ MASTER_KEK_V1: '', ACTIVE_KEK_VERSION: '1' }, 'MASTER_KEK_V1');
+    expectInvalid({ MASTER_KEK_V2: '', ACTIVE_KEK_VERSION: '2' }, 'MASTER_KEK_V2');
+
+    // An explicitly empty inactive KEK is also invalid; only undefined means "not supplied".
+    expectInvalid(
+      { MASTER_KEK_V1: valid, MASTER_KEK_V2: '', ACTIVE_KEK_VERSION: '1' },
+      'MASTER_KEK_V2',
+    );
+    expectInvalid(
+      { MASTER_KEK_V1: '', MASTER_KEK_V2: valid, ACTIVE_KEK_VERSION: '2' },
+      'MASTER_KEK_V1',
+    );
+
+    // Whitespace-only material is invalid regardless of active or inactive status.
+    expectInvalid(
+      { MASTER_KEK_V1: valid, MASTER_KEK_V2: '   ', ACTIVE_KEK_VERSION: '1' },
+      'MASTER_KEK_V2',
+    );
+    expectInvalid({ MASTER_KEK_V1: ' '.repeat(43), ACTIVE_KEK_VERSION: '1' }, 'MASTER_KEK_V1');
   });
 
   it('rejects all-zero KEK material', () => {
@@ -208,6 +251,60 @@ describe('SW-1.7.1 versioned KEK configuration', () => {
     expect(() => keyring.resolve(1)).toThrowError(VaultError);
     expect(() => keyring.resolve(3)).toThrowError(VaultError);
     expect(() => keyring.resolve(0)).toThrowError(VaultError);
+  });
+
+  it('returns an independent KEK copy so caller mutation cannot alter keyring material', () => {
+    const original = crypto.randomBytes(32);
+    const keyring = new KekKeyring({ activeVersion: 1, keys: { 1: original } });
+
+    const first = keyring.resolve(1);
+    expect(first.equals(original)).toBe(true);
+    first.fill(0xff);
+
+    const second = keyring.resolve(1);
+    expect(second.equals(original)).toBe(true);
+    expect(second).not.toBe(first);
+
+    first.fill(0);
+    second.fill(0);
+  });
+
+  it('clears the scoped KEK copy after both success and failure', () => {
+    const keyring = new KekKeyring({ activeVersion: 1, keys: { 1: keyBytes(9) } });
+
+    let successCopy: Buffer | undefined;
+    expect(
+      keyring.withKey(1, (kek) => {
+        successCopy = kek;
+        expect(kek.every((byte) => byte === 9)).toBe(true);
+        return 'completed';
+      }),
+    ).toBe('completed');
+    expect(successCopy?.every((byte) => byte === 0)).toBe(true);
+
+    let failureCopy: Buffer | undefined;
+    expect(() =>
+      keyring.withKey(1, (kek) => {
+        failureCopy = kek;
+        throw new Error('synthetic operation failure');
+      }),
+    ).toThrowError('synthetic operation failure');
+    expect(failureCopy?.every((byte) => byte === 0)).toBe(true);
+  });
+
+  it('resolves historical V1 and V2 KEKs explicitly without fallback', () => {
+    const v1 = crypto.randomBytes(32);
+    const v2 = crypto.randomBytes(32);
+    const keyring = new KekKeyring({ activeVersion: 2, keys: { 1: v1, 2: v2 } });
+
+    const resolvedV1 = keyring.resolve(1);
+    const resolvedV2 = keyring.resolve(2);
+    expect(resolvedV1.equals(v1)).toBe(true);
+    expect(resolvedV2.equals(v2)).toBe(true);
+    expect(resolvedV1.equals(resolvedV2)).toBe(false);
+
+    resolvedV1.fill(0);
+    resolvedV2.fill(0);
   });
 
   it('never echoes KEK values in validation issues or configuration errors', () => {
