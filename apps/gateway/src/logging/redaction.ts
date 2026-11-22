@@ -21,6 +21,10 @@ export const REDACTION_PATHS: string[] = [
   '*token*',
   '*.*secret*',
   '*secret*',
+  '*.*kek*',
+  '*kek*',
+  '*.*dek*',
+  '*dek*',
   '*.*key*',
   '*key*',
   '*.*prompt*',
@@ -93,6 +97,12 @@ const SENSITIVE_KEY_ROOTS = [
 export function isSensitiveKey(key: string): boolean {
   const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, '');
   if (!normalized) return false;
+
+  // Envelope-encryption key material and ciphertext components (SW-1.7.1/SW-1.7.2):
+  // KEK/DEK naming variants such as MASTER_KEK_V1, wrapped_dek, dek_iv, dekAuthTag.
+  if (normalized.includes('kek') || normalized.includes('dek')) {
+    return true;
+  }
 
   for (const root of SENSITIVE_KEY_ROOTS) {
     if (normalized === root) return true;

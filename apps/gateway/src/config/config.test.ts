@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { ConfigValidationError, loadConfig } from './index.js';
+import { createKekKeyringFromEnvironment } from '../vault/kek.js';
 
 const VALID_DEV_ENV: Record<string, string> = {
   NODE_ENV: 'development',
@@ -400,6 +401,178 @@ describe('SW-1.2.2 Central Zod Configuration', () => {
         BROWSER_ORIGIN: 'https://10.0.0.1:8443',
       });
       expect(privateIpConfig.BROWSER_ORIGIN).toBe('https://10.0.0.1:8443');
+    });
+  });
+
+  describe('SW-1.7.1 Versioned KEK configuration', () => {
+    const KEK_V1 = Buffer.alloc(32, 0x11).toString('base64url');
+    const KEK_V2 = Buffer.alloc(32, 0x22).toString('base64url');
+
+    it('19a. permits an uninitialised vault when no KEK configuration is supplied', () => {
+      const config = loadConfig(VALID_DEV_ENV);
+      expect(config.MASTER_KEK_V1).toBeUndefined();
+      expect(config.MASTER_KEK_V2).toBeUndefined();
+      expect(config.ACTIVE_KEK_VERSION).toBeUndefined();
+      expect(() => createKekKeyringFromEnvironment(config)).toThrowError(
+        /KEK configuration is not supplied/,
+      );
+    });
+
+    it('19b. accepts valid V1 configuration and constructs a keyring', () => {
+      const config = loadConfig({
+        ...VALID_DEV_ENV,
+        MASTER_KEK_V1: KEK_V1,
+        ACTIVE_KEK_VERSION: '1',
+      });
+      expect(config.ACTIVE_KEK_VERSION).toBe('1');
+      const keyring = createKekKeyringFromEnvironment(config);
+      expect(keyring.activeVersion).toBe(1);
+      const resolved = keyring.resolve(1);
+      expect(resolved).toHaveLength(32);
+      resolved.fill(0);
+    });
+
+    it('19c. accepts valid V1+V2 configuration with active version 2', () => {
+      const config = loadConfig({
+        ...VALID_DEV_ENV,
+        MASTER_KEK_V1: KEK_V1,
+        MASTER_KEK_V2: KEK_V2,
+        ACTIVE_KEK_VERSION: '2',
+      });
+      const keyring = createKekKeyringFromEnvironment(config);
+      expect(keyring.activeVersion).toBe(2);
+      expect(keyring.has(1)).toBe(true);
+      expect(keyring.has(2)).toBe(true);
+    });
+
+    it('19d. rejects partial KEK configuration', () => {
+      expect(() => loadConfig({ ...VALID_DEV_ENV, MASTER_KEK_V1: KEK_V1 })).toThrowError(
+        ConfigValidationError,
+      );
+      try {
+        loadConfig({ ...VALID_DEV_ENV, MASTER_KEK_V1: KEK_V1 });
+      } catch (error) {
+        const err = error as ConfigValidationError;
+        expect(err.issues.some((issue) => issue.field === 'ACTIVE_KEK_VERSION')).toBe(true);
+      }
+    });
+
+    it('19e. rejects an active version whose KEK is missing', () => {
+      expect(() =>
+        loadConfig({
+          ...VALID_DEV_ENV,
+          MASTER_KEK_V1: KEK_V1,
+          ACTIVE_KEK_VERSION: '2',
+        }),
+      ).toThrowError(ConfigValidationError);
+    });
+
+    it('19f. rejects malformed KEK material and invalid active versions', () => {
+      for (const key of [
+        '',
+        'not-a-kek',
+        `${KEK_V1}=`,
+        Buffer.alloc(31, 1).toString('base64url'),
+      ]) {
+        expect(() =>
+          loadConfig({ ...VALID_DEV_ENV, MASTER_KEK_V1: key, ACTIVE_KEK_VERSION: '1' }),
+        ).toThrowError(ConfigValidationError);
+      }
+      for (const version of ['0', '3', '01', '+1', '1.0', 'one']) {
+        expect(() =>
+          loadConfig({
+            ...VALID_DEV_ENV,
+            MASTER_KEK_V1: KEK_V1,
+            ACTIVE_KEK_VERSION: version,
+          }),
+        ).toThrowError(ConfigValidationError);
+      }
+    });
+
+    it('19g. rejects all-zero and duplicate KEK material', () => {
+      expect(() =>
+        loadConfig({
+          ...VALID_DEV_ENV,
+          MASTER_KEK_V1: Buffer.alloc(32, 0).toString('base64url'),
+          ACTIVE_KEK_VERSION: '1',
+        }),
+      ).toThrowError(ConfigValidationError);
+
+      expect(() =>
+        loadConfig({
+          ...VALID_DEV_ENV,
+          MASTER_KEK_V1: KEK_V1,
+          MASTER_KEK_V2: KEK_V1,
+          ACTIVE_KEK_VERSION: '1',
+        }),
+      ).toThrowError(ConfigValidationError);
+    });
+
+    it('19h. accepts valid V2-only configuration', () => {
+      const config = loadConfig({
+        ...VALID_DEV_ENV,
+        MASTER_KEK_V2: KEK_V2,
+        ACTIVE_KEK_VERSION: '2',
+      });
+      const keyring = createKekKeyringFromEnvironment(config);
+      expect(keyring.activeVersion).toBe(2);
+      expect(keyring.has(2)).toBe(true);
+      expect(keyring.has(1)).toBe(false);
+    });
+
+    it('19i. rejects explicitly empty or whitespace-only inactive KEK values', () => {
+      expect(() =>
+        loadConfig({
+          ...VALID_DEV_ENV,
+          MASTER_KEK_V1: KEK_V1,
+          MASTER_KEK_V2: '',
+          ACTIVE_KEK_VERSION: '1',
+        }),
+      ).toThrowError(ConfigValidationError);
+
+      expect(() =>
+        loadConfig({
+          ...VALID_DEV_ENV,
+          MASTER_KEK_V1: '',
+          MASTER_KEK_V2: KEK_V2,
+          ACTIVE_KEK_VERSION: '2',
+        }),
+      ).toThrowError(ConfigValidationError);
+
+      expect(() =>
+        loadConfig({
+          ...VALID_DEV_ENV,
+          MASTER_KEK_V1: KEK_V1,
+          MASTER_KEK_V2: '   ',
+          ACTIVE_KEK_VERSION: '1',
+        }),
+      ).toThrowError(ConfigValidationError);
+
+      expect(() =>
+        loadConfig({
+          ...VALID_DEV_ENV,
+          MASTER_KEK_V1: ' '.repeat(43),
+          ACTIVE_KEK_VERSION: '1',
+        }),
+      ).toThrowError(ConfigValidationError);
+    });
+
+    it('19j. never echoes KEK values in configuration validation errors', () => {
+      const canary = 'synthetic_config_kek_canary_5d2f8a1c';
+      try {
+        loadConfig({
+          ...VALID_DEV_ENV,
+          MASTER_KEK_V1: canary,
+          ACTIVE_KEK_VERSION: '1',
+        });
+        expect.fail('expected ConfigValidationError');
+      } catch (error) {
+        const err = error as ConfigValidationError;
+        expect(err.message).not.toContain(canary);
+        for (const issue of err.issues) {
+          expect(issue.message).not.toContain(canary);
+        }
+      }
     });
   });
 });

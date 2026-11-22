@@ -188,6 +188,9 @@ export const SAFE_ISSUE_FIELDS = new Set([
   'COOKIE_SECURE',
   'COOKIE_DOMAIN',
   'TLS_VERIFY',
+  'MASTER_KEK_V1',
+  'MASTER_KEK_V2',
+  'ACTIVE_KEK_VERSION',
   'MOCK_PROVIDER_ENABLED',
   'DEMO_SEEDING_ENABLED',
   'UPSTREAM_ENDPOINT_URL',
@@ -223,6 +226,12 @@ export const SAFE_CUSTOM_ZOD_MESSAGES = new Set([
   'Disabling Node TLS verification is prohibited in production.',
   'Forbidden security bypass flag detected. Switchyard is strictly fail-closed.',
   'Invalid value provided for sensitive credential',
+  'ACTIVE_KEK_VERSION is required when KEK configuration is supplied',
+  'ACTIVE_KEK_VERSION must be exactly "1" or "2"',
+  'ACTIVE_KEK_VERSION must reference a supplied valid KEK',
+  'KEK material must be canonical unpadded base64url encoding exactly 32 bytes',
+  'KEK material must not be all zero bytes',
+  'KEK V1 and KEK V2 must not contain identical key material',
 ]);
 
 export interface SerializedError {
