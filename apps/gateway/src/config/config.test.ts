@@ -198,11 +198,28 @@ describe('SW-1.2.2 Central Zod Configuration', () => {
   });
 
   it('15. rejects unknown security bypass flags', () => {
-    const bypassEnv = { ...VALID_DEV_ENV, BYPASS_AUTH: 'true' };
-    expect(() => loadConfig(bypassEnv)).toThrowError(ConfigValidationError);
+    const forbiddenFlags = [
+      'FAIL_OPEN',
+      'ALLOW_FAIL_OPEN',
+      'BYPASS_AUTH',
+      'ALLOW_INSECURE_AUTH',
+      'BYPASS_RLS',
+      'DISABLE_TENANT_ISOLATION',
+      'DISABLE_AUTH',
+      'INSECURE_MODE',
+    ];
 
-    const rlsBypassEnv = { ...VALID_DEV_ENV, BYPASS_RLS: '1' };
-    expect(() => loadConfig(rlsBypassEnv)).toThrowError(ConfigValidationError);
+    for (const flag of forbiddenFlags) {
+      const bypassEnv = { ...VALID_DEV_ENV, [flag]: 'true' };
+      expect(() => loadConfig(bypassEnv)).toThrowError(ConfigValidationError);
+      try {
+        loadConfig(bypassEnv);
+      } catch (e) {
+        const err = e as ConfigValidationError;
+        expect(err.issues.some((issue) => issue.field === flag)).toBe(true);
+        expect(err.message).toContain('Forbidden security bypass flag detected');
+      }
+    }
   });
 
   it('16. ensures injected synthetic secrets never appear in validation errors (Finding 1, Finding 5)', () => {
