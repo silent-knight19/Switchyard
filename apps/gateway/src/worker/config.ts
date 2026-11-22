@@ -45,12 +45,24 @@ const portNumber = z.string().transform((val, ctx) => {
   return num;
 });
 
-const positiveInt = z.string().transform((val, ctx) => {
+const probeInterval = z.string().transform((val, ctx) => {
   const num = Number(val);
-  if (!Number.isInteger(num) || num < 50 || num > 300000) {
+  if (!Number.isInteger(num) || num < 100 || num > 30000) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
-      message: 'Expected integer between 50 and 300000',
+      message: 'Expected integer between 100 and 30000',
+    });
+    return z.NEVER;
+  }
+  return num;
+});
+
+const probeTimeout = z.string().transform((val, ctx) => {
+  const num = Number(val);
+  if (!Number.isInteger(num) || num < 50 || num > 10000) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'Expected integer between 50 and 10000',
     });
     return z.NEVER;
   }
@@ -89,9 +101,9 @@ export const workerEnvSchema = z
     // Health file path for heartbeat and status check
     WORKER_HEALTH_FILE: z.string().default('/tmp/switchyard-worker-health.json'),
 
-    // Bounded probe timings (Architecture v1.2 §20, §23)
-    WORKER_PROBE_INTERVAL_MS: positiveInt.default(5000),
-    WORKER_PROBE_TIMEOUT_MS: positiveInt.default(2000),
+    // Bounded probe timings (Architecture v1.2 §20, §23; WRK-05)
+    WORKER_PROBE_INTERVAL_MS: probeInterval.default(5000),
+    WORKER_PROBE_TIMEOUT_MS: probeTimeout.default(2000),
   })
   .passthrough();
 
@@ -111,7 +123,18 @@ export interface WorkerConfig {
   WORKER_HEALTH_FILE: string;
   WORKER_PROBE_INTERVAL_MS: number;
   WORKER_PROBE_TIMEOUT_MS: number;
+  FRESHNESS_THRESHOLD_MS: number;
 }
+
+const INSECURE_DEV_PASSWORDS = new Set([
+  'switchyard_worker_password',
+  'switchyard_dev_password',
+  'switchyard_app_password',
+  'password',
+  'postgres',
+  'admin',
+  'root',
+]);
 
 export function parseWorkerConfig(
   rawEnv: Record<string, string | undefined> = process.env,
@@ -164,9 +187,42 @@ export function parseWorkerConfig(
     );
   }
 
-  if (issues.length > 0) {
+  // Check 6 (WRK-05): Probe timeout cannot exceed probe interval
+  if (parseResult.success) {
+    const data = parseResult.data;
+    if (data.WORKER_PROBE_TIMEOUT_MS > data.WORKER_PROBE_INTERVAL_MS) {
+      issues.push(
+        `WORKER_PROBE_TIMEOUT_MS: Probe timeout (${data.WORKER_PROBE_TIMEOUT_MS}ms) cannot exceed probe interval (${data.WORKER_PROBE_INTERVAL_MS}ms)`,
+      );
+    }
+  }
+
+  // Check 7 (WRK-06): Default development credentials prohibited in production profile
+  if (rawEnv.NODE_ENV === 'production') {
+    if (rawEnv.POSTGRES_PASSWORD && INSECURE_DEV_PASSWORDS.has(rawEnv.POSTGRES_PASSWORD)) {
+      issues.push(
+        'POSTGRES_PASSWORD: Default development credentials are prohibited in production profile',
+      );
+    }
+    if (rawEnv.REDIS_PASSWORD && INSECURE_DEV_PASSWORDS.has(rawEnv.REDIS_PASSWORD)) {
+      issues.push(
+        'REDIS_PASSWORD: Default development credentials are prohibited in production profile',
+      );
+    }
+  }
+
+  if (issues.length > 0 || !parseResult.success) {
     throw new WorkerConfigValidationError(issues);
   }
 
-  return parseResult.data as WorkerConfig;
+  const parsed = parseResult.data;
+  const freshnessThresholdMs = Math.max(
+    parsed.WORKER_PROBE_INTERVAL_MS * 3,
+    parsed.WORKER_PROBE_INTERVAL_MS + parsed.WORKER_PROBE_TIMEOUT_MS * 2,
+  );
+
+  return {
+    ...parsed,
+    FRESHNESS_THRESHOLD_MS: freshnessThresholdMs,
+  };
 }

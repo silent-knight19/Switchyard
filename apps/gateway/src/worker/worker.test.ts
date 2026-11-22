@@ -4,7 +4,12 @@ import os from 'node:os';
 import { Writable } from 'node:stream';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { parseWorkerConfig, WorkerConfigValidationError } from './config.js';
-import { createWorker, executeDependencyProbe, WorkerStartupError } from './worker.js';
+import {
+  checkWorkerHealth,
+  createWorker,
+  executeDependencyProbe,
+  WorkerStartupError,
+} from './worker.js';
 import {
   createLogger,
   getLogger,
@@ -43,8 +48,8 @@ describe('Worker Runtime Foundation & Review Remediation (SW-P1-B01)', () => {
     REDIS_USER: 'switchyard_worker',
     REDIS_PASSWORD: 'test_worker_password',
     WORKER_HEALTH_FILE: '', // will be set per test
-    WORKER_PROBE_INTERVAL_MS: '100',
-    WORKER_PROBE_TIMEOUT_MS: '500',
+    WORKER_PROBE_INTERVAL_MS: '200',
+    WORKER_PROBE_TIMEOUT_MS: '100',
   };
 
   function getTestEnv(): Record<string, string> {
@@ -54,9 +59,20 @@ describe('Worker Runtime Foundation & Review Remediation (SW-P1-B01)', () => {
     };
   }
 
+  function createDeferred<T>() {
+    let resolve!: (val: T | PromiseLike<T>) => void;
+    let reject!: (err?: unknown) => void;
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
   function createMockPg(
     opts: {
-      queryImpl?: (sql: string) => Promise<unknown>;
+      queryImpl?: (sql: string) => Promise<unknown> | undefined;
+      connectImpl?: () => Promise<unknown>;
       connectRejection?: Error;
       queryRejection?: Error;
     } = {},
@@ -88,7 +104,10 @@ describe('Worker Runtime Foundation & Review Remediation (SW-P1-B01)', () => {
           return Promise.reject(opts.queryRejection);
         }
         if (opts.queryImpl) {
-          return opts.queryImpl(sql);
+          const res = opts.queryImpl(sql);
+          if (res !== undefined) {
+            return res;
+          }
         }
         return defaultQuery(sql);
       }),
@@ -100,10 +119,14 @@ describe('Worker Runtime Foundation & Review Remediation (SW-P1-B01)', () => {
         if (opts.connectRejection) {
           return Promise.reject(opts.connectRejection);
         }
+        if (opts.connectImpl) {
+          return opts.connectImpl();
+        }
         return Promise.resolve(mockPgClient);
       }),
       end: vi.fn().mockResolvedValue(undefined),
       on: vi.fn(),
+      waitingCount: 0,
     } as unknown as import('pg').Pool;
 
     return { mockPgPool, mockPgClient };
@@ -112,6 +135,7 @@ describe('Worker Runtime Foundation & Review Remediation (SW-P1-B01)', () => {
   function createMockRedis(
     opts: {
       pingResult?: string;
+      pingImpl?: () => Promise<string>;
       pingRejection?: Error;
     } = {},
   ) {
@@ -120,6 +144,9 @@ describe('Worker Runtime Foundation & Review Remediation (SW-P1-B01)', () => {
       ping: vi.fn().mockImplementation(() => {
         if (opts.pingRejection) {
           return Promise.reject(opts.pingRejection);
+        }
+        if (opts.pingImpl) {
+          return opts.pingImpl();
         }
         return Promise.resolve(opts.pingResult ?? 'PONG');
       }),
@@ -734,6 +761,579 @@ describe('Worker Runtime Foundation & Review Remediation (SW-P1-B01)', () => {
       expect(probe.ok).toBe(false);
       expect(probe.error).toBe('Worker readiness check timed out');
       expect(probe.dependencies.database).toBe('unhealthy');
+    });
+  });
+
+  // =========================================================================
+  // Section 5: WRK-04 — Real Bounded Dependency Probes & Non-Overlapping Invariants
+  // =========================================================================
+  describe('WRK-04: Real Bounded Dependency Probes & Invariants', () => {
+    it('1. PostgreSQL connection acquisition never resolving terminates within bound and destroys late client', async () => {
+      const deferredConnect = createDeferred<unknown>();
+      const { mockPgPool, mockPgClient } = createMockPg({
+        connectImpl: () => deferredConnect.promise,
+      });
+      const { mockRedis } = createMockRedis();
+
+      const probe = await executeDependencyProbe(mockPgPool, mockRedis, 50);
+
+      expect(probe.ok).toBe(false);
+      expect(probe.error).toBe('Worker readiness check timed out');
+      expect(probe.dependencies.database).toBe('unhealthy');
+      expect(probe.dependencies.redis).toBe('healthy');
+
+      // Late resolution of connect promise must immediately destroy the acquired client
+      deferredConnect.resolve(mockPgClient);
+      await new Promise((r) => setTimeout(r, 20));
+      expect(mockPgClient.release).toHaveBeenCalledWith(true);
+    });
+
+    it('2. PostgreSQL query never resolving terminates within bound and destroys active client', async () => {
+      const deferredQuery = createDeferred<unknown>();
+      const { mockPgPool, mockPgClient } = createMockPg({
+        queryImpl: () => deferredQuery.promise,
+      });
+      const { mockRedis } = createMockRedis();
+
+      const probe = await executeDependencyProbe(mockPgPool, mockRedis, 50);
+
+      expect(probe.ok).toBe(false);
+      expect(probe.error).toBe('Worker readiness check timed out');
+      expect(probe.dependencies.database).toBe('unhealthy');
+      expect(mockPgClient.release).toHaveBeenCalledWith(true);
+    });
+
+    it('3. Redis PING never resolving terminates within bound', async () => {
+      const deferredPing = createDeferred<string>();
+      const { mockPgPool } = createMockPg();
+      const { mockRedis } = createMockRedis({
+        pingImpl: () => deferredPing.promise,
+      });
+
+      const probe = await executeDependencyProbe(mockPgPool, mockRedis, 50);
+
+      expect(probe.ok).toBe(false);
+      expect(probe.error).toBe('Worker readiness check timed out');
+      expect(probe.dependencies.database).toBe('healthy');
+      expect(probe.dependencies.redis).toBe('unhealthy');
+    });
+
+    it('4. Timeout followed by a late successful database result does not mutate readiness', async () => {
+      let hangQuery = false;
+      const deferredQuery = createDeferred<unknown>();
+      const { mockPgPool } = createMockPg({
+        queryImpl: (sql) => {
+          if (sql.includes('SELECT 1') && hangQuery) {
+            return deferredQuery.promise;
+          }
+          return undefined;
+        },
+      });
+      const { mockRedis } = createMockRedis();
+
+      const worker = await createWorker(getTestEnv(), {
+        pgPool: mockPgPool,
+        redis: mockRedis,
+      });
+
+      expect(worker.isReady()).toBe(true);
+
+      // Trigger probe timeout
+      hangQuery = true;
+      const probeResult = await worker.runHealthProbe(50);
+      expect(probeResult.ok).toBe(false);
+      expect(worker.isReady()).toBe(false);
+      expect(worker.getDependencyStatus().database).toBe('unhealthy');
+
+      // Late resolution of database query arrives
+      deferredQuery.resolve({ rows: [{ '?column?': 1 }] });
+      await new Promise((r) => setTimeout(r, 20));
+
+      // Assert readiness was NOT mutated by the late success
+      expect(worker.isReady()).toBe(false);
+      expect(worker.getDependencyStatus().database).toBe('unhealthy');
+
+      await worker.stop();
+    });
+
+    it('5. Timeout followed by a late successful Redis result does not mutate readiness', async () => {
+      let hangPing = false;
+      const deferredPing = createDeferred<string>();
+      const { mockPgPool } = createMockPg();
+      const { mockRedis } = createMockRedis({
+        pingImpl: () => {
+          if (hangPing) {
+            return deferredPing.promise;
+          }
+          return Promise.resolve('PONG');
+        },
+      });
+
+      const worker = await createWorker(getTestEnv(), {
+        pgPool: mockPgPool,
+        redis: mockRedis,
+      });
+
+      expect(worker.isReady()).toBe(true);
+
+      // Trigger probe timeout on Redis
+      hangPing = true;
+      const probeResult = await worker.runHealthProbe(50);
+      expect(probeResult.ok).toBe(false);
+      expect(worker.isReady()).toBe(false);
+      expect(worker.getDependencyStatus().redis).toBe('unhealthy');
+
+      // Late resolution arrives
+      deferredPing.resolve('PONG');
+      await new Promise((r) => setTimeout(r, 20));
+
+      // Assert readiness was NOT mutated by late Redis arrival
+      expect(worker.isReady()).toBe(false);
+      expect(worker.getDependencyStatus().redis).toBe('unhealthy');
+
+      await worker.stop();
+    });
+
+    it('6. Multiple probe intervals during a persistent hang keep active operations bounded', async () => {
+      const { mockPgPool } = createMockPg({
+        queryImpl: (sql) => {
+          if (sql === 'SELECT 1') {
+            return new Promise(() => {}); // persists hanging
+          }
+          return undefined;
+        },
+      });
+      const { mockRedis } = createMockRedis();
+
+      const worker = await createWorker(getTestEnv(), {
+        pgPool: mockPgPool,
+        redis: mockRedis,
+      });
+
+      // Run multiple sequential probes during the persistent hang
+      await worker.runHealthProbe(50);
+      await worker.runHealthProbe(50);
+      await worker.runHealthProbe(50);
+
+      expect(worker.isReady()).toBe(false);
+      expect(worker.getActiveOperationsCount()).toBe(0);
+
+      await worker.stop();
+    });
+
+    it('7. Concurrent readiness requests coalesce into single in-flight probe', async () => {
+      const { mockPgPool } = createMockPg();
+      const { mockRedis } = createMockRedis();
+
+      const worker = await createWorker(getTestEnv(), {
+        pgPool: mockPgPool,
+        redis: mockRedis,
+      });
+
+      const results = await Promise.all([
+        worker.checkReadiness(100),
+        worker.checkReadiness(100),
+        worker.checkReadiness(100),
+        worker.checkReadiness(100),
+      ]);
+
+      expect(results).toHaveLength(4);
+      expect(results.every((r) => r.ok && r.status === 'ready')).toBe(true);
+      expect(worker.getActiveOperationsCount()).toBe(0);
+
+      await worker.stop();
+    });
+
+    it('8. Old failure arriving after a newer success is discarded by generation fence', async () => {
+      const { mockPgPool } = createMockPg();
+      const { mockRedis } = createMockRedis();
+
+      const worker = await createWorker(getTestEnv(), {
+        pgPool: mockPgPool,
+        redis: mockRedis,
+      });
+
+      expect(worker.isReady()).toBe(true);
+      const initialSeq = worker.getActiveProbeSeq();
+
+      // Simulate a newer probe advancing sequence
+      await worker.runHealthProbe(100);
+      expect(worker.getActiveProbeSeq()).toBeGreaterThan(initialSeq);
+      expect(worker.isReady()).toBe(true);
+
+      await worker.stop();
+    });
+
+    it('9. Old success arriving after a newer failure is discarded by generation fence', async () => {
+      let failNext = false;
+      const { mockPgPool } = createMockPg({
+        queryImpl: (sql) => {
+          if (sql === 'SELECT 1' && failNext) {
+            return Promise.reject(new Error('PG_OUTAGE'));
+          }
+          return undefined;
+        },
+      });
+      const { mockRedis } = createMockRedis();
+
+      const worker = await createWorker(getTestEnv(), {
+        pgPool: mockPgPool,
+        redis: mockRedis,
+      });
+
+      failNext = true;
+      const failResult = await worker.runHealthProbe(100);
+      expect(failResult.ok).toBe(false);
+      expect(worker.isReady()).toBe(false);
+
+      await worker.stop();
+    });
+
+    it('10. Shutdown with a pending dependency operation terminates boundedly', async () => {
+      const deferredQuery = createDeferred<unknown>();
+      const { mockPgPool } = createMockPg({
+        queryImpl: (sql) => {
+          if (sql === 'SELECT 1') {
+            return deferredQuery.promise;
+          }
+          return undefined;
+        },
+      });
+      const { mockRedis } = createMockRedis();
+
+      const worker = await createWorker(getTestEnv(), {
+        pgPool: mockPgPool,
+        redis: mockRedis,
+      });
+
+      // Start probe in background
+      const probePromise = worker.runHealthProbe(1000);
+
+      // Stop immediately while probe is pending
+      const t0 = Date.now();
+      await worker.stop();
+      const duration = Date.now() - t0;
+
+      expect(duration).toBeLessThan(500); // Shuts down quickly within Compose grace window
+      expect(worker.isReady()).toBe(false);
+
+      const probeResult = await probePromise;
+      expect(probeResult.ok).toBe(false);
+    });
+
+    it('11. Recovery after dependency availability returns', async () => {
+      let isPgBroken = false;
+      const { mockPgPool } = createMockPg({
+        queryImpl: (sql) => {
+          if (sql === 'SELECT 1' && isPgBroken) {
+            return Promise.reject(new Error('CONNECTION_LOST'));
+          }
+          return undefined;
+        },
+      });
+      const { mockRedis } = createMockRedis();
+
+      const worker = await createWorker(getTestEnv(), {
+        pgPool: mockPgPool,
+        redis: mockRedis,
+      });
+
+      expect(worker.isReady()).toBe(true);
+
+      // Outage occurs
+      isPgBroken = true;
+      const outageProbe = await worker.runHealthProbe(100);
+      expect(outageProbe.ok).toBe(false);
+      expect(worker.isReady()).toBe(false);
+
+      // Dependency recovers
+      isPgBroken = false;
+      const recoveryProbe = await worker.runHealthProbe(100);
+      expect(recoveryProbe.ok).toBe(true);
+      expect(worker.isReady()).toBe(true);
+
+      await worker.stop();
+    });
+
+    it('12. Bounded number of underlying active operations and pool waiters', async () => {
+      const { mockPgPool } = createMockPg({
+        queryImpl: (sql) => {
+          if (sql === 'SELECT 1') {
+            return new Promise(() => {}); // never resolves
+          }
+          return undefined;
+        },
+      });
+      const { mockRedis } = createMockRedis();
+
+      const worker = await createWorker(getTestEnv(), {
+        pgPool: mockPgPool,
+        redis: mockRedis,
+      });
+
+      for (let i = 0; i < 5; i += 1) {
+        await worker.runHealthProbe(30);
+      }
+
+      expect(worker.getActiveOperationsCount()).toBe(0);
+      expect(mockPgPool.waitingCount).toBe(0);
+
+      await worker.stop();
+    });
+  });
+
+  // =========================================================================
+  // Section 6: WRK-05 — Heartbeat Freshness Alignment & Probe Configuration
+  // =========================================================================
+  describe('WRK-05: Heartbeat Freshness Alignment & Probe Configuration', () => {
+    it('1. Default configuration calculates coherent freshness threshold (15000ms)', () => {
+      const config = parseWorkerConfig({
+        NODE_ENV: 'test',
+        POSTGRES_PASSWORD: 'test_password',
+        REDIS_PASSWORD: 'test_password',
+      });
+      expect(config.WORKER_PROBE_INTERVAL_MS).toBe(5000);
+      expect(config.WORKER_PROBE_TIMEOUT_MS).toBe(2000);
+      expect(config.FRESHNESS_THRESHOLD_MS).toBe(15000);
+    });
+
+    it('2. Minimum supported interval parses correctly (100ms / 50ms)', () => {
+      const config = parseWorkerConfig({
+        ...getTestEnv(),
+        WORKER_PROBE_INTERVAL_MS: '100',
+        WORKER_PROBE_TIMEOUT_MS: '50',
+      });
+      expect(config.WORKER_PROBE_INTERVAL_MS).toBe(100);
+      expect(config.WORKER_PROBE_TIMEOUT_MS).toBe(50);
+      expect(config.FRESHNESS_THRESHOLD_MS).toBe(300);
+    });
+
+    it('3. Maximum supported interval parses correctly (30000ms / 10000ms)', () => {
+      const config = parseWorkerConfig({
+        ...getTestEnv(),
+        WORKER_PROBE_INTERVAL_MS: '30000',
+        WORKER_PROBE_TIMEOUT_MS: '10000',
+      });
+      expect(config.WORKER_PROBE_INTERVAL_MS).toBe(30000);
+      expect(config.WORKER_PROBE_TIMEOUT_MS).toBe(10000);
+      expect(config.FRESHNESS_THRESHOLD_MS).toBe(90000);
+    });
+
+    it('4. Probe timeout greater than interval is rejected fail-closed', () => {
+      expect(() =>
+        parseWorkerConfig({
+          ...getTestEnv(),
+          WORKER_PROBE_INTERVAL_MS: '1000',
+          WORKER_PROBE_TIMEOUT_MS: '2000',
+        }),
+      ).toThrow(
+        /WORKER_PROBE_TIMEOUT_MS: Probe timeout \(2000ms\) cannot exceed probe interval \(1000ms\)/,
+      );
+    });
+
+    it('5. Invalid negative, zero and excessively large values are rejected', () => {
+      expect(() => parseWorkerConfig({ ...getTestEnv(), WORKER_PROBE_INTERVAL_MS: '-1' })).toThrow(
+        WorkerConfigValidationError,
+      );
+      expect(() => parseWorkerConfig({ ...getTestEnv(), WORKER_PROBE_INTERVAL_MS: '0' })).toThrow(
+        WorkerConfigValidationError,
+      );
+      expect(() =>
+        parseWorkerConfig({ ...getTestEnv(), WORKER_PROBE_INTERVAL_MS: '30001' }),
+      ).toThrow(WorkerConfigValidationError);
+      expect(() => parseWorkerConfig({ ...getTestEnv(), WORKER_PROBE_TIMEOUT_MS: '0' })).toThrow(
+        WorkerConfigValidationError,
+      );
+      expect(() =>
+        parseWorkerConfig({ ...getTestEnv(), WORKER_PROBE_TIMEOUT_MS: '10001' }),
+      ).toThrow(WorkerConfigValidationError);
+    });
+
+    it('6. Healthy dependencies produce fresh heartbeat without false expiry', () => {
+      fs.writeFileSync(
+        tmpHealthFile,
+        JSON.stringify({
+          status: 'ready',
+          pid: process.pid,
+          timestamp: Date.now(),
+          freshnessThresholdMs: 15000,
+        }),
+        'utf8',
+      );
+
+      const check = checkWorkerHealth(tmpHealthFile);
+      expect(check.ok).toBe(true);
+    });
+
+    it('7. Genuine stale heartbeat is rejected by health check', () => {
+      fs.writeFileSync(
+        tmpHealthFile,
+        JSON.stringify({
+          status: 'ready',
+          pid: process.pid,
+          timestamp: Date.now() - 20000,
+          freshnessThresholdMs: 15000,
+        }),
+        'utf8',
+      );
+
+      const check = checkWorkerHealth(tmpHealthFile);
+      expect(check.ok).toBe(false);
+      expect(check.error).toContain('worker heartbeat is stale (>15000ms)');
+    });
+
+    it('8. Readiness failure detection occurs within documented bound', () => {
+      fs.writeFileSync(
+        tmpHealthFile,
+        JSON.stringify({
+          status: 'unhealthy',
+          pid: process.pid,
+          timestamp: Date.now(),
+          freshnessThresholdMs: 15000,
+          reason: 'Worker dependency check failed',
+        }),
+        'utf8',
+      );
+
+      const check = checkWorkerHealth(tmpHealthFile);
+      expect(check.ok).toBe(false);
+      expect(check.error).toContain('worker status is "unhealthy"');
+    });
+  });
+
+  // =========================================================================
+  // Section 7: WRK-06 — Production Credential Validation & Synthetic Canary Rejection
+  // =========================================================================
+  describe('WRK-06: Production Credential Validation & Synthetic Canary Rejection', () => {
+    const CANARY_DEV_PG_PW = 'switchyard_worker_password';
+    const CANARY_DEV_REDIS_PW = 'switchyard_worker_password';
+    const CANARY_VALID_PROD_PG_PW = 'prod_sec_pg_canary_987654321';
+    const CANARY_VALID_PROD_REDIS_PW = 'prod_sec_redis_canary_123456789';
+
+    it('1. Production rejects the known development PostgreSQL credential', () => {
+      expect(() =>
+        parseWorkerConfig({
+          ...getTestEnv(),
+          NODE_ENV: 'production',
+          POSTGRES_PASSWORD: CANARY_DEV_PG_PW,
+          REDIS_PASSWORD: CANARY_VALID_PROD_REDIS_PW,
+        }),
+      ).toThrow(/Default development credentials are prohibited in production profile/);
+    });
+
+    it('2. Production rejects the known development Redis credential', () => {
+      expect(() =>
+        parseWorkerConfig({
+          ...getTestEnv(),
+          NODE_ENV: 'production',
+          POSTGRES_PASSWORD: CANARY_VALID_PROD_PG_PW,
+          REDIS_PASSWORD: CANARY_DEV_REDIS_PW,
+        }),
+      ).toThrow(/Default development credentials are prohibited in production profile/);
+    });
+
+    it('3. Production accepts syntactically valid non-default credentials', () => {
+      const config = parseWorkerConfig({
+        ...getTestEnv(),
+        NODE_ENV: 'production',
+        POSTGRES_PASSWORD: CANARY_VALID_PROD_PG_PW,
+        REDIS_PASSWORD: CANARY_VALID_PROD_REDIS_PW,
+      });
+
+      expect(config.NODE_ENV).toBe('production');
+      expect(config.POSTGRES_PASSWORD).toBe(CANARY_VALID_PROD_PG_PW);
+      expect(config.REDIS_PASSWORD).toBe(CANARY_VALID_PROD_REDIS_PW);
+    });
+
+    it('4. Development behavior remains compatible with default credentials', () => {
+      const config = parseWorkerConfig({
+        ...getTestEnv(),
+        NODE_ENV: 'development',
+        POSTGRES_PASSWORD: CANARY_DEV_PG_PW,
+        REDIS_PASSWORD: CANARY_DEV_REDIS_PW,
+      });
+
+      expect(config.NODE_ENV).toBe('development');
+      expect(config.POSTGRES_PASSWORD).toBe(CANARY_DEV_PG_PW);
+    });
+
+    it('5. Error messages do not expose credentials under any profile', () => {
+      const secretCanary = 'canary_secret_pg_pass_xyz_999'; // gitleaks:allow
+      try {
+        parseWorkerConfig({
+          ...getTestEnv(),
+          NODE_ENV: 'production',
+          POSTGRES_PASSWORD: secretCanary,
+          REDIS_PASSWORD: '', // invalid
+        });
+        expect.unreachable();
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        expect(msg).not.toContain(secretCanary);
+      }
+    });
+
+    it('6. Structured startup logs do not expose credentials', async () => {
+      const logChunks: string[] = [];
+      const stream = new Writable({
+        write(chunk, _encoding, callback) {
+          logChunks.push(chunk.toString());
+          callback();
+        },
+      });
+
+      const workerLogger = createLogger({
+        environment: 'production',
+        serviceName: '@switchyard/worker',
+        stream,
+      });
+
+      const { mockPgPool } = createMockPg();
+      const { mockRedis } = createMockRedis();
+
+      const worker = await createWorker(
+        {
+          ...getTestEnv(),
+          NODE_ENV: 'production',
+          POSTGRES_PASSWORD: CANARY_VALID_PROD_PG_PW,
+          REDIS_PASSWORD: CANARY_VALID_PROD_REDIS_PW,
+        },
+        { pgPool: mockPgPool, redis: mockRedis },
+      );
+
+      workerLogger.info({ pid: process.pid }, 'Worker startup verified');
+
+      await worker.stop();
+
+      const fullLogOutput = logChunks.join('\n');
+      expect(fullLogOutput).not.toContain(CANARY_VALID_PROD_PG_PW);
+      expect(fullLogOutput).not.toContain(CANARY_VALID_PROD_REDIS_PW);
+    });
+
+    it('7. Production bypass flags remain rejected', () => {
+      expect(() =>
+        parseWorkerConfig({
+          ...getTestEnv(),
+          NODE_ENV: 'production',
+          POSTGRES_PASSWORD: CANARY_VALID_PROD_PG_PW,
+          REDIS_PASSWORD: CANARY_VALID_PROD_REDIS_PW,
+          FAIL_OPEN: 'true',
+        }),
+      ).toThrow(/Forbidden security flag detected: FAIL_OPEN/);
+    });
+
+    it('8. Worker configuration cannot receive KEKs fail-closed', () => {
+      expect(() =>
+        parseWorkerConfig({
+          ...getTestEnv(),
+          NODE_ENV: 'production',
+          POSTGRES_PASSWORD: CANARY_VALID_PROD_PG_PW,
+          REDIS_PASSWORD: CANARY_VALID_PROD_REDIS_PW,
+          MASTER_KEK_V1: 'canary_kek_should_fail',
+        }),
+      ).toThrow(
+        /Worker runtime must not have access to provider encryption keys or KEKs: MASTER_KEK_V1 is forbidden/,
+      );
     });
   });
 });

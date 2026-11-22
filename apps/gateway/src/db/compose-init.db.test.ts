@@ -847,4 +847,126 @@ describe('SW-1.3.1 / SW-1.3.2 Docker Compose fresh initialization (DB-15, DB-16 
     }
     expect(workerRecovered).toBe(true);
   });
+
+  it('proves worker becomes unhealthy when PostgreSQL is unavailable and recovers without manual restart (WRK-04)', async () => {
+    // 1. Initial state: worker CLI health check must pass with exit code 0
+    const initialHealth = run(
+      'docker',
+      ['exec', workerContainer, 'node', 'apps/gateway/dist/worker-main.js', '--health'],
+      composeEnv,
+    );
+    expect(initialHealth).toBe('');
+
+    // 2. Pause isolated test PostgreSQL container
+    run('docker', ['pause', pgContainer], composeEnv);
+
+    try {
+      // 3. Worker health probe must fail within bounded interval
+      let workerReportedUnhealthy = false;
+      for (let i = 0; i < 20; i += 1) {
+        try {
+          run(
+            'docker',
+            ['exec', workerContainer, 'node', 'apps/gateway/dist/worker-main.js', '--health'],
+            composeEnv,
+          );
+        } catch {
+          const healthJson = run(
+            'docker',
+            ['exec', workerContainer, 'cat', '/tmp/switchyard-worker-health.json'],
+            composeEnv,
+          );
+          if (healthJson.includes('"status":"unhealthy"')) {
+            workerReportedUnhealthy = true;
+            break;
+          }
+        }
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+      expect(workerReportedUnhealthy).toBe(true);
+    } finally {
+      // 4. Restore PostgreSQL container
+      run('docker', ['unpause', pgContainer], composeEnv);
+    }
+
+    // 5. Worker must automatically recover without manual restart
+    let workerRecovered = false;
+    for (let i = 0; i < 20; i += 1) {
+      try {
+        run(
+          'docker',
+          ['exec', workerContainer, 'node', 'apps/gateway/dist/worker-main.js', '--health'],
+          composeEnv,
+        );
+        const healthJson = run(
+          'docker',
+          ['exec', workerContainer, 'cat', '/tmp/switchyard-worker-health.json'],
+          composeEnv,
+        );
+        if (healthJson.includes('"status":"ready"')) {
+          workerRecovered = true;
+          break;
+        }
+      } catch {
+        // wait for next periodic probe
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    expect(workerRecovered).toBe(true);
+  });
+
+  it('proves worker shutdown remains bounded during an in-flight probe (WRK-04)', async () => {
+    // 1. Pause isolated Redis container to force in-flight probes to hang on timeout
+    run('docker', ['pause', redisContainer], composeEnv);
+
+    try {
+      // 2. Measure worker stop duration while probe is in flight
+      const t0 = Date.now();
+      run('docker', ['compose', '-p', projectName, 'stop', '-t', '5', 'worker'], composeEnv);
+      const stopDuration = Date.now() - t0;
+
+      // Assert shutdown completes gracefully within bounded grace period (< 8000ms)
+      expect(stopDuration).toBeLessThan(8000);
+    } finally {
+      // 3. Unpause Redis container
+      run('docker', ['unpause', redisContainer], composeEnv);
+
+      // 4. Wait for Redis to return to healthy state
+      for (let i = 0; i < 20; i += 1) {
+        try {
+          const status = run(
+            'docker',
+            ['inspect', redisContainer, '--format', '{{.State.Health.Status}}'],
+            composeEnv,
+          ).trim();
+          if (status === 'healthy') {
+            break;
+          }
+        } catch {
+          // wait
+        }
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+
+      // 5. Restart worker for clean environment teardown
+      run('docker', ['start', workerContainer], composeEnv);
+
+      // Wait for worker to return to ready state
+      for (let i = 0; i < 20; i += 1) {
+        try {
+          const healthJson = run(
+            'docker',
+            ['exec', workerContainer, 'cat', '/tmp/switchyard-worker-health.json'],
+            composeEnv,
+          );
+          if (healthJson.includes('"status":"ready"')) {
+            break;
+          }
+        } catch {
+          // wait
+        }
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+    }
+  });
 });
