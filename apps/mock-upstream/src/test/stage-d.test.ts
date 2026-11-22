@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -25,17 +25,25 @@ function getFreePort(): Promise<number> {
 }
 
 function resolveDistIndex(): string {
-  const candidates = [
-    path.resolve(process.cwd(), 'apps/mock-upstream/dist/index.js'),
-    path.resolve(process.cwd(), 'dist/index.js'),
-  ];
-  const found = candidates.find((p) => fs.existsSync(p));
-  if (!found) {
-    throw new Error(
-      `Could not locate compiled entrypoint dist/index.js. Checked: ${candidates.join(', ')}`,
-    );
+  const rootDir = fs.existsSync(path.resolve(process.cwd(), 'apps'))
+    ? process.cwd()
+    : path.resolve(process.cwd(), '../..');
+  const distFile = path.resolve(rootDir, 'apps/mock-upstream/dist/index.js');
+
+  if (!fs.existsSync(distFile)) {
+    // If running in a clean checkout before `pnpm build`, compile mock-upstream on demand
+    const tsconfigPath = path.resolve(rootDir, 'apps/mock-upstream/tsconfig.build.json');
+    const tscBin = path.resolve(rootDir, 'node_modules/.bin/tsc');
+    execFileSync(tscBin, ['-p', tsconfigPath], {
+      cwd: rootDir,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
   }
-  return found;
+
+  if (!fs.existsSync(distFile)) {
+    throw new Error(`Failed to locate or compile entrypoint: ${distFile}`);
+  }
+  return distFile;
 }
 
 function runSubprocess(
