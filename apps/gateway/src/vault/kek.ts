@@ -82,9 +82,11 @@ function isAllZero(buffer: Buffer): boolean {
 }
 
 /**
- * Immutable-by-convention keyring. The raw KEK map is private; callers can only resolve a key by
- * its explicit version. The returned Buffer is process-lifetime key material and must never be
- * mutated, logged, serialised, or persisted.
+ * Versioned KEK keyring. The keyring owns private, process-lifetime KEK Buffers; they are copied on
+ * construction and are never exposed directly. `resolve(version)` returns an independent temporary
+ * Buffer copy that the caller owns and MUST clear after use. `withKey(version, operation)` resolves
+ * such a copy, runs a synchronous operation, and clears the copy in a `finally` block on success and
+ * every exception path. No public API intentionally exposes the keyring's internal KEK material.
  */
 export class KekKeyring {
   private readonly active: KekVersion;

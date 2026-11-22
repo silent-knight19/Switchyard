@@ -75,20 +75,49 @@ function providerEnvelopeWithCiphertextLength(length: number): ProviderCredentia
   };
 }
 
-function captureDecipherChunks(): {
-  chunks: Buffer[];
+type GcmDecipher = ReturnType<typeof crypto.createDecipheriv> & {
+  setAAD(aad: Buffer): GcmDecipher;
+};
+
+interface CapturedDecipherChunks {
+  dekUnwrap: Buffer[];
+  providerDecrypt: Buffer[];
   restore: () => void;
-} {
-  const chunks: Buffer[] = [];
+}
+
+function captureDecipherChunksByOperation(): CapturedDecipherChunks {
+  const dekUnwrap: Buffer[] = [];
+  const providerDecrypt: Buffer[] = [];
   const realCreateDecipheriv = crypto.createDecipheriv;
   const spy = vi
     .spyOn(crypto, 'createDecipheriv')
     .mockImplementation((algorithm, key, iv, options) => {
-      const decipher = realCreateDecipheriv(algorithm, key, iv, options);
+      const decipher = realCreateDecipheriv(algorithm, key, iv, options) as GcmDecipher;
+      let operationChunks: Buffer[] | null = null;
+
       return new Proxy(decipher, {
         get(target, property, receiver) {
+          if (property === 'setAAD') {
+            return (aad: Buffer) => {
+              // Production AAD is `dek:<orgId>:v<kekVersion>` for DEK unwrapping and
+              // `pk:<orgId>:<providerKeyId>:<provider>` for provider-credential decryption.
+              const prefix = aad.toString('utf8', 0, 4);
+              if (prefix.startsWith('dek:')) {
+                operationChunks = dekUnwrap;
+              } else if (prefix.startsWith('pk:')) {
+                operationChunks = providerDecrypt;
+              } else {
+                throw new Error('Unexpected vault AAD prefix in test instrumentation');
+              }
+              return target.setAAD(aad);
+            };
+          }
           if (property === 'update') {
             return (data: Buffer) => {
+              const chunks = operationChunks;
+              if (chunks === null) {
+                throw new Error('Vault decipher update before setAAD');
+              }
               const output = target.update(data);
               chunks.push(output);
               return output;
@@ -96,6 +125,10 @@ function captureDecipherChunks(): {
           }
           if (property === 'final') {
             return () => {
+              const chunks = operationChunks;
+              if (chunks === null) {
+                throw new Error('Vault decipher final before setAAD');
+              }
               const output = target.final();
               chunks.push(output);
               return output;
@@ -105,7 +138,7 @@ function captureDecipherChunks(): {
         },
       });
     });
-  return { chunks, restore: () => spy.mockRestore() };
+  return { dekUnwrap, providerDecrypt, restore: () => spy.mockRestore() };
 }
 
 function independentUnwrapDek(
@@ -868,11 +901,11 @@ describe('SW-1.7.1/SW-1.7.2 remediation', () => {
     }
   });
 
-  it('clears intermediate plaintext chunks after successful decryption', () => {
+  it('scrubs both DEK-unwrap and provider-decrypt intermediates on success', () => {
     const vault = createVault(1);
     const envelope = vault.createOrganizationEnvelope(ORG_A);
     const providerEnvelope = encryptWithVault(vault, ORG_A, envelope);
-    const capture = captureDecipherChunks();
+    const capture = captureDecipherChunksByOperation();
 
     try {
       const plaintext = vault.decryptProviderCredential({
@@ -882,11 +915,57 @@ describe('SW-1.7.1/SW-1.7.2 remediation', () => {
         providerEnvelope,
         organizationEnvelope: envelope,
       });
-      expect(plaintext.equals(CANARY)).toBe(true);
-      plaintext.fill(0);
 
-      expect(capture.chunks.length).toBeGreaterThanOrEqual(2);
-      for (const chunk of capture.chunks) {
+      // Both authenticated decryption paths executed during the round-trip.
+      expect(capture.dekUnwrap.length).toBeGreaterThanOrEqual(2);
+      expect(capture.providerDecrypt.length).toBeGreaterThanOrEqual(2);
+
+      for (const chunk of [...capture.dekUnwrap, ...capture.providerDecrypt]) {
+        expect(chunk.every((byte) => byte === 0)).toBe(true);
+      }
+
+      // The caller-owned result is a distinct allocation and is untouched by intermediate cleanup.
+      expect(capture.dekUnwrap.includes(plaintext)).toBe(false);
+      expect(capture.providerDecrypt.includes(plaintext)).toBe(false);
+      expect(plaintext.equals(CANARY)).toBe(true);
+
+      plaintext.fill(0);
+      expect(plaintext.every((byte) => byte === 0)).toBe(true);
+    } finally {
+      capture.restore();
+    }
+  });
+
+  it('scrubs DEK-unwrap intermediates on organization-DEK authentication failure', () => {
+    const vault = createVault(1);
+    const envelope = vault.createOrganizationEnvelope(ORG_A);
+    const providerEnvelope = encryptWithVault(vault, ORG_A, envelope);
+    const tampered = cloneOrgEnvelope(envelope);
+    tampered.wrappedDek[1] = (tampered.wrappedDek[1] as number) ^ 0xff;
+    const capture = captureDecipherChunksByOperation();
+
+    try {
+      let returnedPlaintext: Buffer | undefined;
+      try {
+        returnedPlaintext = vault.decryptProviderCredential({
+          orgId: ORG_A,
+          providerKeyId: PROVIDER_KEY_A,
+          provider: 'openai',
+          providerEnvelope,
+          organizationEnvelope: tampered,
+        });
+      } catch (error) {
+        expect(error).toBeInstanceOf(VaultError);
+        expect((error as VaultError).reason).toBe('AUTHENTICATION_FAILED');
+      }
+
+      // No plaintext crosses the boundary when the organization DEK fails authentication.
+      expect(returnedPlaintext).toBeUndefined();
+
+      // The DEK unwrap produced intermediate chunks; provider decryption never started.
+      expect(capture.dekUnwrap.length).toBeGreaterThanOrEqual(1);
+      expect(capture.providerDecrypt).toHaveLength(0);
+      for (const chunk of capture.dekUnwrap) {
         expect(chunk.every((byte) => byte === 0)).toBe(true);
       }
     } finally {
@@ -894,29 +973,36 @@ describe('SW-1.7.1/SW-1.7.2 remediation', () => {
     }
   });
 
-  it('clears intermediate plaintext chunks after authentication failure', () => {
+  it('scrubs both operations on provider authentication failure without returning plaintext', () => {
     const vault = createVault(1);
     const envelope = vault.createOrganizationEnvelope(ORG_A);
     const providerEnvelope = encryptWithVault(vault, ORG_A, envelope);
     const tampered = cloneProviderEnvelope(providerEnvelope);
     tampered.authTag[0] = (tampered.authTag[0] as number) ^ 0xff;
-    const capture = captureDecipherChunks();
+    const capture = captureDecipherChunksByOperation();
 
     try {
-      expectVaultError(
-        () =>
-          vault.decryptProviderCredential({
-            orgId: ORG_A,
-            providerKeyId: PROVIDER_KEY_A,
-            provider: 'openai',
-            providerEnvelope: tampered,
-            organizationEnvelope: envelope,
-          }),
-        'AUTHENTICATION_FAILED',
-      );
+      let returnedPlaintext: Buffer | undefined;
+      try {
+        returnedPlaintext = vault.decryptProviderCredential({
+          orgId: ORG_A,
+          providerKeyId: PROVIDER_KEY_A,
+          provider: 'openai',
+          providerEnvelope: tampered,
+          organizationEnvelope: envelope,
+        });
+      } catch (error) {
+        expect(error).toBeInstanceOf(VaultError);
+        expect((error as VaultError).reason).toBe('AUTHENTICATION_FAILED');
+      }
 
-      expect(capture.chunks.length).toBeGreaterThanOrEqual(2);
-      for (const chunk of capture.chunks) {
+      // No plaintext crosses the boundary when provider ciphertext fails authentication.
+      expect(returnedPlaintext).toBeUndefined();
+
+      // DEK unwrap succeeded; provider decryption produced an update chunk before final() failed.
+      expect(capture.dekUnwrap.length).toBeGreaterThanOrEqual(2);
+      expect(capture.providerDecrypt.length).toBeGreaterThanOrEqual(1);
+      for (const chunk of [...capture.dekUnwrap, ...capture.providerDecrypt]) {
         expect(chunk.every((byte) => byte === 0)).toBe(true);
       }
     } finally {
