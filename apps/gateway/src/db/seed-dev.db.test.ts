@@ -437,6 +437,72 @@ describe('SW-P1-B02 development seeding PostgreSQL integration', () => {
       const envelope = await readEnvelope(admin, ORG_A_ID);
       assertEnvelopeRoundTrip(keyring(seededKek), ORG_A_ID, envelope);
     });
+
+    it('rejects a valid but incompatible KEK on repeat without mutating persisted records', async () => {
+      const admin = handle!.admin;
+      const before = await admin.query<{
+        wrapped_dek: Buffer;
+        dek_iv: Buffer;
+        dek_auth_tag: Buffer;
+        password_hash: string;
+      }>(
+        `SELECT o.wrapped_dek, o.dek_iv, o.dek_auth_tag, u.password_hash
+         FROM public.organizations o JOIN public.users u ON u.org_id = o.id
+         WHERE o.id = $1`,
+        [ORG_A_ID],
+      );
+      expect(before.rows).toHaveLength(1);
+
+      const incompatible = seedEnv(handle!.db, passwords, { kek: newKek() });
+      const result = await runSeed(incompatible, OTHER_PASSWORD);
+      expect(result.code).toBe(SEED_EXIT_FAILURE);
+      expect(result.stdout).toBe('');
+      expect(result.stderr).toContain('EXISTING_ENVELOPE_INVALID');
+
+      const after = await admin.query<{
+        wrapped_dek: Buffer;
+        dek_iv: Buffer;
+        dek_auth_tag: Buffer;
+        password_hash: string;
+      }>(
+        `SELECT o.wrapped_dek, o.dek_iv, o.dek_auth_tag, u.password_hash
+         FROM public.organizations o JOIN public.users u ON u.org_id = o.id
+         WHERE o.id = $1`,
+        [ORG_A_ID],
+      );
+      expect(await countRows(admin, 'organizations')).toBe(1);
+      expect(await countRows(admin, 'users')).toBe(1);
+      expect(after.rows[0]?.wrapped_dek.equals(before.rows[0]!.wrapped_dek)).toBe(true);
+      expect(after.rows[0]?.dek_iv.equals(before.rows[0]!.dek_iv)).toBe(true);
+      expect(after.rows[0]?.dek_auth_tag.equals(before.rows[0]!.dek_auth_tag)).toBe(true);
+      expect(after.rows[0]?.password_hash).toBe(before.rows[0]?.password_hash);
+      assertEnvelopeRoundTrip(keyring(seededKek), ORG_A_ID, await readEnvelope(admin, ORG_A_ID));
+    });
+
+    it('fails closed on tampered existing envelope and leaves the original account intact', async () => {
+      const admin = handle!.admin;
+      const original = await readEnvelope(admin, ORG_A_ID);
+      const tampered = Buffer.from(original.dekAuthTag);
+      tampered[0] = tampered[0]! ^ 0xff;
+      await admin.query('UPDATE public.organizations SET dek_auth_tag = $1 WHERE id = $2', [
+        tampered,
+        ORG_A_ID,
+      ]);
+      try {
+        const result = await runSeed(env, OTHER_PASSWORD);
+        expect(result.code).toBe(SEED_EXIT_FAILURE);
+        expect(result.stdout).toBe('');
+        expect(result.stderr).toContain('EXISTING_ENVELOPE_INVALID');
+        expect(await countRows(admin, 'organizations')).toBe(1);
+        expect(await countRows(admin, 'users')).toBe(1);
+      } finally {
+        await admin.query('UPDATE public.organizations SET dek_auth_tag = $1 WHERE id = $2', [
+          original.dekAuthTag,
+          ORG_A_ID,
+        ]);
+      }
+      assertEnvelopeRoundTrip(keyring(seededKek), ORG_A_ID, await readEnvelope(admin, ORG_A_ID));
+    });
   });
 
   describe('concurrent seeding preserves exactly-one semantics', () => {
