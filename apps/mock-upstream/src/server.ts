@@ -5,6 +5,7 @@ import { getFixture, hasFixture } from './fixtures/registry.js';
 import type { AbortObservation, Fixture } from './fixtures/types.js';
 import { sendJsonResponse } from './response/json.js';
 import { sendSseResponse } from './response/sse.js';
+import { sendHttpError, executeNetworkFault } from './response/faults.js';
 
 export interface MockServerOptions {
   port?: number;
@@ -20,6 +21,7 @@ export class MockServer {
   private readonly config = parseMockConfig();
   private readonly activeSockets = new Set<Socket>();
   private readonly observations: AbortObservation[] = [];
+  private readonly shutdownController = new AbortController();
   private activeFixtureOverride: string | null = null;
   private defaultFixture: string;
   private readonly allowHeaderSelection: boolean;
@@ -89,6 +91,7 @@ export class MockServer {
   public async stop(): Promise<void> {
     if (!this.running) return;
     this.running = false;
+    this.shutdownController.abort();
 
     // Destroy active sockets
     for (const socket of this.activeSockets) {
@@ -282,6 +285,14 @@ export class MockServer {
     const startTime = Date.now();
     const requestId = `obs-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
     const abortController = new AbortController();
+
+    if (this.shutdownController.signal.aborted) {
+      abortController.abort();
+    } else {
+      this.shutdownController.signal.addEventListener('abort', () => abortController.abort(), {
+        once: true,
+      });
+    }
 
     let rawBody = '';
     try {
@@ -560,7 +571,18 @@ export class MockServer {
       return;
     }
 
-    throw new Error(`Unsupported fixture type in Stage A: ${fixture.type}`);
+    if (fixture.type === 'http_error') {
+      const bytes = sendHttpError(res, fixture);
+      onBytesWritten(bytes);
+      return;
+    }
+
+    if (fixture.type === 'network_fault') {
+      await executeNetworkFault(res, fixture, abortSignal, onBytesWritten);
+      return;
+    }
+
+    throw new Error(`Unsupported fixture type in Stage A/B: ${fixture.type}`);
   }
 }
 
